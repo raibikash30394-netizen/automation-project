@@ -83,11 +83,15 @@ setGlobalDispatcher(new Agent({
 }));
 
 const sapPool = new Pool(SAP_ORIGIN, {
-  connections: 12,
+  connections: 8,
   pipelining: 1,
-  keepAliveTimeout: 30_000,
+  keepAliveTimeout: 60_000,
   headersTimeout: 8_000,
   bodyTimeout: 10_000,
+  // Try HTTP/2 first — SAP OData over UI5 supports it and it removes head-of-
+  // line blocking on the TCP connection. Falls back to HTTP/1.1 automatically
+  // if the server refuses ALPN "h2".
+  allowH2: true,
 });
 
 const solverPool = new Pool(CAPTCHA_ORIGIN, {
@@ -345,6 +349,8 @@ function isCustomerBlacklisted(order, blacklist) {
 async function fetchLiveOrders(auth) {
   if (wafActive()) return { orders: [], plantConf: null };
   const today = new Date().toISOString().slice(0, 10) + 'T00:00:00';
+  // Full payload — SAP's OData validator requires ALL declared nav ranges to
+  // be present (even when empty). Removing them causes HTTP 400.
   const payload = {
     EvFrieghtPercent      : '',
     EvTolerenceAmount     : '',
@@ -498,6 +504,7 @@ function fmtAmtSap(v) { return `${Math.round(Number(v || 0))}.000`; }
 // ---- Submit ---------------------------------------------------------------
 
 async function submitBid(auth, bids, solvedCaptcha) {
+  const t0 = Date.now();
   const pc = auth._lastPlantConf || {};
   const biddingDate = pc.BiddingDate || `/Date(${Date.now()})/`;
   const slotNumber  = (pc.SlotNumber ?? '').toString();
@@ -537,6 +544,7 @@ async function submitBid(auth, bids, solvedCaptcha) {
     body: payload,
     timeoutMs: 5000,
   });
+  const submitMs = Date.now() - t0;
 
   const d = res.data?.d || {};
   const messages = extractSapMessages(d);
@@ -546,7 +554,7 @@ async function submitBid(auth, bids, solvedCaptcha) {
     if ((severity[m.info] || 0) > (severity[primary.info] || 0)) primary = m;
   }
   if (!primary.text && d.Ev_Text) primary = { info: primary.info || '', text: d.Ev_Text };
-  return { statusCode: res.statusCode, info: primary.info, text: primary.text, messages, raw: res.data };
+  return { statusCode: res.statusCode, info: primary.info, text: primary.text, messages, raw: res.data, submitMs };
 }
 
 function extractSapMessages(d) {
@@ -612,16 +620,23 @@ function parseMinFloor(text) {
  */
 const sapSession = (() => {
   let chain = Promise.resolve();
-  return {
+  const obj = {
+    _busy: false,
     /** Serialise `fn` — returns whatever fn resolves to. */
     run(fn) {
-      const p = chain.then(() => fn(), () => fn());
+      const wrapped = async () => {
+        obj._busy = true;
+        try { return await fn(); }
+        finally { obj._busy = false; }
+      };
+      const p = chain.then(wrapped, wrapped);
       // Keep chain alive even on rejection; swallow so one failure
       // doesn't poison every future queued task.
       chain = p.catch(() => {});
       return p;
     },
   };
+  return obj;
 })();
 
 // ---- Batcher --------------------------------------------------------------
@@ -795,7 +810,7 @@ async function handleBatch(ctx, item, solved, workerId, retryDepth = 0) {
 
   if (isRealSuccess) {
     metrics.submitsOk++;
-    log.info(`[w${workerId}] ✓ ACCEPTED (${item.kind}, ${bids.length}): ${result.text || 'OK'}`);
+    log.info(`[w${workerId}] ✓ ACCEPTED (${item.kind}, ${bids.length}) in ${result.submitMs}ms: ${result.text || 'OK'}`);
     for (const b of item.bids) ctx.submitted.add(String(b.order.SapOrderId));
     return { ok: true };
   }
@@ -884,7 +899,7 @@ async function handleBatch(ctx, item, solved, workerId, retryDepth = 0) {
   if ((result.statusCode === 200 || result.statusCode === 201) &&
       !result.info && !result.text && !isTimeEnded && !isWrongCaptcha && reduceBy === null && minFloor === null) {
     metrics.submitsOk++;
-    log.info(`[w${workerId}] ✓ ACCEPTED (${item.kind}, ${bids.length}): HTTP ${result.statusCode} (empty confirmation)`);
+    log.info(`[w${workerId}] ✓ ACCEPTED (${item.kind}, ${bids.length}) in ${result.submitMs}ms: HTTP ${result.statusCode} (empty confirmation)`);
     for (const b of item.bids) ctx.submitted.add(String(b.order.SapOrderId));
     return { ok: true };
   }
@@ -976,6 +991,34 @@ async function warmUpPools(auth) {
   log.info('Pools warmed up (SAP + local solver keep-alive established).');
 }
 
+/**
+ * Background keep-warm ping to SAP every 20 s.
+ *
+ * Without this, the underlying TCP+TLS connection to SAP dies after ~60 s of
+ * idle (server-side timeout). Reconnecting costs a full TLS handshake
+ * (~200-300 ms) — which lands right in the middle of your first bid when
+ * the window opens. Sending a cheap HEAD-ish call every 20 s keeps the
+ * connection warm indefinitely so bid #1 pays 0 ms handshake cost.
+ *
+ * Safe to run in parallel with the polling loop — it only fires when the
+ * SAP session mutex is free and no submit is in flight.
+ */
+function startKeepWarm(auth) {
+  const INTERVAL_MS = 20_000;
+  setInterval(() => {
+    if (wafActive()) return;
+    // Skip if a submit is in flight — don't want a metadata ping to eat the
+    // mutex slot right when we could be bidding.
+    if (sapSession._busy) return;
+    sapPool.request({
+      path: `${SAP_PATH_PFX}/$metadata`,
+      method: 'GET',
+      headers: auth.headers({ accept: 'application/xml' }),
+    }).then((r) => r.body.dump()).catch(() => {});
+  }, INTERVAL_MS).unref();
+  log.info(`Keep-warm ping enabled (every ${INTERVAL_MS / 1000}s) — TCP+TLS session stays hot even during long idle windows.`);
+}
+
 // ---- Main ------------------------------------------------------------------
 
 async function main() {
@@ -995,6 +1038,7 @@ async function main() {
   const auth = new AuthConfig();
   if (!auth.token) await auth.refreshToken();
   await warmUpPools(auth);
+  startKeepWarm(auth);
 
   const [inputRows, deleteRows] = await Promise.all([parseCSV(INPUT_CSV), parseCSV(DELETE_CSV)]);
   const { rules, blacklist } = buildRuleMaps(inputRows, deleteRows);
