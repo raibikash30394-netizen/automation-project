@@ -274,20 +274,58 @@ function buildRuleMaps(inputRows, deleteRows) {
   return { rules, blacklist };
 }
 
-function matchOrder(order, rules) {
+function matchOrder(order, rules, ruleCitiesByLen) {
   const dest = (order.Destination || order.DestCityDesc || order.CityCodeDescription || '')
     .toString().trim().toUpperCase();
   if (!dest) return null;
   const orderSpi = (order.SPI || order.Spi || order.SpecialProcessInd || order.Zspi || '')
     .toString().trim();
-  for (const [ruleCity, ruleList] of rules.entries()) {
-    const cityHit = dest === ruleCity || dest.includes(ruleCity) || ruleCity.includes(dest);
-    if (!cityHit) continue;
-    for (const rule of ruleList) {
-      if (!rule.spi) return { amount: rule.amount, matchedCity: ruleCity, matchedSpi: '(any)' };
-      if (orderSpi.includes(rule.spi)) {
-        return { amount: rule.amount, matchedCity: ruleCity, matchedSpi: rule.spi };
-      }
+
+  // Iterate longest ruleCity first so "KRISHNANAGAR - STO" (specific) wins
+  // over "KRISHNANAGAR" (generic) when both are in the CSV.  We also prefer
+  // an EXACT equal match over any substring hit at the same length.
+  const candidates = ruleCitiesByLen || Array.from(rules.keys()).sort((a, b) => b.length - a.length);
+
+  // Pass 1: exact equal match — always highest priority
+  for (const ruleCity of candidates) {
+    if (dest !== ruleCity) continue;
+    const list = rules.get(ruleCity);
+    const hit = pickBySpi(list, orderSpi, ruleCity, 'exact');
+    if (hit) return hit;
+  }
+
+  // Pass 2: containment (longest first). Prefer dest.includes(ruleCity)
+  // over ruleCity.includes(dest) because CSV keys are usually more specific
+  // than the raw SAP dest string.
+  for (const ruleCity of candidates) {
+    if (dest === ruleCity) continue;
+    if (!(dest.includes(ruleCity) || ruleCity.includes(dest))) continue;
+    const list = rules.get(ruleCity);
+    const hit = pickBySpi(list, orderSpi, ruleCity, 'substr');
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/**
+ * From a list of {spi, amount} rules for one city, pick the best-matching
+ * one for the given order SPI.  Preference:
+ *   1. SPI substring hit (e.g. CSV "1164" matches "1164-BAG-AL/…")
+ *   2. Rule with empty SPI (wildcard "any")
+ *   3. First rule in list
+ */
+function pickBySpi(list, orderSpi, ruleCity, matchKind) {
+  if (!Array.isArray(list) || !list.length) return null;
+  // Prefer SPI-specific rules first
+  for (const rule of list) {
+    if (rule.spi && orderSpi.includes(rule.spi)) {
+      return { amount: rule.amount, matchedCity: ruleCity, matchedSpi: rule.spi, matchKind };
+    }
+  }
+  // Then wildcard rules (no SPI in CSV)
+  for (const rule of list) {
+    if (!rule.spi) {
+      return { amount: rule.amount, matchedCity: ruleCity, matchedSpi: '(any)', matchKind };
     }
   }
   return null;
@@ -568,6 +606,9 @@ function buildBatches(orders, rules, blacklist, seenSubmitted, inFlight, cooldow
   const byClub = new Map();
   const stats = { total: orders.length, matched: 0, blacklisted: 0, noRule: 0, clubDropped: 0, coolskip: 0 };
 
+  // Pre-sort rule cities: longest first → "KRISHNANAGAR - STO" wins over "KRISHNANAGAR"
+  const ruleCitiesByLen = Array.from(rules.keys()).sort((a, b) => b.length - a.length);
+
   const fresh = orders.filter((o) => {
     const key = String(o.SapOrderId || '');
     if (!key || seenSubmitted.has(key) || inFlight.has(key)) return false;
@@ -590,7 +631,7 @@ function buildBatches(orders, rules, blacklist, seenSubmitted, inFlight, cooldow
     if (!club) {
       for (const o of members) {
         if (isCustomerBlacklisted(o, blacklist)) { stats.blacklisted++; continue; }
-        const m = matchOrder(o, rules);
+        const m = matchOrder(o, rules, ruleCitiesByLen);
         if (!m) { stats.noRule++; continue; }
         stats.matched++;
         singles.push({ order: o, amount: m.amount, city: m.matchedCity, spi: m.matchedSpi });
@@ -600,7 +641,7 @@ function buildBatches(orders, rules, blacklist, seenSubmitted, inFlight, cooldow
       let drop = false;
       for (const o of members) {
         if (isCustomerBlacklisted(o, blacklist)) { drop = true; break; }
-        const m = matchOrder(o, rules);
+        const m = matchOrder(o, rules, ruleCitiesByLen);
         if (!m) { drop = true; break; }
         items.push({ order: o, amount: m.amount, city: m.matchedCity, spi: m.matchedSpi });
       }
