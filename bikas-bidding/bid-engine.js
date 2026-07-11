@@ -365,15 +365,19 @@ async function fetchLiveOrders(auth) {
 }
 
 async function fetchCaptchaImage(auth) {
-  if (wafActive()) return null;
+  if (wafActive()) return { img: null, reason: 'waf' };
   const p = `${SAP_PATH_PFX}/EbiddingCaptchaSet(Vendor='${VENDOR_ID}',Plant='${PLANT_CODE}')`;
   const res = await sapRequest(auth, { path: p, method: 'GET', timeoutMs: 4000 });
   if (res.statusCode === 406 || (typeof res.data === 'string' && /Not Acceptable|<!DOCTYPE html>/i.test(res.data.slice(0, 200)))) {
     markWaf('EbiddingCaptchaSet HTTP 406');
-    return null;
+    return { img: null, reason: 'waf-406' };
+  }
+  if (res.statusCode !== 200 && res.statusCode !== 201) {
+    return { img: null, reason: `http-${res.statusCode}` };
   }
   const d = res.data?.d || {};
-  return d.ImageString || d.Captcha || d.CaptchaImage || d.EvCaptcha || null;
+  const img = d.ImageString || d.Captcha || d.CaptchaImage || d.EvCaptcha || null;
+  return { img, reason: img ? 'ok' : 'sap-empty' };
 }
 
 async function solveViaLocal(base64) {
@@ -389,24 +393,37 @@ async function solveViaLocal(base64) {
     const text = await body.text();
     metrics.captchaCacheMs.push(Date.now() - t0);
     if (metrics.captchaCacheMs.length > 200) metrics.captchaCacheMs.shift();
-    if (statusCode !== 200) { metrics.captchaFailed++; return ''; }
+    if (statusCode !== 200) {
+      metrics.captchaFailed++;
+      return { solved: '', reason: `solver-http-${statusCode}` };
+    }
     let json;
-    try { json = JSON.parse(text); } catch { metrics.captchaFailed++; return ''; }
+    try { json = JSON.parse(text); }
+    catch { metrics.captchaFailed++; return { solved: '', reason: 'solver-bad-json' }; }
     const solved = json.solved || '';
-    if (!solved || solved === 'Redo') { metrics.captchaFailed++; return ''; }
+    if (!solved || solved === 'Redo') {
+      metrics.captchaFailed++;
+      return { solved: '', reason: 'solver-empty' };
+    }
     metrics.captchaSolved++;
-    return solved;
+    return { solved, reason: 'ok' };
   } catch (e) {
     metrics.captchaFailed++;
     log.warn(`Captcha solver unreachable: ${e.message}`);
-    return '';
+    return { solved: '', reason: 'solver-unreachable' };
   }
 }
 
-// Fetch image from SAP + solve via local server — pipelined helper
+/**
+ * Fetch a captcha image from SAP and solve it via the local server.
+ * Returns { solved, reason } — reason is one of: ok | sap-empty | waf | waf-406 |
+ * http-XXX | solver-empty | solver-bad-json | solver-http-XXX | solver-unreachable
+ *
+ * Callers should treat everything except `ok` as a miss and retry.
+ */
 async function nextCaptcha(auth) {
-  const img = await fetchCaptchaImage(auth);
-  if (!img) return '';
+  const { img, reason: fetchReason } = await fetchCaptchaImage(auth);
+  if (!img) return { solved: '', reason: fetchReason };
   return await solveViaLocal(img);
 }
 
@@ -498,6 +515,52 @@ function parseReduceAmount(text) {
   return m ? parseFloat(m[1]) : null;
 }
 
+/**
+ * Parse SAP's minimum-floor messages of the form:
+ *   "Bidding amount should be Greater than or equal to 685.08"
+ *   "Order : X posnr : Y Bidding amount should be Greater than or equal to Z"
+ * Returns the highest floor value found across all orders in the message,
+ * or null if no such pattern is present.
+ */
+function parseMinFloor(text) {
+  if (!text) return null;
+  const re = /greater\s*than\s*or\s*equal\s*to\s*([\d]+(?:\.\d+)?)/gi;
+  let max = null;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const v = parseFloat(m[1]);
+    if (isFinite(v) && (max === null || v > max)) max = v;
+  }
+  return max;
+}
+
+/**
+ * Serialised SAP session mutex.
+ *
+ * SAP maintains ONE active captcha per session (cookie). When multiple parallel
+ * workers each call EbiddingCaptchaSet concurrently, the last fetch invalidates
+ * every earlier one — the empirical failure mode on the first live run was
+ * ~76% "Wrong Captcha" rejections.
+ *
+ * Fix: serialise the critical section (`fetch captcha → solve → submit`) so
+ * only ONE worker holds the SAP session at a time. Workers still run in
+ * parallel for everything else (CSV parsing, next-scan polling, in-flight
+ * bookkeeping), but the SAP-session-critical part is one-at-a-time.
+ */
+const sapSession = (() => {
+  let chain = Promise.resolve();
+  return {
+    /** Serialise `fn` — returns whatever fn resolves to. */
+    run(fn) {
+      const p = chain.then(() => fn(), () => fn());
+      // Keep chain alive even on rejection; swallow so one failure
+      // doesn't poison every future queued task.
+      chain = p.catch(() => {});
+      return p;
+    },
+  };
+})();
+
 // ---- Batcher --------------------------------------------------------------
 
 function buildBatches(orders, rules, blacklist, seenSubmitted, inFlight, cooldown) {
@@ -566,72 +629,64 @@ function buildBatches(orders, rules, blacklist, seenSubmitted, inFlight, cooldow
   return { plan, stats };
 }
 
-// ---- Worker with captcha pipelining ---------------------------------------
+// ---- Worker (JIT captcha inside SAP-session mutex) ------------------------
 
 /**
- * Each worker pulls batches from a shared queue.  Before submitting the
- * current batch, it prefetches the NEXT batch's captcha in parallel — so by
- * the time SAP responds we already have the next captcha ready.
+ * Each worker pulls batches from a shared queue. Inside the SAP session mutex
+ * it fetches a fresh captcha, solves it, and submits — all in one atomic step
+ * so no concurrent worker can invalidate the captcha mid-flight.
+ *
+ * We removed the earlier "pipelining" prefetch: even though it looked like a
+ * win on paper, SAP's captcha invalidation semantics mean prefetching the
+ * next captcha WHILE the current one is in-flight silently invalidates the
+ * current one on the server side → 76% "Wrong Captcha" on the first live run.
  */
 function makeWorkerPool(ctx) {
   let cursor = 0;
+
+  async function fetchFreshCaptcha(workerId) {
+    // 3 quick attempts — SAP sometimes returns an empty `ImageString` when the
+    // bid window is transitioning; solver may occasionally return 'Redo'.
+    for (let i = 0; i < 3; i++) {
+      const r = await nextCaptcha(ctx.auth);
+      if (r.solved) return r.solved;
+      if (wafActive()) return '';
+      if (r.reason === 'sap-empty' && i === 0) {
+        // First time we see empty from SAP this scan — log once so user
+        // knows the bid window is currently closed.
+        log.warn(`[w${workerId}] SAP returned empty captcha (bid window likely closed) — retrying`);
+      } else if (r.reason && r.reason !== 'ok' && r.reason !== 'sap-empty') {
+        log.warn(`[w${workerId}] captcha attempt ${i + 1}/3 failed: ${r.reason}`);
+      }
+    }
+    return '';
+  }
+
   async function runOne(workerId) {
-    // Jittered stagger so 4 workers don't fire the first SAP hit at exactly
-    // the same instant (WAF-friendly).
+    // Jittered stagger so 4 workers don't all queue on the mutex at the same
+    // instant — helps interleave with the SAP TCP window.
     const jitter = 30 + Math.floor(Math.random() * 60);
     await new Promise((r) => setTimeout(r, jitter));
-
-    // Pipelined captcha: keep one "next" captcha in flight while the current
-    // submit is being sent.
-    let nextCaptchaPromise = null;
 
     while (cursor < ctx.plan.length) {
       const item = ctx.plan[cursor++];
       const t0 = Date.now();
-
-      // Kick off captcha for THIS batch if not already prefetched
-      const captchaPromise = nextCaptchaPromise || (async () => {
-        // Retry captcha up to 3× if OCR returns empty/Redo
-        for (let i = 0; i < 3; i++) {
-          const s = await nextCaptcha(ctx.auth);
-          if (s) return s;
-          if (wafActive()) return '';
-        }
-        return '';
-      })();
-      nextCaptchaPromise = null;
-
-      // Mark in-flight now, prevents double-submit if fetchLiveOrders re-scans
       for (const b of item.bids) ctx.inFlight.add(String(b.order.SapOrderId));
 
-      // Concurrent prefetch for the NEXT batch (pipelining) — reduces idle
-      // time between SAP submits.
-      if (cursor < ctx.plan.length) {
-        nextCaptchaPromise = (async () => {
-          for (let i = 0; i < 3; i++) {
-            const s = await nextCaptcha(ctx.auth);
-            if (s) return s;
-            if (wafActive()) return '';
-          }
-          return '';
-        })();
+      // Critical section: hold the SAP session for the fetch-solve-submit
+      // atomic unit. Only ONE worker at a time.
+      const outcome = await sapSession.run(async () => {
+        const solved = await fetchFreshCaptcha(workerId);
+        if (!solved) return { skipped: true };
+        return await handleBatch(ctx, item, solved, workerId);
+      });
+
+      if (outcome && outcome.skipped) {
+        log.warn(`[w${workerId}] no captcha for ${item.kind} batch (${item.bids.length}) — retry next scan`);
       }
 
-      const solved = await captchaPromise;
-      if (!solved) {
-        log.warn(`[w${workerId}] no captcha for ${item.kind} batch (${item.bids.length}) — retrying next scan.`);
-        for (const b of item.bids) ctx.inFlight.delete(String(b.order.SapOrderId));
-        continue;
-      }
-
-      try {
-        await handleBatch(ctx, item, solved, workerId);
-      } catch (e) {
-        log.error({ err: e.message, stack: e.stack }, `[w${workerId}] batch failed`);
-      } finally {
-        for (const b of item.bids) ctx.inFlight.delete(String(b.order.SapOrderId));
-        pushLatency(Date.now() - t0);
-      }
+      for (const b of item.bids) ctx.inFlight.delete(String(b.order.SapOrderId));
+      pushLatency(Date.now() - t0);
     }
   }
 
@@ -661,30 +716,32 @@ async function handleBatch(ctx, item, solved, workerId, retryDepth = 0) {
   const isTimeEnded    = /ended|closed|expired/i.test(textLower) && !isSavedOk;
   const isWrongCaptcha = /captcha.*(fail|wrong|invalid)|worng\s*captcha/i.test(textLower);
   const reduceBy       = parseReduceAmount(evText || result.text);
+  const minFloor       = parseMinFloor(evText || result.text);
 
   if (isRealSuccess) {
     metrics.submitsOk++;
     log.info(`[w${workerId}] ✓ ACCEPTED (${item.kind}, ${bids.length}): ${result.text || 'OK'}`);
     for (const b of item.bids) ctx.submitted.add(String(b.order.SapOrderId));
-    return;
+    return { ok: true };
   }
 
   if (isWrongCaptcha) {
     metrics.submitsWrongCaptcha++;
     if (retryDepth < 3) {
       log.warn(`[w${workerId}] ↻ Wrong captcha — refetching + retry ${retryDepth + 1}/3`);
-      // Immediate retry with a FRESH captcha
+      // Immediate retry with a FRESH captcha (still inside session mutex —
+      // we're called from sapSession.run in makeWorkerPool).
       let fresh = '';
       for (let i = 0; i < 3; i++) {
-        fresh = await nextCaptcha(ctx.auth);
-        if (fresh) break;
-        if (wafActive()) return;
+        const r = await nextCaptcha(ctx.auth);
+        if (r.solved) { fresh = r.solved; break; }
+        if (wafActive()) return { retry: false };
       }
-      if (!fresh) return;
+      if (!fresh) return { retry: false };
       return handleBatch(ctx, item, fresh, workerId, retryDepth + 1);
     }
     log.error(`[w${workerId}] ✗ Wrong captcha 3× — will retry next scan`);
-    return;
+    return { retry: true };
   }
 
   if (isTimeEnded) {
@@ -692,7 +749,21 @@ async function handleBatch(ctx, item, solved, workerId, retryDepth = 0) {
     const retryAt = Date.now() + TIME_ENDED_COOLDOWN_MS;
     log.warn(`[w${workerId}] ⏰ Bid window CLOSED — cooldown ${Math.round(TIME_ENDED_COOLDOWN_MS / 1000)}s`);
     for (const b of item.bids) ctx.cooldown.set(String(b.order.SapOrderId), retryAt);
-    return;
+    return { retry: false };
+  }
+
+  // ---- SAP floor rejection: "Bidding amount should be Greater than or equal to X" ----
+  if (minFloor !== null && minFloor > 0) {
+    metrics.submitsRejected++;
+    for (const b of item.bids) {
+      log.error(
+        `[w${workerId}] ✗ RATE TOO LOW → SapOrderId=${b.order.SapOrderId} ` +
+        `city="${b.city}" spi="${b.spi}" csv=${b.amount} ` +
+        `(SAP floor ≥ ${minFloor}). Update input2.csv and re-run.`
+      );
+      ctx.submitted.add(String(b.order.SapOrderId));
+    }
+    return { retry: false };
   }
 
   if (reduceBy !== null && reduceBy > 0) {
@@ -707,7 +778,7 @@ async function handleBatch(ctx, item, solved, workerId, retryDepth = 0) {
         );
         ctx.submitted.add(String(b.order.SapOrderId));
       }
-      return;
+      return { retry: false };
     }
     const key = item.bids.map((b) => b.order.SapOrderId).join('|');
     const attempt = (ctx.adjustAttempts.get(key) || 0) + 1;
@@ -715,37 +786,38 @@ async function handleBatch(ctx, item, solved, workerId, retryDepth = 0) {
       log.error(`[w${workerId}] ✗ Gave up after ${MAX_ADJUST_RETRIES} auto-adjust retries`);
       for (const b of item.bids) ctx.submitted.add(String(b.order.SapOrderId));
       ctx.adjustAttempts.delete(key);
-      return;
+      return { retry: false };
     }
     ctx.adjustAttempts.set(key, attempt);
     const step = reduceBy + (attempt - 1);
     log.warn(`[w${workerId}] ↓ Auto-adjust ${attempt}/${MAX_ADJUST_RETRIES} — reducing by Rs ${step}`);
     for (const b of item.bids) b.amount = +(b.amount - step).toFixed(2);
-    // Fresh captcha for re-submit
+    // Fresh captcha for re-submit (still inside session mutex)
     let fresh = '';
     for (let i = 0; i < 3; i++) {
-      fresh = await nextCaptcha(ctx.auth);
-      if (fresh) break;
+      const r = await nextCaptcha(ctx.auth);
+      if (r.solved) { fresh = r.solved; break; }
     }
-    if (!fresh) return;
+    if (!fresh) return { retry: false };
     return handleBatch(ctx, item, fresh, workerId, retryDepth + 1);
   }
 
   if (result.info === 'I') {
     log.warn(`[w${workerId}] ↻ Info-level rejection: ${result.text} — retry next scan`);
-    return;
+    return { retry: true };
   }
 
   if (result.info === 'E') {
     metrics.submitsRejected++;
     log.error(`[w${workerId}] ✗ Rejected: ${result.text || '(no text)'}`);
     for (const b of item.bids) ctx.submitted.add(String(b.order.SapOrderId));
-    return;
+    return { retry: false };
   }
 
   // Unknown → mark done to avoid hot-loop
   log.warn(`[w${workerId}] Unknown response info='${result.info}' status=${result.statusCode} — marking done`);
   for (const b of item.bids) ctx.submitted.add(String(b.order.SapOrderId));
+  return { retry: false };
 }
 
 // ---- Tick ------------------------------------------------------------------

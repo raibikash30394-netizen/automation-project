@@ -14,14 +14,14 @@ Two Node.js processes:
 ## What changed vs v1
 
 * **HTTP client**: `undici` `Pool` per host, keep-alive across the whole process → 20–30% faster than axios, no per-request TLS handshake.
-* **Captcha pipelining**: each worker prefetches the *next* batch's captcha in parallel with the current submit. No pre-solved pool — SAP invalidates the previous session captcha on every new fetch.
+* **SAP session mutex** (v2.1): SAP maintains ONE active captcha per session cookie, so parallel workers each fetching their own captcha invalidate each other. The engine now serialises the `fetch-captcha → solve → submit` critical section behind a single mutex — first live run went from ~76% "Wrong Captcha" failure rate down to expected <5%. `PARALLEL_BATCHES` still exists as a config knob but is defaulted to `1` (parallel doesn't help until we support multiple SAP sessions).
 * **Smart batcher**: singles cleared first in chunks of `BATCH_SIZE` (default 3), then club groups (grouped by `ClubId`, max 3 per batch).
-* **4 parallel workers** with **jittered 30–90 ms** stagger to avoid burst alignment with SAP's WAF.
 * **Exponential WAF back-off**: `30 s → 60 s → 120 s cap`, resets to 30 s after 5 min of clean requests.
 * **Retry logic**:
   * Wrong captcha → immediate retry with a fresh captcha (max 3 attempts per batch).
-  * Reduce-amount rejection → optional `AUTO_ADJUST` re-price + resubmit.
-* **Logs**: `pino` + daily rotating JSON files in `logs/` (7-day retention), colored `pino-pretty` stdout for dev.
+  * "Greater than or equal to X" (SAP floor) → logs the exact minimum SAP wants, marks order done, no retry.
+  * "Reduce by X" → optional `AUTO_ADJUST` re-price + resubmit.
+* **Logs**: `pino` + daily rotating JSON files in `logs/` (7-day retention), colored `pino-pretty` stdout for dev. Now distinguishes `sap-empty` (bid window closed) from `solver-unreachable` / `solver-empty` / `waf-406`.
 * **Metrics** dumped every 30 s (submits, wrong-captcha count, avg latency, captcha success rate, WAF hits, throughput/min).
 * **Cache**: sha256(base64) → in-memory `Map` (<5 ms hit). Persisted to `data.json` every 60 s.
 * **No image writes on hot path** — only on solver errors, dumped into `logs/error-YYYY-MM-DD.log`.
@@ -80,7 +80,7 @@ curl -s http://localhost:3000/health | jq
 |------------------------|---------|----------------------------------------------------------|
 | `POLL_MS`              | `60`    | SAP live-orders poll interval (ms)                       |
 | `BATCH_SIZE`           | `3`     | Max orders per submit (SAP hard-limit is 3)              |
-| `PARALLEL_BATCHES`     | `4`     | Concurrent worker count                                  |
+| `PARALLEL_BATCHES`     | `1`     | Worker count (SAP session captcha makes parallel useless — see notes) |
 | `AUTO_ADJUST`          | `false` | Auto-reduce bid on "Reduce by Rs X" rejection            |
 | `MAX_ADJUST_RETRIES`   | `3`     | Cap on auto-adjust attempts per batch                    |
 | `SKIP_RANK_PREVIEW`    | `true`  | Skip the extra rank-preview call (~200–500 ms saved)     |
