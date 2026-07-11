@@ -48,7 +48,7 @@ const CAPTCHA_ORIGIN = new URL(CAPTCHA_URL).origin;
 const CAPTCHA_PATH   = new URL(CAPTCHA_URL).pathname || '/';
 const VENDOR_ID      = process.env.VENDOR_ID || '2210181';
 const PLANT_CODE     = process.env.PLANT_CODE || '6924';
-const POLL_MS        = parseInt(process.env.POLL_MS || '60', 10);
+const POLL_MS        = parseInt(process.env.POLL_MS || '30', 10);
 const BATCH_SIZE     = parseInt(process.env.BATCH_SIZE || '3', 10);
 const PARALLEL_BATCHES = parseInt(process.env.PARALLEL_BATCHES || '4', 10);
 
@@ -402,6 +402,9 @@ async function fetchLiveOrders(auth) {
   return { orders, plantConf };
 }
 
+// Global counter for one-time debug dump of the first captcha response.
+let _firstCaptchaDumped = false;
+
 async function fetchCaptchaImage(auth) {
   if (wafActive()) return { img: null, reason: 'waf' };
   const p = `${SAP_PATH_PFX}/EbiddingCaptchaSet(Vendor='${VENDOR_ID}',Plant='${PLANT_CODE}')`;
@@ -415,6 +418,28 @@ async function fetchCaptchaImage(auth) {
   }
   const d = res.data?.d || {};
   const img = d.ImageString || d.Captcha || d.CaptchaImage || d.EvCaptcha || null;
+
+  // Dump the FIRST captcha response for offline inspection — critical for
+  // debugging what SAP actually sends when the bid window is transitioning.
+  if (!_firstCaptchaDumped) {
+    _firstCaptchaDumped = true;
+    try {
+      const dir = path.join(__dirname, 'logs');
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      const dump = {
+        ts: new Date().toISOString(),
+        statusCode: res.statusCode,
+        keys: Object.keys(d),
+        hasImage: !!img,
+        imageLen: img ? img.length : 0,
+        imagePreview: img ? img.slice(0, 200) : null,
+        rawPreview: (typeof res.data === 'string' ? res.data : JSON.stringify(res.data)).slice(0, 800),
+      };
+      fs.writeFileSync(path.join(dir, 'captcha-response.json'), JSON.stringify(dump, null, 2));
+      log.info(`[captcha-debug] first captcha keys=[${Object.keys(d).join(',')}] hasImage=${!!img}${img ? ' len=' + img.length : ''} — dump: logs/captcha-response.json`);
+    } catch (_) { /* silent */ }
+  }
+
   return { img, reason: img ? 'ok' : 'sap-empty' };
 }
 
@@ -704,20 +729,33 @@ function makeWorkerPool(ctx) {
   }
 
   async function runOne(workerId) {
-    // Jittered stagger so 4 workers don't all queue on the mutex at the same
-    // instant — helps interleave with the SAP TCP window.
-    const jitter = 30 + Math.floor(Math.random() * 60);
-    await new Promise((r) => setTimeout(r, jitter));
+    // Jittered stagger ONLY when multiple workers are running — otherwise it
+    // just adds 30-90 ms of pointless wait to the single active worker (which
+    // is the speed-critical path when only 1 bid is queued).
+    if (PARALLEL_BATCHES > 1) {
+      const jitter = 30 + Math.floor(Math.random() * 60);
+      await new Promise((r) => setTimeout(r, jitter));
+    }
 
     while (cursor < ctx.plan.length) {
       const item = ctx.plan[cursor++];
       const t0 = Date.now();
       for (const b of item.bids) ctx.inFlight.add(String(b.order.SapOrderId));
 
+      // SPEED: the tick pre-fetched a captcha in parallel with fetchLiveOrders.
+      // The FIRST worker consumes that captcha instantly (0 extra ms).  Later
+      // workers fetch fresh inside the mutex.  In practice most scans have
+      // just 1 batch → we bid ~200 ms faster than sequential fetch.
+      let prewarm = '';
+      if (workerId === 1 && ctx.prewarmCaptcha) {
+        prewarm = ctx.prewarmCaptcha;
+        ctx.prewarmCaptcha = null;   // consume once
+      }
+
       // Critical section: hold the SAP session for the fetch-solve-submit
       // atomic unit. Only ONE worker at a time.
       const outcome = await sapSession.run(async () => {
-        const solved = await fetchFreshCaptcha(workerId);
+        const solved = prewarm || await fetchFreshCaptcha(workerId);
         if (!solved) return { skipped: true };
         return await handleBatch(ctx, item, solved, workerId);
       });
@@ -845,6 +883,18 @@ async function handleBatch(ctx, item, solved, workerId, retryDepth = 0) {
     return handleBatch(ctx, item, fresh, workerId, retryDepth + 1);
   }
 
+  // ---- HTTP 201 with empty response body = success ----
+  // SAP returns 201 Created + empty NavEBiddingMessage + empty Ev_Text when
+  // the save succeeded silently (no confirmation text).  Treat as accepted
+  // instead of "unknown", otherwise every fast bid gets logged as failure.
+  if ((result.statusCode === 200 || result.statusCode === 201) &&
+      !result.info && !result.text && !isTimeEnded && !isWrongCaptcha && reduceBy === null && minFloor === null) {
+    metrics.submitsOk++;
+    log.info(`[w${workerId}] ✓ ACCEPTED (${item.kind}, ${bids.length}): HTTP ${result.statusCode} (empty confirmation)`);
+    for (const b of item.bids) ctx.submitted.add(String(b.order.SapOrderId));
+    return { ok: true };
+  }
+
   if (result.info === 'I') {
     log.warn(`[w${workerId}] ↻ Info-level rejection: ${result.text} — retry next scan`);
     return { retry: true };
@@ -872,11 +922,21 @@ async function tick(ctx) {
     return;
   }
   try {
-    const { orders } = await fetchLiveOrders(ctx.auth);
+    // ---- SPEED CRITICAL: parallel fetch ----
+    // Fire BidOrderListSet and EbiddingCaptchaSet at exactly the same moment.
+    // While SAP is deciding what orders exist, we're already fetching the
+    // captcha for the (probable) upcoming submit.  If orders are empty we
+    // discard the captcha — cheap.  If orders arrive, worker consumes the
+    // pre-warmed captcha instantly → saves ~200 ms per bid, which is the
+    // difference between winning L1 and losing to a faster opponent.
+    const [ordersRes, captchaRes] = await Promise.all([
+      fetchLiveOrders(ctx.auth),
+      fetchCaptchaImage(ctx.auth),
+    ]);
+    const { orders } = ordersRes;
+
     if (!orders.length) {
-      // Idle heartbeat — every ~10s (at POLL_MS=60ms → 167 scans/10s) so user
-      // knows the bot is alive even when SAP has no live orders / bid window
-      // is closed.
+      // Idle heartbeat — every ~10s so user knows the bot is alive.
       const beat = Math.max(1, Math.round(10_000 / Math.max(POLL_MS, 1)));
       if (ctx.scan % beat === 0) {
         log.info(`Scan #${ctx.scan} | SAP returned 0 live orders (bid window likely closed) — waiting…`);
@@ -892,13 +952,22 @@ async function tick(ctx) {
     const { plan, stats } = buildBatches(orders, ctx.rules, ctx.blacklist, ctx.submitted, ctx.inFlight, ctx.cooldown);
     if (stats.matched === 0) return;
 
+    // Solve the pre-fetched captcha NOW (usually ~5 ms cache hit) so the
+    // first worker doesn't wait.
+    let prewarmSolved = '';
+    if (captchaRes.img) {
+      const solverRes = await solveViaLocal(captchaRes.img);
+      if (solverRes.solved) prewarmSolved = solverRes.solved;
+    }
+
     log.info(
       `Scan #${ctx.scan} | orders=${stats.total} matched=${stats.matched} bl=${stats.blacklisted} ` +
       `no-rule=${stats.noRule} club-drop=${stats.clubDropped} cool=${stats.coolskip} | ` +
-      `plan=[singles+clubs=${plan.length}, parallel=${PARALLEL_BATCHES}]`
+      `plan=[singles+clubs=${plan.length}, parallel=${PARALLEL_BATCHES}]` +
+      (prewarmSolved ? ' [captcha PRE-WARMED]' : '')
     );
 
-    const workerCtx = { ...ctx, plan };
+    const workerCtx = { ...ctx, plan, prewarmCaptcha: prewarmSolved };
     const workers = makeWorkerPool(workerCtx);
     await Promise.all(workers).catch(() => {});
   } catch (e) {
