@@ -724,6 +724,8 @@ function makeWorkerPool(ctx) {
 
       if (outcome && outcome.skipped) {
         log.warn(`[w${workerId}] no captcha for ${item.kind} batch (${item.bids.length}) — retry next scan`);
+        for (const b of item.bids) ctx.inFlight.delete(String(b.order.SapOrderId));
+        continue;   // don't pollute latency metric with no-op scans
       }
 
       for (const b of item.bids) ctx.inFlight.delete(String(b.order.SapOrderId));
@@ -871,7 +873,16 @@ async function tick(ctx) {
   }
   try {
     const { orders } = await fetchLiveOrders(ctx.auth);
-    if (!orders.length) return;
+    if (!orders.length) {
+      // Idle heartbeat — every ~10s (at POLL_MS=60ms → 167 scans/10s) so user
+      // knows the bot is alive even when SAP has no live orders / bid window
+      // is closed.
+      const beat = Math.max(1, Math.round(10_000 / Math.max(POLL_MS, 1)));
+      if (ctx.scan % beat === 0) {
+        log.info(`Scan #${ctx.scan} | SAP returned 0 live orders (bid window likely closed) — waiting…`);
+      }
+      return;
+    }
 
     if (!ctx.sampled) {
       ctx.sampled = true;
