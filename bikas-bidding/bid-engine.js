@@ -742,20 +742,14 @@ function makeWorkerPool(ctx) {
       const t0 = Date.now();
       for (const b of item.bids) ctx.inFlight.add(String(b.order.SapOrderId));
 
-      // SPEED: the tick pre-fetched a captcha in parallel with fetchLiveOrders.
-      // The FIRST worker consumes that captcha instantly (0 extra ms).  Later
-      // workers fetch fresh inside the mutex.  In practice most scans have
-      // just 1 batch → we bid ~200 ms faster than sequential fetch.
-      let prewarm = '';
-      if (workerId === 1 && ctx.prewarmCaptcha) {
-        prewarm = ctx.prewarmCaptcha;
-        ctx.prewarmCaptcha = null;   // consume once
-      }
-
       // Critical section: hold the SAP session for the fetch-solve-submit
       // atomic unit. Only ONE worker at a time.
+      // JIT captcha (fetched INSIDE the mutex, right before submit) is the
+      // proven pattern — v1 used the same approach and had ~0% wrong-captcha
+      // failure rate. Any form of prefetch/prewarm outside the mutex causes
+      // SAP-session captcha invalidation races.
       const outcome = await sapSession.run(async () => {
-        const solved = prewarm || await fetchFreshCaptcha(workerId);
+        const solved = await fetchFreshCaptcha(workerId);
         if (!solved) return { skipped: true };
         return await handleBatch(ctx, item, solved, workerId);
       });
@@ -922,18 +916,13 @@ async function tick(ctx) {
     return;
   }
   try {
-    // ---- SPEED CRITICAL: parallel fetch ----
-    // Fire BidOrderListSet and EbiddingCaptchaSet at exactly the same moment.
-    // While SAP is deciding what orders exist, we're already fetching the
-    // captcha for the (probable) upcoming submit.  If orders are empty we
-    // discard the captcha — cheap.  If orders arrive, worker consumes the
-    // pre-warmed captcha instantly → saves ~200 ms per bid, which is the
-    // difference between winning L1 and losing to a faster opponent.
-    const [ordersRes, captchaRes] = await Promise.all([
-      fetchLiveOrders(ctx.auth),
-      fetchCaptchaImage(ctx.auth),
-    ]);
-    const { orders } = ordersRes;
+    // Just fetch orders. Captcha will be fetched JIT by the worker inside the
+    // SAP-session mutex, right before submitBid. We tried parallel prefetch
+    // here (orders + captcha in Promise.all) but it caused every first-attempt
+    // submit to fail with "Wrong Captcha" — SAP has a subtle timing race
+    // between session-captcha commit and validation when two fetches happen
+    // close together. JIT (v1 proven pattern) has ~0% wrong-captcha rate.
+    const { orders } = await fetchLiveOrders(ctx.auth);
 
     if (!orders.length) {
       // Idle heartbeat — every ~10s so user knows the bot is alive.
@@ -952,22 +941,13 @@ async function tick(ctx) {
     const { plan, stats } = buildBatches(orders, ctx.rules, ctx.blacklist, ctx.submitted, ctx.inFlight, ctx.cooldown);
     if (stats.matched === 0) return;
 
-    // Solve the pre-fetched captcha NOW (usually ~5 ms cache hit) so the
-    // first worker doesn't wait.
-    let prewarmSolved = '';
-    if (captchaRes.img) {
-      const solverRes = await solveViaLocal(captchaRes.img);
-      if (solverRes.solved) prewarmSolved = solverRes.solved;
-    }
-
     log.info(
       `Scan #${ctx.scan} | orders=${stats.total} matched=${stats.matched} bl=${stats.blacklisted} ` +
       `no-rule=${stats.noRule} club-drop=${stats.clubDropped} cool=${stats.coolskip} | ` +
-      `plan=[singles+clubs=${plan.length}, parallel=${PARALLEL_BATCHES}]` +
-      (prewarmSolved ? ' [captcha PRE-WARMED]' : '')
+      `plan=[singles+clubs=${plan.length}, parallel=${PARALLEL_BATCHES}]`
     );
 
-    const workerCtx = { ...ctx, plan, prewarmCaptcha: prewarmSolved };
+    const workerCtx = { ...ctx, plan };
     const workers = makeWorkerPool(workerCtx);
     await Promise.all(workers).catch(() => {});
   } catch (e) {
@@ -1004,6 +984,13 @@ async function main() {
     `Config: POLL_MS=${POLL_MS} BATCH_SIZE=${BATCH_SIZE} PARALLEL=${PARALLEL_BATCHES} ` +
     `AUTO_ADJUST=${AUTO_ADJUST} WAF=${WAF_MIN_MS}→${WAF_MAX_MS}ms metrics=${METRICS_MS}ms`
   );
+  if (PARALLEL_BATCHES > 1) {
+    log.warn(
+      `⚠  PARALLEL_BATCHES=${PARALLEL_BATCHES} — SAP session mutex forces one-at-a-time ` +
+      `anyway (single cookie = one active captcha per session). Higher values just add ` +
+      `mutex-queue overhead. Recommended: set PARALLEL_BATCHES=1 in .env for lowest latency.`
+    );
+  }
 
   const auth = new AuthConfig();
   if (!auth.token) await auth.refreshToken();
