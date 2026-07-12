@@ -725,19 +725,32 @@ function makeWorkerPool(ctx) {
   let cursor = 0;
 
   async function fetchFreshCaptcha(workerId) {
-    // 3 quick attempts — SAP sometimes returns an empty `ImageString` when the
-    // bid window is transitioning; solver may occasionally return 'Redo'.
-    for (let i = 0; i < 3; i++) {
+    // First try: single fetch.
+    const r1 = await nextCaptcha(ctx.auth);
+    if (r1.solved) return r1.solved;
+    if (wafActive()) return '';
+
+    // sap-empty = bid window is CLOSED on the SAP side. Retrying just wastes
+    // ~500 ms per attempt (each SAP round-trip). The window will re-open on
+    // its own — we just need to poll again on the NEXT scan. This saves the
+    // ~1500 ms of retry-loop time that was previously making us miss the
+    // moment the window opens (opponents got in first, leaving us at rank 5).
+    if (r1.reason === 'sap-empty') {
+      // Log once every ~10s so the reason is still visible.
+      if (ctx.scan % Math.max(1, Math.round(10_000 / Math.max(POLL_MS, 1))) === 0) {
+        log.warn(`[w${workerId}] SAP returned empty captcha (bid window likely closed) — polling next scan`);
+      }
+      return '';
+    }
+
+    // Real transient error (solver down, network hiccup, etc.) — retry 2 more times.
+    log.warn(`[w${workerId}] captcha attempt 1/3 failed: ${r1.reason}`);
+    for (let i = 1; i < 3; i++) {
       const r = await nextCaptcha(ctx.auth);
       if (r.solved) return r.solved;
       if (wafActive()) return '';
-      if (r.reason === 'sap-empty' && i === 0) {
-        // First time we see empty from SAP this scan — log once so user
-        // knows the bid window is currently closed.
-        log.warn(`[w${workerId}] SAP returned empty captcha (bid window likely closed) — retrying`);
-      } else if (r.reason && r.reason !== 'ok' && r.reason !== 'sap-empty') {
-        log.warn(`[w${workerId}] captcha attempt ${i + 1}/3 failed: ${r.reason}`);
-      }
+      if (r.reason === 'sap-empty') return ''; // window closed mid-retry — bail
+      log.warn(`[w${workerId}] captcha attempt ${i + 1}/3 failed: ${r.reason}`);
     }
     return '';
   }
@@ -769,7 +782,8 @@ function makeWorkerPool(ctx) {
       });
 
       if (outcome && outcome.skipped) {
-        log.warn(`[w${workerId}] no captcha for ${item.kind} batch (${item.bids.length}) — retry next scan`);
+        // Don't log per-batch — fetchFreshCaptcha already logged the reason
+        // (throttled). Additional per-batch log was just noise.
         for (const b of item.bids) ctx.inFlight.delete(String(b.order.SapOrderId));
         continue;   // don't pollute latency metric with no-op scans
       }
@@ -955,11 +969,19 @@ async function tick(ctx) {
     const { plan, stats } = buildBatches(orders, ctx.rules, ctx.blacklist, ctx.submitted, ctx.inFlight, ctx.cooldown);
     if (stats.matched === 0) return;
 
-    log.info(
-      `Scan #${ctx.scan} | orders=${stats.total} matched=${stats.matched} bl=${stats.blacklisted} ` +
-      `no-rule=${stats.noRule} club-drop=${stats.clubDropped} cool=${stats.coolskip} | ` +
-      `plan=[singles+clubs=${plan.length}, parallel=${PARALLEL_BATCHES}]`
-    );
+    // Throttle the scan log: it repeats identically for every scan while
+    // waiting for the captcha to appear. Log only when the plan changes or
+    // every ~5s so log stays readable.
+    const planSig = `${stats.matched}/${plan.length}`;
+    if (ctx._lastPlanSig !== planSig || (ctx.scan - (ctx._lastPlanLoggedScan || 0)) * POLL_MS > 5000) {
+      log.info(
+        `Scan #${ctx.scan} | orders=${stats.total} matched=${stats.matched} bl=${stats.blacklisted} ` +
+        `no-rule=${stats.noRule} club-drop=${stats.clubDropped} cool=${stats.coolskip} | ` +
+        `plan=[singles+clubs=${plan.length}, parallel=${PARALLEL_BATCHES}]`
+      );
+      ctx._lastPlanSig = planSig;
+      ctx._lastPlanLoggedScan = ctx.scan;
+    }
 
     const workerCtx = { ...ctx, plan };
     const workers = makeWorkerPool(workerCtx);
