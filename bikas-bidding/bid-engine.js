@@ -721,7 +721,7 @@ function parseMinFloor(text) {
 
 // ---- Batcher --------------------------------------------------------------
 
-function buildBatches(orders, rules, blacklist, seenSubmitted, inFlight, cooldown) {
+function buildBatches(orders, rules, blacklist, seenSubmitted, inFlight, cooldown, sessionCount = 1) {
   const now = Date.now();
   const byClub = new Map();
   const stats = { total: orders.length, matched: 0, blacklisted: 0, noRule: 0, clubDropped: 0, coolskip: 0 };
@@ -776,10 +776,22 @@ function buildBatches(orders, rules, blacklist, seenSubmitted, inFlight, cooldow
     }
   }
 
-  // Singles: chunk by BATCH_SIZE
+  // ---- SMART BATCHING for multi-session parallelism ----
+  // Choose effective batch size to spread singles across ALL sessions when
+  // there are enough sessions. Example:
+  //   • 2 singles + 2 sessions → 2 batches of 1 (both sessions fire in parallel)
+  //   • 6 singles + 2 sessions → 2 batches of 3 (each session gets one)
+  //   • 3 singles + 4 sessions → 3 batches of 1 (3 sessions fire, 1 idle)
+  //   • 8 singles + 4 sessions → 4 batches of 2 (all fire in parallel)
+  // Falls back to BATCH_SIZE (usually 3) when there are far more singles than sessions.
+  const N = singles.length;
+  const S = Math.max(1, sessionCount);
+  const effectiveBatchSize = N > 0 ? Math.min(BATCH_SIZE, Math.max(1, Math.ceil(N / S))) : BATCH_SIZE;
+
+  // Singles: chunk by effective batch size (session-aware)
   const singleBatches = [];
-  for (let i = 0; i < singles.length; i += BATCH_SIZE) {
-    singleBatches.push(singles.slice(i, i + BATCH_SIZE));
+  for (let i = 0; i < singles.length; i += effectiveBatchSize) {
+    singleBatches.push(singles.slice(i, i + effectiveBatchSize));
   }
 
   // Order: singles first, then clubs
@@ -787,7 +799,7 @@ function buildBatches(orders, rules, blacklist, seenSubmitted, inFlight, cooldow
   for (const b of singleBatches) plan.push({ kind: 'single', bids: b });
   for (const c of clubGroups)    plan.push({ kind: 'club',   bids: c.bids, clubId: c.clubId });
 
-  return { plan, stats };
+  return { plan, stats, effectiveBatchSize };
 }
 
 // ---- Worker pool: one worker per SAP session, parallel across sessions ----
@@ -1062,7 +1074,10 @@ async function tick(ctx) {
       log.info(`Sample order keys: ${Object.keys(orders[0]).join(', ')}`);
     }
 
-    const { plan, stats } = buildBatches(orders, ctx.rules, ctx.blacklist, ctx.submitted, ctx.inFlight, ctx.cooldown);
+    const { plan, stats, effectiveBatchSize } = buildBatches(
+      orders, ctx.rules, ctx.blacklist, ctx.submitted, ctx.inFlight, ctx.cooldown,
+      ctx.sessions.length
+    );
     if (stats.matched === 0) {
       ctx._matchedButNoCaptcha = false;
       return;
@@ -1076,7 +1091,7 @@ async function tick(ctx) {
       log.info(
         `Scan #${ctx.scan} | orders=${stats.total} matched=${stats.matched} bl=${stats.blacklisted} ` +
         `no-rule=${stats.noRule} club-drop=${stats.clubDropped} cool=${stats.coolskip} | ` +
-        `plan=[singles+clubs=${plan.length}, sessions=${ctx.sessions.length}]` +
+        `plan=[batches=${plan.length}×${effectiveBatchSize || BATCH_SIZE}, sessions=${ctx.sessions.length}]` +
         (canReuseOrders ? ' [cached-orders]' : '')
       );
       ctx._lastPlanSig = planSig;
