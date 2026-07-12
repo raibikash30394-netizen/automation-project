@@ -83,7 +83,7 @@ setGlobalDispatcher(new Agent({
 }));
 
 const sapPool = new Pool(SAP_ORIGIN, {
-  connections: 8,
+  connections: 32,
   pipelining: 1,
   keepAliveTimeout: 60_000,
   headersTimeout: 15_000,
@@ -125,15 +125,39 @@ function wafRemainingMs() { return Math.max(0, waf.until - Date.now()); }
 
 // ---- Auth (cookie + CSRF token) --------------------------------------------
 
+/**
+ * One SAP session = one cookie + its own CSRF token + its own session-serialisation
+ * mutex. SAP maintains exactly ONE active captcha per session, so parallelism
+ * across bids is only possible via MULTIPLE independent sessions (different
+ * cookies from different browser logins).
+ */
 class AuthConfig {
-  constructor() {
-    this.cookie = this._read(COOKIE_FILE);
-    this.token  = this._read(TOKEN_FILE);
+  constructor(id, cookieFile, tokenFile) {
+    this.id = id;                          // e.g. "s1", "s2"
+    this.cookieFile = cookieFile;
+    this.tokenFile = tokenFile;
+    this.cookie = this._read(cookieFile);
+    this.token  = this._read(tokenFile);
     this._refreshInFlight = null;
     this._lastPlantConf = null;
+    // Per-session serialisation mutex — fetch-captcha → submit is atomic.
+    // Sessions are independent, so mutexes are per-instance.
+    let chain = Promise.resolve();
+    this.mutex = {
+      _busy: false,
+      run: (fn) => {
+        const wrapped = async () => {
+          this.mutex._busy = true;
+          try { return await fn(); }
+          finally { this.mutex._busy = false; }
+        };
+        const p = chain.then(wrapped, wrapped);
+        chain = p.catch(() => {});
+        return p;
+      },
+    };
     if (!this.cookie) {
-      log.error(`cookie.txt is empty. Paste your logged-in browser Cookie header into ${COOKIE_FILE} and restart.`);
-      process.exit(1);
+      throw new Error(`Session ${id}: ${cookieFile} is empty. Paste browser Cookie header there.`);
     }
   }
 
@@ -158,7 +182,7 @@ class AuthConfig {
   async refreshToken() {
     if (this._refreshInFlight) return this._refreshInFlight;
     this._refreshInFlight = (async () => {
-      log.info('Refreshing CSRF token…');
+      log.info(`[${this.id}] Refreshing CSRF token…`);
       try {
         const { statusCode, headers } = await sapPool.request({
           path: `${SAP_PATH_PFX}/SessionSet('')`,
@@ -170,8 +194,8 @@ class AuthConfig {
           throw new Error(`HTTP ${statusCode} — no CSRF token returned. Cookie may have expired.`);
         }
         this.token = String(tok);
-        fs.writeFileSync(TOKEN_FILE, this.token, 'utf8');
-        log.info('CSRF token saved to token.txt');
+        fs.writeFileSync(this.tokenFile, this.token, 'utf8');
+        log.info(`[${this.id}] CSRF token saved to ${path.basename(this.tokenFile)}`);
         return this.token;
       } finally {
         this._refreshInFlight = null;
@@ -180,6 +204,93 @@ class AuthConfig {
     return this._refreshInFlight;
   }
 }
+
+/**
+ * Discover session cookie files in the working directory.
+ *
+ * Convention:
+ *   cookie.txt    → session s1  (backward-compat with single-session mode)
+ *   cookie2.txt   → session s2
+ *   cookie3.txt   → session s3
+ *   cookie4.txt   → session s4
+ *   ...           up to cookie10.txt
+ *
+ * Each file: one line = raw browser Cookie header from a separate SAP login.
+ * All sessions must be for the SAME vendor+plant — they submit in parallel
+ * to the same bid queue, so the vendor identity has to match.
+ *
+ * Returns an array of { id, cookieFile, tokenFile } (never empty; falls back
+ * to single cookie.txt if it's the only one).
+ */
+function discoverSessions() {
+  const sessions = [];
+  // First session: cookie.txt / token.txt (existing files stay untouched)
+  if (fs.existsSync(COOKIE_FILE)) {
+    sessions.push({ id: 's1', cookieFile: COOKIE_FILE, tokenFile: TOKEN_FILE });
+  }
+  // Additional sessions: cookie2.txt … cookie10.txt
+  for (let n = 2; n <= 10; n++) {
+    const cf = path.join(ROOT, `cookie${n}.txt`);
+    if (fs.existsSync(cf) && fs.readFileSync(cf, 'utf8').trim()) {
+      const tf = path.join(ROOT, `token${n}.txt`);
+      sessions.push({ id: `s${n}`, cookieFile: cf, tokenFile: tf });
+    }
+  }
+  if (!sessions.length) {
+    log.error(`No cookie file found. Paste your logged-in browser Cookie header into ${COOKIE_FILE}`);
+    process.exit(1);
+  }
+  return sessions;
+}
+
+/**
+ * Bid log book — every submit attempt (success, wrong-captcha, rejected) is
+ * appended as one CSV row to `logs/bids-YYYY-MM-DD.csv` for post-mortem.
+ * Rotated daily so files stay small.
+ */
+const bidLog = (() => {
+  const dir = path.join(ROOT, 'logs');
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  let currentDate = '';
+  let stream = null;
+  const HEADER = 'timestamp,session,sap_order_id,city,spi,csv_rate,submit_ms,status,message\n';
+  function open() {
+    const today = new Date().toISOString().slice(0, 10);
+    if (today === currentDate && stream) return stream;
+    if (stream) { try { stream.end(); } catch (_) { /* ignore */ } }
+    currentDate = today;
+    const file = path.join(dir, `bids-${today}.csv`);
+    const exists = fs.existsSync(file);
+    stream = fs.createWriteStream(file, { flags: 'a' });
+    if (!exists) stream.write(HEADER);
+    return stream;
+  }
+  function esc(v) {
+    const s = String(v == null ? '' : v);
+    if (s.includes(',') || s.includes('"') || s.includes('\n')) {
+      return '"' + s.replace(/"/g, '""') + '"';
+    }
+    return s;
+  }
+  return {
+    write(row) {
+      try {
+        const s = open();
+        s.write([
+          new Date().toISOString(),
+          row.session || '',
+          row.sap_order_id || '',
+          row.city || '',
+          row.spi || '',
+          row.csv_rate ?? '',
+          row.submit_ms ?? '',
+          row.status || '',
+          row.message || '',
+        ].map(esc).join(',') + '\n');
+      } catch (_) { /* never let logging break bidding */ }
+    },
+  };
+})();
 
 // ---- Small SAP request helper (with 403 CSRF-refresh once) ----------------
 
@@ -604,39 +715,9 @@ function parseMinFloor(text) {
   return max;
 }
 
-/**
- * Serialised SAP session mutex.
- *
- * SAP maintains ONE active captcha per session (cookie). When multiple parallel
- * workers each call EbiddingCaptchaSet concurrently, the last fetch invalidates
- * every earlier one — the empirical failure mode on the first live run was
- * ~76% "Wrong Captcha" rejections.
- *
- * Fix: serialise the critical section (`fetch captcha → solve → submit`) so
- * only ONE worker holds the SAP session at a time. Workers still run in
- * parallel for everything else (CSV parsing, next-scan polling, in-flight
- * bookkeeping), but the SAP-session-critical part is one-at-a-time.
- */
-const sapSession = (() => {
-  let chain = Promise.resolve();
-  const obj = {
-    _busy: false,
-    /** Serialise `fn` — returns whatever fn resolves to. */
-    run(fn) {
-      const wrapped = async () => {
-        obj._busy = true;
-        try { return await fn(); }
-        finally { obj._busy = false; }
-      };
-      const p = chain.then(wrapped, wrapped);
-      // Keep chain alive even on rejection; swallow so one failure
-      // doesn't poison every future queued task.
-      chain = p.catch(() => {});
-      return p;
-    },
-  };
-  return obj;
-})();
+// ---- Per-session mutex (defined on AuthConfig) ----------------------------
+// The old global `sapSession` object was replaced by `authInstance.mutex`
+// so different SAP sessions can truly run in parallel.
 
 // ---- Batcher --------------------------------------------------------------
 
@@ -709,83 +790,63 @@ function buildBatches(orders, rules, blacklist, seenSubmitted, inFlight, cooldow
   return { plan, stats };
 }
 
-// ---- Worker (JIT captcha inside SAP-session mutex) ------------------------
+// ---- Worker pool: one worker per SAP session, parallel across sessions ----
 
 /**
- * Each worker pulls batches from a shared queue. Inside the SAP session mutex
- * it fetches a fresh captcha, solves it, and submits — all in one atomic step
- * so no concurrent worker can invalidate the captcha mid-flight.
+ * With N SAP session cookies, we launch N workers — one per session. Each
+ * worker holds its OWN mutex (fetch-captcha → submit is atomic PER session
+ * but truly parallel ACROSS sessions).  A batch queue is round-robin dispatched.
  *
- * We removed the earlier "pipelining" prefetch: even though it looked like a
- * win on paper, SAP's captcha invalidation semantics mean prefetching the
- * next captcha WHILE the current one is in-flight silently invalidates the
- * current one on the server side → 76% "Wrong Captcha" on the first live run.
+ * With 4 cookies: 4 bids can hit SAP simultaneously, cutting effective
+ * end-to-end latency by ~4× when there are multiple batches to submit.
  */
 function makeWorkerPool(ctx) {
   let cursor = 0;
 
-  async function fetchFreshCaptcha(workerId) {
-    // First try: single fetch.
-    const r1 = await nextCaptcha(ctx.auth);
+  async function fetchFreshCaptcha(auth, workerId) {
+    const r1 = await nextCaptcha(auth);
     if (r1.solved) return r1.solved;
     if (wafActive()) return '';
 
     // sap-empty = bid window is CLOSED on the SAP side. Retrying just wastes
-    // ~500 ms per attempt (each SAP round-trip). The window will re-open on
-    // its own — we just need to poll again on the NEXT scan. This saves the
-    // ~1500 ms of retry-loop time that was previously making us miss the
-    // moment the window opens (opponents got in first, leaving us at rank 5).
+    // ~500 ms per attempt. Return immediately, poll again next scan.
     if (r1.reason === 'sap-empty') {
-      // Log once every ~10s so the reason is still visible.
       if (ctx.scan % Math.max(1, Math.round(10_000 / Math.max(POLL_MS, 1))) === 0) {
-        log.warn(`[w${workerId}] SAP returned empty captcha (bid window likely closed) — polling next scan`);
+        log.warn(`[${workerId}] SAP returned empty captcha (bid window likely closed) — polling next scan`);
       }
       return '';
     }
 
-    // Real transient error (solver down, network hiccup, etc.) — retry 2 more times.
-    log.warn(`[w${workerId}] captcha attempt 1/3 failed: ${r1.reason}`);
+    // Real transient error — retry 2 more times.
+    log.warn(`[${workerId}] captcha attempt 1/3 failed: ${r1.reason}`);
     for (let i = 1; i < 3; i++) {
-      const r = await nextCaptcha(ctx.auth);
+      const r = await nextCaptcha(auth);
       if (r.solved) return r.solved;
       if (wafActive()) return '';
-      if (r.reason === 'sap-empty') return ''; // window closed mid-retry — bail
-      log.warn(`[w${workerId}] captcha attempt ${i + 1}/3 failed: ${r.reason}`);
+      if (r.reason === 'sap-empty') return '';
+      log.warn(`[${workerId}] captcha attempt ${i + 1}/3 failed: ${r.reason}`);
     }
     return '';
   }
 
-  async function runOne(workerId) {
-    // Jittered stagger ONLY when multiple workers are running — otherwise it
-    // just adds 30-90 ms of pointless wait to the single active worker (which
-    // is the speed-critical path when only 1 bid is queued).
-    if (PARALLEL_BATCHES > 1) {
-      const jitter = 30 + Math.floor(Math.random() * 60);
-      await new Promise((r) => setTimeout(r, jitter));
-    }
-
+  async function runOne(session) {
+    const workerId = session.id;
     while (cursor < ctx.plan.length) {
       const item = ctx.plan[cursor++];
       const t0 = Date.now();
       for (const b of item.bids) ctx.inFlight.add(String(b.order.SapOrderId));
 
-      // Critical section: hold the SAP session for the fetch-solve-submit
-      // atomic unit. Only ONE worker at a time.
-      // JIT captcha (fetched INSIDE the mutex, right before submit) is the
-      // proven pattern — v1 used the same approach and had ~0% wrong-captcha
-      // failure rate. Any form of prefetch/prewarm outside the mutex causes
-      // SAP-session captcha invalidation races.
-      const outcome = await sapSession.run(async () => {
-        const solved = await fetchFreshCaptcha(workerId);
+      // Critical section — per-session mutex (independent across sessions):
+      // fetch captcha → solve → submit as one atomic unit for THIS session.
+      const outcome = await session.mutex.run(async () => {
+        const solved = await fetchFreshCaptcha(session, workerId);
         if (!solved) return { skipped: true };
-        return await handleBatch(ctx, item, solved, workerId);
+        return await handleBatch(ctx, session, item, solved, workerId);
       });
 
       if (outcome && outcome.skipped) {
-        // Don't log per-batch — fetchFreshCaptcha already logged the reason
-        // (throttled). Additional per-batch log was just noise.
         for (const b of item.bids) ctx.inFlight.delete(String(b.order.SapOrderId));
-        continue;   // don't pollute latency metric with no-op scans
+        continue;
       }
 
       for (const b of item.bids) ctx.inFlight.delete(String(b.order.SapOrderId));
@@ -793,14 +854,15 @@ function makeWorkerPool(ctx) {
     }
   }
 
-  const n = Math.min(PARALLEL_BATCHES, ctx.plan.length);
-  return Array.from({ length: n }, (_, i) => runOne(i + 1));
+  // One worker per session — pure parallelism across cookies.
+  return ctx.sessions.map((s) => runOne(s));
 }
 
-async function handleBatch(ctx, item, solved, workerId, retryDepth = 0) {
+async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0) {
+  const auth = session;   // session IS the AuthConfig (with .mutex, .headers, etc.)
   metrics.submits++;
   const list = item.bids.map((b) => `${b.order.SapOrderId}[${b.city}/${b.spi}]@${b.amount}`).join(', ');
-  log.info(`[w${workerId}] → ${item.kind.toUpperCase()}${item.clubId ? ' id=' + item.clubId : ''} (${item.bids.length}): ${list}`);
+  log.info(`[${workerId}] → ${item.kind.toUpperCase()}${item.clubId ? ' id=' + item.clubId : ''} (${item.bids.length}): ${list}`);
 
   const bids = item.bids.map((b) => ({
     sapOrderId: b.order.SapOrderId,
@@ -809,7 +871,7 @@ async function handleBatch(ctx, item, solved, workerId, retryDepth = 0) {
     clubId    : b.order.ClubId || '',
   }));
 
-  const result = await submitBid(ctx.auth, bids, solved);
+  const result = await submitBid(auth, bids, solved);
 
   const textLower = (result.text || '').toString().toLowerCase();
   const evText    = (result.raw?.d?.Ev_Text || '').toString();
@@ -821,37 +883,48 @@ async function handleBatch(ctx, item, solved, workerId, retryDepth = 0) {
   const reduceBy       = parseReduceAmount(evText || result.text);
   const minFloor       = parseMinFloor(evText || result.text);
 
+  const bidLogRow = (b, status, message) => bidLog.write({
+    session: workerId, sap_order_id: b.order.SapOrderId, city: b.city, spi: b.spi,
+    csv_rate: b.amount, submit_ms: result.submitMs, status, message,
+  });
+
   if (isRealSuccess) {
     metrics.submitsOk++;
-    log.info(`[w${workerId}] ✓ ACCEPTED (${item.kind}, ${bids.length}) in ${result.submitMs}ms: ${result.text || 'OK'}`);
-    for (const b of item.bids) ctx.submitted.add(String(b.order.SapOrderId));
+    log.info(`[${workerId}] ✓ ACCEPTED (${item.kind}, ${bids.length}) in ${result.submitMs}ms: ${result.text || 'OK'}`);
+    for (const b of item.bids) {
+      ctx.submitted.add(String(b.order.SapOrderId));
+      bidLogRow(b, 'ACCEPTED', result.text || 'OK');
+    }
     return { ok: true };
   }
 
   if (isWrongCaptcha) {
     metrics.submitsWrongCaptcha++;
     if (retryDepth < 3) {
-      log.warn(`[w${workerId}] ↻ Wrong captcha — refetching + retry ${retryDepth + 1}/3`);
-      // Immediate retry with a FRESH captcha (still inside session mutex —
-      // we're called from sapSession.run in makeWorkerPool).
+      log.warn(`[${workerId}] ↻ Wrong captcha — refetching + retry ${retryDepth + 1}/3`);
+      // Immediate retry with a FRESH captcha (still inside session mutex).
       let fresh = '';
       for (let i = 0; i < 3; i++) {
-        const r = await nextCaptcha(ctx.auth);
+        const r = await nextCaptcha(auth);
         if (r.solved) { fresh = r.solved; break; }
         if (wafActive()) return { retry: false };
       }
       if (!fresh) return { retry: false };
-      return handleBatch(ctx, item, fresh, workerId, retryDepth + 1);
+      return handleBatch(ctx, session, item, fresh, workerId, retryDepth + 1);
     }
-    log.error(`[w${workerId}] ✗ Wrong captcha 3× — will retry next scan`);
+    log.error(`[${workerId}] ✗ Wrong captcha 3× — will retry next scan`);
+    for (const b of item.bids) bidLogRow(b, 'WRONG_CAPTCHA_3X', result.text || '');
     return { retry: true };
   }
 
   if (isTimeEnded) {
     metrics.submitsTimeEnded++;
     const retryAt = Date.now() + TIME_ENDED_COOLDOWN_MS;
-    log.warn(`[w${workerId}] ⏰ Bid window CLOSED — cooldown ${Math.round(TIME_ENDED_COOLDOWN_MS / 1000)}s`);
-    for (const b of item.bids) ctx.cooldown.set(String(b.order.SapOrderId), retryAt);
+    log.warn(`[${workerId}] ⏰ Bid window CLOSED — cooldown ${Math.round(TIME_ENDED_COOLDOWN_MS / 1000)}s`);
+    for (const b of item.bids) {
+      ctx.cooldown.set(String(b.order.SapOrderId), retryAt);
+      bidLogRow(b, 'TIME_ENDED', result.text || '');
+    }
     return { retry: false };
   }
 
@@ -860,11 +933,12 @@ async function handleBatch(ctx, item, solved, workerId, retryDepth = 0) {
     metrics.submitsRejected++;
     for (const b of item.bids) {
       log.error(
-        `[w${workerId}] ✗ RATE TOO LOW → SapOrderId=${b.order.SapOrderId} ` +
+        `[${workerId}] ✗ RATE TOO LOW → SapOrderId=${b.order.SapOrderId} ` +
         `city="${b.city}" spi="${b.spi}" csv=${b.amount} ` +
         `(SAP floor ≥ ${minFloor}). Update input2.csv and re-run.`
       );
       ctx.submitted.add(String(b.order.SapOrderId));
+      bidLogRow(b, 'RATE_TOO_LOW', `floor=${minFloor}`);
     }
     return { retry: false };
   }
@@ -875,63 +949,70 @@ async function handleBatch(ctx, item, solved, workerId, retryDepth = 0) {
       for (const b of item.bids) {
         const suggested = +(b.amount - reduceBy).toFixed(2);
         log.error(
-          `[w${workerId}] ✗ RATE HIGH → SapOrderId=${b.order.SapOrderId} ` +
+          `[${workerId}] ✗ RATE HIGH → SapOrderId=${b.order.SapOrderId} ` +
           `city="${b.city}" spi="${b.spi}" csv=${b.amount} ` +
           `(SAP wants ≤ ${suggested}). Update input2.csv and re-run.`
         );
         ctx.submitted.add(String(b.order.SapOrderId));
+        bidLogRow(b, 'RATE_HIGH', `reduce_by=${reduceBy}`);
       }
       return { retry: false };
     }
     const key = item.bids.map((b) => b.order.SapOrderId).join('|');
     const attempt = (ctx.adjustAttempts.get(key) || 0) + 1;
     if (attempt > MAX_ADJUST_RETRIES) {
-      log.error(`[w${workerId}] ✗ Gave up after ${MAX_ADJUST_RETRIES} auto-adjust retries`);
+      log.error(`[${workerId}] ✗ Gave up after ${MAX_ADJUST_RETRIES} auto-adjust retries`);
       for (const b of item.bids) ctx.submitted.add(String(b.order.SapOrderId));
       ctx.adjustAttempts.delete(key);
       return { retry: false };
     }
     ctx.adjustAttempts.set(key, attempt);
     const step = reduceBy + (attempt - 1);
-    log.warn(`[w${workerId}] ↓ Auto-adjust ${attempt}/${MAX_ADJUST_RETRIES} — reducing by Rs ${step}`);
+    log.warn(`[${workerId}] ↓ Auto-adjust ${attempt}/${MAX_ADJUST_RETRIES} — reducing by Rs ${step}`);
     for (const b of item.bids) b.amount = +(b.amount - step).toFixed(2);
-    // Fresh captcha for re-submit (still inside session mutex)
     let fresh = '';
     for (let i = 0; i < 3; i++) {
-      const r = await nextCaptcha(ctx.auth);
+      const r = await nextCaptcha(auth);
       if (r.solved) { fresh = r.solved; break; }
     }
     if (!fresh) return { retry: false };
-    return handleBatch(ctx, item, fresh, workerId, retryDepth + 1);
+    return handleBatch(ctx, session, item, fresh, workerId, retryDepth + 1);
   }
 
   // ---- HTTP 201 with empty response body = success ----
-  // SAP returns 201 Created + empty NavEBiddingMessage + empty Ev_Text when
-  // the save succeeded silently (no confirmation text).  Treat as accepted
-  // instead of "unknown", otherwise every fast bid gets logged as failure.
   if ((result.statusCode === 200 || result.statusCode === 201) &&
       !result.info && !result.text && !isTimeEnded && !isWrongCaptcha && reduceBy === null && minFloor === null) {
     metrics.submitsOk++;
-    log.info(`[w${workerId}] ✓ ACCEPTED (${item.kind}, ${bids.length}) in ${result.submitMs}ms: HTTP ${result.statusCode} (empty confirmation)`);
-    for (const b of item.bids) ctx.submitted.add(String(b.order.SapOrderId));
+    log.info(`[${workerId}] ✓ ACCEPTED (${item.kind}, ${bids.length}) in ${result.submitMs}ms: HTTP ${result.statusCode} (empty confirmation)`);
+    for (const b of item.bids) {
+      ctx.submitted.add(String(b.order.SapOrderId));
+      bidLogRow(b, 'ACCEPTED', `HTTP ${result.statusCode} empty`);
+    }
     return { ok: true };
   }
 
   if (result.info === 'I') {
-    log.warn(`[w${workerId}] ↻ Info-level rejection: ${result.text} — retry next scan`);
+    log.warn(`[${workerId}] ↻ Info-level rejection: ${result.text} — retry next scan`);
+    for (const b of item.bids) bidLogRow(b, 'INFO_RETRY', result.text || '');
     return { retry: true };
   }
 
   if (result.info === 'E') {
     metrics.submitsRejected++;
-    log.error(`[w${workerId}] ✗ Rejected: ${result.text || '(no text)'}`);
-    for (const b of item.bids) ctx.submitted.add(String(b.order.SapOrderId));
+    log.error(`[${workerId}] ✗ Rejected: ${result.text || '(no text)'}`);
+    for (const b of item.bids) {
+      ctx.submitted.add(String(b.order.SapOrderId));
+      bidLogRow(b, 'REJECTED', result.text || '');
+    }
     return { retry: false };
   }
 
   // Unknown → mark done to avoid hot-loop
-  log.warn(`[w${workerId}] Unknown response info='${result.info}' status=${result.statusCode} — marking done`);
-  for (const b of item.bids) ctx.submitted.add(String(b.order.SapOrderId));
+  log.warn(`[${workerId}] Unknown response info='${result.info}' status=${result.statusCode} — marking done`);
+  for (const b of item.bids) {
+    ctx.submitted.add(String(b.order.SapOrderId));
+    bidLogRow(b, 'UNKNOWN', `info=${result.info} status=${result.statusCode}`);
+  }
   return { retry: false };
 }
 
@@ -944,14 +1025,12 @@ async function tick(ctx) {
     return;
   }
   try {
-    // ---- SPEED: skip fetchLiveOrders during captcha-wait state ----
-    // If the previous scan matched orders but the captcha was empty, we're
-    // in "waiting for bid window to open" state. The order list won't change
-    // materially in the next ~500 ms (typical SAP polling cadence). Reusing
-    // the cached orders skips a ~500 ms fetchLiveOrders round-trip so the
-    // next captcha check happens sooner — this catches the window-open
-    // transition ~500 ms faster than before. Refresh orders every 5 scans
-    // (~150 ms at POLL_MS=30) or immediately after a successful submit.
+    // Use session s1 (primary) for orders + captcha probes. All sessions see
+    // the SAME order list on SAP's side (same vendor+plant), so we only need
+    // one probe. When work exists, we distribute batches across ALL sessions
+    // for parallel submission.
+    const primary = ctx.sessions[0];
+
     let orders;
     const canReuseOrders =
       ctx._cachedOrders &&
@@ -962,7 +1041,7 @@ async function tick(ctx) {
     if (canReuseOrders) {
       orders = ctx._cachedOrders;
     } else {
-      const res = await fetchLiveOrders(ctx.auth);
+      const res = await fetchLiveOrders(primary);
       orders = res.orders;
       ctx._cachedOrders = orders;
       ctx._cachedOrdersScan = ctx.scan;
@@ -997,7 +1076,7 @@ async function tick(ctx) {
       log.info(
         `Scan #${ctx.scan} | orders=${stats.total} matched=${stats.matched} bl=${stats.blacklisted} ` +
         `no-rule=${stats.noRule} club-drop=${stats.clubDropped} cool=${stats.coolskip} | ` +
-        `plan=[singles+clubs=${plan.length}, parallel=${PARALLEL_BATCHES}]` +
+        `plan=[singles+clubs=${plan.length}, sessions=${ctx.sessions.length}]` +
         (canReuseOrders ? ' [cached-orders]' : '')
       );
       ctx._lastPlanSig = planSig;
@@ -1008,7 +1087,6 @@ async function tick(ctx) {
     const workerCtx = { ...ctx, plan };
     const workers = makeWorkerPool(workerCtx);
     await Promise.all(workers).catch(() => {});
-
     // Mark whether this scan actually submitted or was blocked on captcha.
     // If ANY submit happened, invalidate the cached orders on next tick.
     if (metrics.submits > submitsBefore) {
@@ -1032,76 +1110,66 @@ async function tick(ctx) {
 
 // ---- Warm-up ---------------------------------------------------------------
 
-async function warmUpPools(auth) {
-  // Two cheap HEAD-ish calls to prime the TCP+TLS handshake for SAP pool
-  // and the local solver pool, so the first real bid doesn't pay ~200-300ms.
+async function warmUpPools(sessions) {
   const tasks = [];
-  tasks.push(sapPool.request({
-    path: `${SAP_PATH_PFX}/SessionSet('')`,
-    method: 'GET',
-    headers: auth.headers({ 'x-csrf-token': 'Fetch' }),
-  }).then((r) => r.body.dump()).catch(() => {}));
-
+  // Prime one connection per session (parallel TLS handshakes).
+  for (const s of sessions) {
+    tasks.push(sapPool.request({
+      path: `${SAP_PATH_PFX}/SessionSet('')`,
+      method: 'GET',
+      headers: s.headers({ 'x-csrf-token': 'Fetch' }),
+    }).then((r) => r.body.dump()).catch(() => {}));
+  }
   tasks.push(solverPool.request({
     path: '/health',
     method: 'GET',
   }).then((r) => r.body.dump()).catch(() => {}));
-
   await Promise.all(tasks);
-  log.info('Pools warmed up (SAP + local solver keep-alive established).');
+  log.info(`Pools warmed up (${sessions.length} SAP session${sessions.length > 1 ? 's' : ''} + local solver, keep-alive established).`);
 }
 
 /**
- * Background keep-warm ping to SAP every 20 s.
- *
- * Without this, the underlying TCP+TLS connection to SAP dies after ~60 s of
- * idle (server-side timeout). Reconnecting costs a full TLS handshake
- * (~200-300 ms) — which lands right in the middle of your first bid when
- * the window opens. Sending a cheap SessionSet GET every 20 s keeps the
- * connection warm indefinitely so bid #1 pays 0 ms handshake cost.
- *
- * Safe to run in parallel with the polling loop — it only fires when the
- * SAP session mutex is free and no submit is in flight.  Errors are silent
- * (they just mean the keep-warm couldn't complete; the next poll will
- * establish a fresh connection anyway).
+ * Background keep-warm ping every 20 s — PER SESSION. Prevents TCP+TLS from
+ * dying during long idle windows. Errors silent (non-fatal).
  */
-function startKeepWarm(auth) {
+function startKeepWarm(sessions) {
   const INTERVAL_MS = 20_000;
   setInterval(() => {
     if (wafActive()) return;
-    if (sapSession._busy) return;
-    // Very light call — just fetches CSRF-token metadata header, ~1KB response.
-    sapPool.request({
-      path: `${SAP_PATH_PFX}/SessionSet('')`,
-      method: 'GET',
-      headers: auth.headers({ 'x-csrf-token': 'Fetch' }),
-      headersTimeout: 15_000,
-      bodyTimeout: 15_000,
-    }).then((r) => r.body.dump()).catch(() => { /* silent: keep-warm errors are non-fatal */ });
+    for (const s of sessions) {
+      if (s.mutex._busy) continue;
+      sapPool.request({
+        path: `${SAP_PATH_PFX}/SessionSet('')`,
+        method: 'GET',
+        headers: s.headers({ 'x-csrf-token': 'Fetch' }),
+        headersTimeout: 15_000,
+        bodyTimeout: 15_000,
+      }).then((r) => r.body.dump()).catch(() => {});
+    }
   }, INTERVAL_MS).unref();
-  log.info(`Keep-warm ping enabled (every ${INTERVAL_MS / 1000}s) — TCP+TLS session stays hot even during long idle windows.`);
+  log.info(`Keep-warm ping enabled (every ${INTERVAL_MS / 1000}s, ${sessions.length} session${sessions.length > 1 ? 's' : ''}) — TCP+TLS stays hot during idle windows.`);
 }
 
 // ---- Main ------------------------------------------------------------------
 
 async function main() {
   log.info('🚀 Bikas Bidding v2 engine starting…');
+
+  // Discover session cookie files (cookie.txt, cookie2.txt, cookie3.txt, …)
+  const sessionSpecs = discoverSessions();
+  const sessions = sessionSpecs.map((sp) => new AuthConfig(sp.id, sp.cookieFile, sp.tokenFile));
+
   log.info(
-    `Config: POLL_MS=${POLL_MS} BATCH_SIZE=${BATCH_SIZE} PARALLEL=${PARALLEL_BATCHES} ` +
+    `Config: POLL_MS=${POLL_MS} BATCH_SIZE=${BATCH_SIZE} SESSIONS=${sessions.length} ` +
     `AUTO_ADJUST=${AUTO_ADJUST} WAF=${WAF_MIN_MS}→${WAF_MAX_MS}ms metrics=${METRICS_MS}ms`
   );
-  if (PARALLEL_BATCHES > 1) {
-    log.warn(
-      `⚠  PARALLEL_BATCHES=${PARALLEL_BATCHES} — SAP session mutex forces one-at-a-time ` +
-      `anyway (single cookie = one active captcha per session). Higher values just add ` +
-      `mutex-queue overhead. Recommended: set PARALLEL_BATCHES=1 in .env for lowest latency.`
-    );
-  }
+  log.info(`Cookies loaded: ${sessions.map((s) => s.id).join(', ')} — each will submit bids in parallel.`);
 
-  const auth = new AuthConfig();
-  if (!auth.token) await auth.refreshToken();
-  await warmUpPools(auth);
-  startKeepWarm(auth);
+  // Refresh CSRF for every session in parallel.
+  await Promise.all(sessions.map((s) => (s.token ? Promise.resolve() : s.refreshToken())));
+
+  await warmUpPools(sessions);
+  startKeepWarm(sessions);
 
   const [inputRows, deleteRows] = await Promise.all([parseCSV(INPUT_CSV), parseCSV(DELETE_CSV)]);
   const { rules, blacklist } = buildRuleMaps(inputRows, deleteRows);
@@ -1110,7 +1178,7 @@ async function main() {
   log.info(`Loaded ${rules.size} cities (${totalRules} rule rows), ${blacklist.length} blacklisted customers`);
 
   const ctx = {
-    auth, rules, blacklist,
+    sessions, rules, blacklist,
     scan: 0,
     submitted: new Set(),
     inFlight:  new Set(),
