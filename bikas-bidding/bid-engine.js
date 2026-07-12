@@ -603,7 +603,14 @@ async function solveViaLocal(base64) {
 async function nextCaptcha(auth) {
   const { img, reason: fetchReason } = await fetchCaptchaImage(auth);
   if (!img) return { solved: '', reason: fetchReason };
-  return await solveViaLocal(img);
+  const r = await solveViaLocal(img);
+  // First time captcha becomes available after a pre-window period, log the
+  // exact moment so we can measure detection latency (window-open → detect).
+  if (r.solved && !globalThis.__firstCaptchaAt) {
+    globalThis.__firstCaptchaAt = Date.now();
+    log.info(`⚡ First non-empty captcha detected [${auth.id}] — window open!`);
+  }
+  return r;
 }
 
 // ---- Formatting helpers ---------------------------------------------------
@@ -1061,6 +1068,9 @@ async function tick(ctx) {
 
     if (!orders.length) {
       ctx._matchedButNoCaptcha = false;
+      // Reset the "first captcha detected" marker between windows so the
+      // next window-open log fires afresh.
+      if (globalThis.__firstCaptchaAt) globalThis.__firstCaptchaAt = null;
       // Idle heartbeat — every ~10s so user knows the bot is alive.
       const beat = Math.max(1, Math.round(10_000 / Math.max(POLL_MS, 1)));
       if (ctx.scan % beat === 0) {
@@ -1206,10 +1216,21 @@ async function main() {
 
   if (METRICS_MS > 0) setInterval(metricsDump, METRICS_MS).unref();
 
-  // Main polling loop with small jitter (0-20 ms) to avoid perfectly aligned bursts
+  // Main polling loop.
+  //
+  // SPEED: adaptive sleep. During pre-window state (orders matched but
+  // captcha still empty), sleep is 0 → we probe captcha as tightly as the
+  // network allows, catching the "window opens" moment within one SAP RTT
+  // (~30-50 ms). Otherwise use POLL_MS + small jitter to avoid perfect
+  // burst alignment with SAP's WAF.
   while (true) {
     await tick(ctx);
-    await new Promise((r) => setTimeout(r, POLL_MS + Math.floor(Math.random() * 20)));
+    if (ctx._matchedButNoCaptcha) {
+      // No sleep — tight-loop probe until window opens or state changes.
+      await new Promise((r) => setImmediate(r));
+    } else {
+      await new Promise((r) => setTimeout(r, POLL_MS + Math.floor(Math.random() * 20)));
+    }
   }
 }
 
