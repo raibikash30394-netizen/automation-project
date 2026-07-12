@@ -86,12 +86,11 @@ const sapPool = new Pool(SAP_ORIGIN, {
   connections: 8,
   pipelining: 1,
   keepAliveTimeout: 60_000,
-  headersTimeout: 8_000,
-  bodyTimeout: 10_000,
-  // Try HTTP/2 first — SAP OData over UI5 supports it and it removes head-of-
-  // line blocking on the TCP connection. Falls back to HTTP/1.1 automatically
-  // if the server refuses ALPN "h2".
-  allowH2: true,
+  headersTimeout: 15_000,
+  bodyTimeout: 15_000,
+  // Note: HTTP/2 (allowH2: true) was tried but SAP's Web Dispatcher does not
+  // support ALPN "h2" cleanly on this tenant — every request timed out with
+  // "HeadersTimeoutError". Sticking to HTTP/1.1 + keep-alive which is proven.
 });
 
 const solverPool = new Pool(CAPTCHA_ORIGIN, {
@@ -966,7 +965,15 @@ async function tick(ctx) {
     const workers = makeWorkerPool(workerCtx);
     await Promise.all(workers).catch(() => {});
   } catch (e) {
-    log.error({ err: e.message, stack: e.stack }, 'tick failed');
+    // Transient network timeouts (HeadersTimeoutError / UND_ERR_CONNECT_TIMEOUT)
+    // are common during long idle windows and are self-healing on the next
+    // scan — log as warn, not error, so log noise stays low.
+    const msg = e && e.message ? e.message : String(e);
+    if (/HeadersTimeoutError|Headers Timeout|UND_ERR_CONNECT_TIMEOUT|ETIMEDOUT|ECONNRESET|socket hang up/i.test(msg)) {
+      if (ctx.scan % 20 === 0) log.warn(`tick #${ctx.scan}: transient network error (${msg}) — will retry`);
+    } else {
+      log.error({ err: msg, stack: e.stack }, 'tick failed');
+    }
   }
 }
 
@@ -997,24 +1004,27 @@ async function warmUpPools(auth) {
  * Without this, the underlying TCP+TLS connection to SAP dies after ~60 s of
  * idle (server-side timeout). Reconnecting costs a full TLS handshake
  * (~200-300 ms) — which lands right in the middle of your first bid when
- * the window opens. Sending a cheap HEAD-ish call every 20 s keeps the
+ * the window opens. Sending a cheap SessionSet GET every 20 s keeps the
  * connection warm indefinitely so bid #1 pays 0 ms handshake cost.
  *
  * Safe to run in parallel with the polling loop — it only fires when the
- * SAP session mutex is free and no submit is in flight.
+ * SAP session mutex is free and no submit is in flight.  Errors are silent
+ * (they just mean the keep-warm couldn't complete; the next poll will
+ * establish a fresh connection anyway).
  */
 function startKeepWarm(auth) {
   const INTERVAL_MS = 20_000;
   setInterval(() => {
     if (wafActive()) return;
-    // Skip if a submit is in flight — don't want a metadata ping to eat the
-    // mutex slot right when we could be bidding.
     if (sapSession._busy) return;
+    // Very light call — just fetches CSRF-token metadata header, ~1KB response.
     sapPool.request({
-      path: `${SAP_PATH_PFX}/$metadata`,
+      path: `${SAP_PATH_PFX}/SessionSet('')`,
       method: 'GET',
-      headers: auth.headers({ accept: 'application/xml' }),
-    }).then((r) => r.body.dump()).catch(() => {});
+      headers: auth.headers({ 'x-csrf-token': 'Fetch' }),
+      headersTimeout: 15_000,
+      bodyTimeout: 15_000,
+    }).then((r) => r.body.dump()).catch(() => { /* silent: keep-warm errors are non-fatal */ });
   }, INTERVAL_MS).unref();
   log.info(`Keep-warm ping enabled (every ${INTERVAL_MS / 1000}s) — TCP+TLS session stays hot even during long idle windows.`);
 }
