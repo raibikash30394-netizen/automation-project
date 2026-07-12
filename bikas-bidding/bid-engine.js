@@ -944,15 +944,32 @@ async function tick(ctx) {
     return;
   }
   try {
-    // Just fetch orders. Captcha will be fetched JIT by the worker inside the
-    // SAP-session mutex, right before submitBid. We tried parallel prefetch
-    // here (orders + captcha in Promise.all) but it caused every first-attempt
-    // submit to fail with "Wrong Captcha" — SAP has a subtle timing race
-    // between session-captcha commit and validation when two fetches happen
-    // close together. JIT (v1 proven pattern) has ~0% wrong-captcha rate.
-    const { orders } = await fetchLiveOrders(ctx.auth);
+    // ---- SPEED: skip fetchLiveOrders during captcha-wait state ----
+    // If the previous scan matched orders but the captcha was empty, we're
+    // in "waiting for bid window to open" state. The order list won't change
+    // materially in the next ~500 ms (typical SAP polling cadence). Reusing
+    // the cached orders skips a ~500 ms fetchLiveOrders round-trip so the
+    // next captcha check happens sooner — this catches the window-open
+    // transition ~500 ms faster than before. Refresh orders every 5 scans
+    // (~150 ms at POLL_MS=30) or immediately after a successful submit.
+    let orders;
+    const canReuseOrders =
+      ctx._cachedOrders &&
+      ctx._cachedOrdersScan &&
+      ctx.scan - ctx._cachedOrdersScan < 5 &&
+      ctx._matchedButNoCaptcha;
+
+    if (canReuseOrders) {
+      orders = ctx._cachedOrders;
+    } else {
+      const res = await fetchLiveOrders(ctx.auth);
+      orders = res.orders;
+      ctx._cachedOrders = orders;
+      ctx._cachedOrdersScan = ctx.scan;
+    }
 
     if (!orders.length) {
+      ctx._matchedButNoCaptcha = false;
       // Idle heartbeat — every ~10s so user knows the bot is alive.
       const beat = Math.max(1, Math.round(10_000 / Math.max(POLL_MS, 1)));
       if (ctx.scan % beat === 0) {
@@ -967,7 +984,10 @@ async function tick(ctx) {
     }
 
     const { plan, stats } = buildBatches(orders, ctx.rules, ctx.blacklist, ctx.submitted, ctx.inFlight, ctx.cooldown);
-    if (stats.matched === 0) return;
+    if (stats.matched === 0) {
+      ctx._matchedButNoCaptcha = false;
+      return;
+    }
 
     // Throttle the scan log: it repeats identically for every scan while
     // waiting for the captcha to appear. Log only when the plan changes or
@@ -977,15 +997,26 @@ async function tick(ctx) {
       log.info(
         `Scan #${ctx.scan} | orders=${stats.total} matched=${stats.matched} bl=${stats.blacklisted} ` +
         `no-rule=${stats.noRule} club-drop=${stats.clubDropped} cool=${stats.coolskip} | ` +
-        `plan=[singles+clubs=${plan.length}, parallel=${PARALLEL_BATCHES}]`
+        `plan=[singles+clubs=${plan.length}, parallel=${PARALLEL_BATCHES}]` +
+        (canReuseOrders ? ' [cached-orders]' : '')
       );
       ctx._lastPlanSig = planSig;
       ctx._lastPlanLoggedScan = ctx.scan;
     }
 
+    const submitsBefore = metrics.submits;
     const workerCtx = { ...ctx, plan };
     const workers = makeWorkerPool(workerCtx);
     await Promise.all(workers).catch(() => {});
+
+    // Mark whether this scan actually submitted or was blocked on captcha.
+    // If ANY submit happened, invalidate the cached orders on next tick.
+    if (metrics.submits > submitsBefore) {
+      ctx._cachedOrders = null;         // force refresh next scan
+      ctx._matchedButNoCaptcha = false;
+    } else {
+      ctx._matchedButNoCaptcha = true;  // still waiting on captcha
+    }
   } catch (e) {
     // Transient network timeouts (HeadersTimeoutError / UND_ERR_CONNECT_TIMEOUT)
     // are common during long idle windows and are self-healing on the next
