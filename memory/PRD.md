@@ -37,7 +37,13 @@ Two Node.js processes:
 - **`handleBatch` empty-201 path** returns `{ silentFail: true }` (no cooldown side-effect) so the caller can walk the session chain.
 - **Batching restored to 3-per-call**: Post-mutex-refactor, `effectiveBatchSize = BATCH_SIZE` (unconditional). 3 singles pack into 1 SAP submit call. Singles-first, then clubs. Removes the fragmenting session-spread logic that was slowing the window.
 - **Wrong-captcha exhaustion → fallback**: After 3× wrong-captcha on one session, `handleBatch` returns `{ silentFail: true }` so runAll retries with next session (its captcha comes from independent SAP session state, so OCR often succeeds).
-- **Unit tests** in `tests/test-window-scheduler.js` — 6 groups, all pass (msUntilNextWindow 7 cases, isHotWindow 22 cases, mutex serialisation 4-way, sequential fallback success + all-fail paths, batching 5 cases).
+- **Unit tests** in `tests/test-window-scheduler.js` — 7 groups, all pass (msUntilNextWindow 7 cases, isHotWindow 22 cases, mutex serialisation 4-way, sequential fallback success + all-fail paths, batching 5 cases, rank hint extraction 3 cases).
+
+## Implemented (2026-02 — diagnostic instrumentation)
+- **Raw submit response dump**: first 5 SAP submit responses per process saved to `logs/submit-responses.jsonl` (bounded so disk stays small). Includes submitted bids, statusCode, primary message, all messages, topLevel keys, 4KB rawPreview. Non-fatal.
+- **Rank + L1 extraction**: `submitBid()` now reads `d.NavEBiddingTrackHis.results` and returns `rankHints` per bid `{ sapOrderId, rank, savedAmt, l1Amt, avgAmt }`.
+- **ACCEPTED log line** now appends per-order `rank=X L1=Y saved=Z` when SAP echoes them. Same info embedded in `logs/bids-YYYY-MM-DD.csv` message column for offline analysis.
+- Purpose: gives conclusive visibility into "did SAP actually persist my bid?" vs. the "Saved Successfully" text. If tenant uses different keys (e.g. `Rank` instead of `BiddingRank`), the first live-window dump will reveal it and we adjust.
 
 ## Verified
 - `bidding.js` starts, loads cache, `/health` returns metrics JSON
