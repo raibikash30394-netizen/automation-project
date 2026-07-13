@@ -291,8 +291,8 @@ setInterval(() => {
   );
 }, parseInt(process.env.METRICS_INTERVAL_MS || '30000', 10)).unref();
 
-const server = app.listen(PORT, () => {
-  log.info(`Captcha solver ready → http://localhost:${PORT} (endpoints: POST /, /solve-captcha, /captcha ; GET /health)`);
+const server = app.listen(PORT, '127.0.0.1', () => {
+  log.info(`Captcha solver ready → http://127.0.0.1:${PORT} (loopback-only bind; endpoints: POST /, /solve-captcha, /captcha ; GET /health)`);
 });
 server.keepAliveTimeout = 30_000;
 server.headersTimeout   = 35_000;
