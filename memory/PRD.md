@@ -39,11 +39,14 @@ Two Node.js processes:
 - **Wrong-captcha exhaustion → fallback**: After 3× wrong-captcha on one session, `handleBatch` returns `{ silentFail: true }` so runAll retries with next session (its captcha comes from independent SAP session state, so OCR often succeeds).
 - **Unit tests** in `tests/test-window-scheduler.js` — 7 groups, all pass (msUntilNextWindow 7 cases, isHotWindow 22 cases, mutex serialisation 4-way, sequential fallback success + all-fail paths, batching 5 cases, rank hint extraction 3 cases).
 
-## Implemented (2026-02 — diagnostic instrumentation)
-- **Raw submit response dump**: first 5 SAP submit responses per process saved to `logs/submit-responses.jsonl` (bounded so disk stays small). Includes submitted bids, statusCode, primary message, all messages, topLevel keys, 4KB rawPreview. Non-fatal.
-- **Rank + L1 extraction**: `submitBid()` now reads `d.NavEBiddingTrackHis.results` and returns `rankHints` per bid `{ sapOrderId, rank, savedAmt, l1Amt, avgAmt }`.
-- **ACCEPTED log line** now appends per-order `rank=X L1=Y saved=Z` when SAP echoes them. Same info embedded in `logs/bids-YYYY-MM-DD.csv` message column for offline analysis.
-- Purpose: gives conclusive visibility into "did SAP actually persist my bid?" vs. the "Saved Successfully" text. If tenant uses different keys (e.g. `Rank` instead of `BiddingRank`), the first live-window dump will reveal it and we adjust.
+## Implemented (2026-02 — v3.6 single-session revert per user)
+- **Reverted to SINGLE-SESSION mode** — `discoverSessions()` only picks up cookie.txt. Any cookie2/3/4.txt files are IGNORED with a warning log. Matches the user-verified working baseline they shared.
+- **Empty HTTP 200/201 = SILENT SAVE SUCCESS** (restored from pre-multi-session working build). SAP returns empty NavEBiddingMessage + empty Ev_Text as its silent confirmation — the browser row appears after this response. Previous "anti-fraud silent-fail" theory was actually caused by parallel multi-cookie submissions, not by empty 201 itself. In single-session mode empty 201 is a real save.
+- **Wrong-captcha 3×** now returns `{ retry: true }` (retry next scan) — single session has nowhere to fall back to.
+- **Preserved** all v3.4/v3.5 improvements: IST bid-window scheduler (`:15`/`:45` pre-warm 30s + hot polling), adaptive main-loop sleep (0/30/100/500/2000 ms tiers), bid log CSV, rank/L1 extraction, raw response dump, batching 3-per-call, longest-first city matching, JIT captcha, order caching, TCP keep-warm ping.
+- **New unit test**: `testEmptyResponseSuccess` — 6 cases verifying empty 200/201 → ACCEPTED, real save text → ACCEPTED, time-ended text → TIME_ENDED, wrong-captcha text → WRONG_CAPTCHA, HTTP 500 → UNKNOWN.
+- **Total test groups: 8/8 pass**.
+- **testing_agent iteration_4**: 100% pass, no critical/minor issues.
 
 ## Verified
 - `bidding.js` starts, loads cache, `/health` returns metrics JSON
