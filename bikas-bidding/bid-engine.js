@@ -746,11 +746,38 @@ async function nextCaptcha(auth) {
   // exact moment so we can measure detection latency (window-open → detect).
   if (r.solved && !globalThis.__firstCaptchaAt) {
     globalThis.__firstCaptchaAt = Date.now();
-    log.info(`⚡ First non-empty captcha detected [${auth.id}] — window open!`);
+    const untilNext = msUntilNextWindow();
+    // Windows are 30 min apart. If we're inside a window (msUntilNextWindow
+    // is close to 30 min), we can approximate the actual window-open time
+    // and compute the gap in seconds/ms.
+    const secsPast = 30 * 60 - Math.round(untilNext / 1000);
+    log.info(`⚡ First non-empty captcha detected [${auth.id}] — window open! (~${secsPast}s past :15/:45 boundary)`);
   }
   // Attach the base64 image to the result so callers can invalidate the cache
   // entry later if SAP rejects the solve with "Wrong Captcha".
   return { ...r, img };
+}
+
+// ---- Parallel captcha probing ---------------------------------------------
+//
+// User's log showed a ~3-second gap from window-open (15:45:00) to first
+// non-empty captcha (15:45:03). Serial polling misses the exact SAP unlock
+// moment because each probe is one round-trip (~50-100 ms) and we can only
+// do one at a time. Firing N parallel probes covers a wider time slice per
+// wave — whichever probe lands after SAP unlocks the captcha wins.
+//
+// Only enabled during "match+no-captcha" tight-loop state (window opening).
+// Outside of that state, serial polling is more polite to SAP.
+const PARALLEL_CAPTCHA_PROBES = parseInt(process.env.PARALLEL_CAPTCHA_PROBES || '3', 10);
+
+async function nextCaptchaParallel(auth) {
+  if (PARALLEL_CAPTCHA_PROBES <= 1) return nextCaptcha(auth);
+  const probes = Array.from({ length: PARALLEL_CAPTCHA_PROBES }, () => nextCaptcha(auth));
+  // Race: first probe with a real solved captcha wins. If all fail, return
+  // the last failure (any is fine — they'll all say sap-empty or similar).
+  const results = await Promise.all(probes);
+  const winner = results.find((r) => r.solved);
+  return winner || results[results.length - 1];
 }
 
 // Fire-and-forget: ask the local solver to drop a stale/wrong cache entry.
@@ -1018,7 +1045,10 @@ function makeWorkerPool(ctx) {
   let cursor = 0;
 
   async function fetchFreshCaptcha(auth, workerId) {
-    const r1 = await nextCaptcha(auth);
+    // Use parallel probing when we know the window is about to open (matched
+    // orders exist + no captcha yet). Otherwise single probe is enough.
+    const useParallel = ctx._matchedButNoCaptcha || isHotWindow();
+    const r1 = useParallel ? await nextCaptchaParallel(auth) : await nextCaptcha(auth);
     if (r1.solved) { auth._lastCaptchaImg = r1.img; return r1.solved; }
     if (wafActive()) return '';
 
@@ -1034,7 +1064,7 @@ function makeWorkerPool(ctx) {
     // Real transient error — retry 2 more times.
     log.warn(`[${workerId}] captcha attempt 1/3 failed: ${r1.reason}`);
     for (let i = 1; i < 3; i++) {
-      const r = await nextCaptcha(auth);
+      const r = useParallel ? await nextCaptchaParallel(auth) : await nextCaptcha(auth);
       if (r.solved) { auth._lastCaptchaImg = r.img; return r.solved; }
       if (wafActive()) return '';
       if (r.reason === 'sap-empty') return '';
@@ -1488,13 +1518,22 @@ async function warmUpPools(sessions) {
 }
 
 /**
- * Background keep-warm ping every 20 s — PER SESSION. Prevents TCP+TLS from
- * dying during long idle windows. Errors silent (non-fatal).
+ * Background keep-warm ping — PER SESSION. Prevents TCP+TLS from dying so
+ * the FIRST captcha probe after window-open doesn't pay a TLS-renegotiation
+ * penalty (~200-500ms). Two frequencies:
+ *   • Hot window (30s pre-warm + 5-min active): every 3 seconds
+ *   • Cold time (between windows):               every 20 seconds
+ * Errors are silent (non-fatal).
  */
 function startKeepWarm(sessions) {
-  const INTERVAL_MS = 20_000;
+  const HOT_MS  = 3_000;
+  const COLD_MS = 20_000;
+  let lastPing = 0;
   setInterval(() => {
     if (wafActive()) return;
+    const need = isHotWindow() ? HOT_MS : COLD_MS;
+    if (Date.now() - lastPing < need) return;
+    lastPing = Date.now();
     for (const s of sessions) {
       if (s.mutex._busy) continue;
       sapPool.request({
@@ -1505,8 +1544,8 @@ function startKeepWarm(sessions) {
         bodyTimeout: 15_000,
       }).then((r) => r.body.dump()).catch(() => {});
     }
-  }, INTERVAL_MS).unref();
-  log.info(`Keep-warm ping enabled (every ${INTERVAL_MS / 1000}s, ${sessions.length} session${sessions.length > 1 ? 's' : ''}) — TCP+TLS stays hot during idle windows.`);
+  }, 1_000).unref();
+  log.info(`Keep-warm ping enabled (${HOT_MS/1000}s hot / ${COLD_MS/1000}s cold, ${sessions.length} session${sessions.length > 1 ? 's' : ''}) — TCP+TLS stays hot during window opens.`);
 }
 
 // ---- Main ------------------------------------------------------------------

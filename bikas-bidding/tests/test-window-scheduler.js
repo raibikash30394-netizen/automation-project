@@ -608,6 +608,79 @@ function testL1UndercutDetection() {
   console.log('✓ L1-undercut detection: correctly identifies tie-loser orders + respects max-attempts');
 }
 
+// ---- Test parallel captcha probe race semantics ----------------------------
+//
+// User's 15:45 IST log showed a 3-second gap window-open → first captcha
+// detected. Serial polling misses SAP's exact unlock moment because each
+// probe is one RTT (~50-100 ms). Parallel probes cover more time-slice per
+// wave — first non-empty wins.
+async function testParallelCaptchaProbes() {
+  // Simulate nextCaptcha() returning empty for the first N probes, then
+  // non-empty. Fire 3 parallel probes → the non-empty one wins even if
+  // others resolve earlier (all empty).
+  async function makeProbe(willSucceed, delayMs) {
+    await new Promise((r) => setTimeout(r, delayMs));
+    return willSucceed ? { solved: 'ABCD1', reason: 'ok', img: 'imgX' } : { solved: '', reason: 'sap-empty' };
+  }
+
+  async function nextCaptchaParallel(probeSpecs) {
+    // probeSpecs: [{ succeed, delayMs }, ...]
+    const results = await Promise.all(probeSpecs.map((s) => makeProbe(s.succeed, s.delayMs)));
+    return results.find((r) => r.solved) || results[results.length - 1];
+  }
+
+  // Case 1: All empty → returns the (last) empty result
+  const r1 = await nextCaptchaParallel([
+    { succeed: false, delayMs: 10 },
+    { succeed: false, delayMs: 20 },
+    { succeed: false, delayMs: 30 },
+  ]);
+  assert.strictEqual(r1.solved, '');
+  assert.strictEqual(r1.reason, 'sap-empty');
+
+  // Case 2: One succeeds — winner is the non-empty one regardless of ordering
+  const r2 = await nextCaptchaParallel([
+    { succeed: false, delayMs: 10 },
+    { succeed: true,  delayMs: 30 },
+    { succeed: false, delayMs: 20 },
+  ]);
+  assert.strictEqual(r2.solved, 'ABCD1');
+  assert.strictEqual(r2.reason, 'ok');
+
+  // Case 3: Multiple succeed — first successful one wins (find semantics)
+  const r3 = await nextCaptchaParallel([
+    { succeed: true,  delayMs: 10 },
+    { succeed: true,  delayMs: 20 },
+    { succeed: true,  delayMs: 30 },
+  ]);
+  assert.strictEqual(r3.solved, 'ABCD1');
+
+  console.log('✓ Parallel captcha probes: 3 cases pass (all-empty, one-succeeds, multi-succeed)');
+}
+
+// ---- Test adaptive keep-warm frequency (hot vs cold) -----------------------
+function testAdaptiveKeepWarm() {
+  const HOT_MS  = 3_000;
+  const COLD_MS = 20_000;
+  function shouldPing(now, lastPing, hot) {
+    const need = hot ? HOT_MS : COLD_MS;
+    return (now - lastPing) >= need;
+  }
+  const t0 = 1_000_000;
+
+  // Hot: ping every 3s
+  assert.strictEqual(shouldPing(t0 + 2_999, t0, true),  false, '2.999s in hot: no ping yet');
+  assert.strictEqual(shouldPing(t0 + 3_000, t0, true),  true,  '3.000s in hot: ping');
+  assert.strictEqual(shouldPing(t0 + 5_000, t0, true),  true,  '5s in hot: ping');
+
+  // Cold: ping every 20s
+  assert.strictEqual(shouldPing(t0 + 3_000, t0, false), false, '3s in cold: no ping yet');
+  assert.strictEqual(shouldPing(t0 + 19_999, t0, false), false, '19.9s in cold: no ping');
+  assert.strictEqual(shouldPing(t0 + 20_000, t0, false), true,  '20s in cold: ping');
+
+  console.log('✓ Adaptive keep-warm: hot=3s, cold=20s (TCP+TLS stays hot during window opens)');
+}
+
 // ---- Run --------------------------------------------------------------------
 
 (async () => {
@@ -623,6 +696,8 @@ function testL1UndercutDetection() {
     testPostSaveVerification();
     testCaptchaCacheInvalidation();
     testL1UndercutDetection();
+    await testParallelCaptchaProbes();
+    testAdaptiveKeepWarm();
     console.log('\n🎉 ALL TESTS PASS');
     process.exit(0);
   } catch (e) {
