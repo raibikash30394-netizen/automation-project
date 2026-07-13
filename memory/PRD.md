@@ -39,16 +39,17 @@ Two Node.js processes:
 - **Wrong-captcha exhaustion → fallback**: After 3× wrong-captcha on one session, `handleBatch` returns `{ silentFail: true }` so runAll retries with next session (its captcha comes from independent SAP session state, so OCR often succeeds).
 - **Unit tests** in `tests/test-window-scheduler.js` — 7 groups, all pass (msUntilNextWindow 7 cases, isHotWindow 22 cases, mutex serialisation 4-way, sequential fallback success + all-fail paths, batching 5 cases, rank hint extraction 3 cases).
 
-## Implemented (2026-02 — v3.11 speed optimizations for window-open latency)
-- **Parallel captcha probes** (`PARALLEL_CAPTCHA_PROBES=3` env, default 3):
-  - `nextCaptchaParallel()` fires N simultaneous captcha requests via `Promise.all`
-  - First response with a non-empty solved captcha wins (`.find(r => r.solved)`)
-  - Only active during tight-loop state (`_matchedButNoCaptcha`) OR `isHotWindow()` — polite to SAP otherwise
-  - Sub-linearly reduces window-open → first-submit latency (each wave covers 3x more time-slice)
-- **Adaptive keep-warm frequency** — 3s during hot window, 20s during cold time. Prevents TCP+TLS from going idle right at the window boundary (was costing ~200-500ms TLS renegotiation on the first captcha probe post-window-open).
-- **Precise latency logging** — "First non-empty captcha detected" log now includes `(~Ns past :15/:45 boundary)` so user can measure the actual SAP-side delay per window.
-- New unit tests: `testParallelCaptchaProbes` (3 cases), `testAdaptiveKeepWarm` (hot/cold threshold).
-- **Total tests: 14/14 pass**. **testing_agent iteration_9: 100% pass, no issues**.
+## Implemented (2026-02 — v3.12 revert parallel-captcha race, keep other speed wins)
+- **PARALLEL_CAPTCHA_PROBES default 3 → 1** (disabled). v3.11's parallel probing broke the SAP single-active-captcha invariant that the original code explicitly warned about — user's 16:45 IST log confirmed: 3 solver hits (`ry2n4`, `f8233`, `VFh@4@`), `submits=1 ok=0 wrong-captcha=1`, no bid saved.
+- **Kept the machinery** for users who want to experiment: `nextCaptchaParallel()` when N>1 now returns the **LAST-arrived solved captcha** (submit-safe with SAP), not the first (which gets invalidated).
+- **Explanatory comment** at the top of the function cites the exact user log for future regression protection.
+- **All v3.11 speed wins preserved**:
+  - Adaptive keep-warm (3s hot / 20s cold) — kept TCP+TLS hot near boundary
+  - POLL_MS=20 tight polling
+  - setImmediate tight-loop when matched-but-no-captcha
+  - "~Ns past :15/:45 boundary" precise latency logging
+- User's v3.11 improvement (3s → 1s detection latency) came from **adaptive keep-warm**, not parallel probes — those wins remain.
+- **Total tests: 14/14 pass**. **testing_agent iteration_10: 100% pass, no issues**.
 
 ## Verified
 - `bidding.js` starts, loads cache, `/health` returns metrics JSON
