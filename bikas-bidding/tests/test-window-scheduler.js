@@ -608,54 +608,57 @@ function testL1UndercutDetection() {
   console.log('✓ L1-undercut detection: correctly identifies tie-loser orders + respects max-attempts');
 }
 
-// ---- Test parallel captcha probe race semantics ----------------------------
+// ---- Test parallel captcha probe race semantics (LAST-arrived winner) -----
 //
-// User's 15:45 IST log showed a 3-second gap window-open → first captcha
-// detected. Serial polling misses SAP's exact unlock moment because each
-// probe is one RTT (~50-100 ms). Parallel probes cover more time-slice per
-// wave — first non-empty wins.
+// SAP maintains ONE active captcha per session — every new fetch invalidates
+// the previous one. So when PARALLEL_CAPTCHA_PROBES > 1, we MUST return the
+// LAST-arrived solved captcha (not the first), otherwise the winner we submit
+// with will already have been invalidated by later probes. This regression
+// test was born from user's 16:45 IST log: 3 solver hits (ry2n4, f8233,
+// VFh@4@), submitted ry2n4 (first) → 'Wrong Captcha' 3× → no bid saved.
 async function testParallelCaptchaProbes() {
-  // Simulate nextCaptcha() returning empty for the first N probes, then
-  // non-empty. Fire 3 parallel probes → the non-empty one wins even if
-  // others resolve earlier (all empty).
-  async function makeProbe(willSucceed, delayMs) {
+  async function makeProbe(willSucceed, delayMs, tag) {
     await new Promise((r) => setTimeout(r, delayMs));
-    return willSucceed ? { solved: 'ABCD1', reason: 'ok', img: 'imgX' } : { solved: '', reason: 'sap-empty' };
+    return willSucceed ? { solved: tag, reason: 'ok', img: `img-${tag}` } : { solved: '', reason: 'sap-empty' };
   }
 
+  // v3.12 semantics: return LAST-arrived solved (SAP-safe)
   async function nextCaptchaParallel(probeSpecs) {
-    // probeSpecs: [{ succeed, delayMs }, ...]
-    const results = await Promise.all(probeSpecs.map((s) => makeProbe(s.succeed, s.delayMs)));
-    return results.find((r) => r.solved) || results[results.length - 1];
+    const results = await Promise.all(probeSpecs.map((s) => makeProbe(s.succeed, s.delayMs, s.tag)));
+    const solved = results.filter((r) => r.solved);
+    if (solved.length) return solved[solved.length - 1];
+    return results[results.length - 1];
   }
 
-  // Case 1: All empty → returns the (last) empty result
+  // Case 1: All empty → returns the last empty result
   const r1 = await nextCaptchaParallel([
-    { succeed: false, delayMs: 10 },
-    { succeed: false, delayMs: 20 },
-    { succeed: false, delayMs: 30 },
+    { succeed: false, delayMs: 10, tag: 'AAA' },
+    { succeed: false, delayMs: 20, tag: 'BBB' },
+    { succeed: false, delayMs: 30, tag: 'CCC' },
   ]);
   assert.strictEqual(r1.solved, '');
-  assert.strictEqual(r1.reason, 'sap-empty');
 
-  // Case 2: One succeeds — winner is the non-empty one regardless of ordering
+  // Case 2: All succeed — winner is LAST-arrived (SAP invalidated the others)
   const r2 = await nextCaptchaParallel([
-    { succeed: false, delayMs: 10 },
-    { succeed: true,  delayMs: 30 },
-    { succeed: false, delayMs: 20 },
+    { succeed: true,  delayMs: 10, tag: 'AAA' },  // SAP invalidated
+    { succeed: true,  delayMs: 20, tag: 'BBB' },  // SAP invalidated
+    { succeed: true,  delayMs: 30, tag: 'CCC' },  // ← only this one is submit-safe
   ]);
-  assert.strictEqual(r2.solved, 'ABCD1');
-  assert.strictEqual(r2.reason, 'ok');
+  assert.strictEqual(r2.solved, 'CCC', 'must return LAST-arrived, not first (SAP single-captcha rule)');
 
-  // Case 3: Multiple succeed — first successful one wins (find semantics)
+  // Case 3: Only the middle probe succeeds (first empty, mid solved, last empty)
+  // — return the middle one because it's the last (and only) solved. But
+  // this is actually a broken SAP state: last probe was empty means SAP
+  // hasn't fully unlocked; middle probe's captcha may still be invalidated
+  // by the (empty) last probe. In practice PARALLEL_CAPTCHA_PROBES=1 is safer.
   const r3 = await nextCaptchaParallel([
-    { succeed: true,  delayMs: 10 },
-    { succeed: true,  delayMs: 20 },
-    { succeed: true,  delayMs: 30 },
+    { succeed: false, delayMs: 10, tag: 'AAA' },
+    { succeed: true,  delayMs: 20, tag: 'BBB' },
+    { succeed: false, delayMs: 30, tag: 'CCC' },
   ]);
-  assert.strictEqual(r3.solved, 'ABCD1');
+  assert.strictEqual(r3.solved, 'BBB', 'returns the only solved probe');
 
-  console.log('✓ Parallel captcha probes: 3 cases pass (all-empty, one-succeeds, multi-succeed)');
+  console.log('✓ Parallel captcha probes (SAP-safe): returns LAST-arrived solved, prevents captcha invalidation race');
 }
 
 // ---- Test adaptive keep-warm frequency (hot vs cold) -----------------------

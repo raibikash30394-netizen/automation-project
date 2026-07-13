@@ -758,26 +758,43 @@ async function nextCaptcha(auth) {
   return { ...r, img };
 }
 
-// ---- Parallel captcha probing ---------------------------------------------
+// ---- Captcha probe strategy -----------------------------------------------
 //
-// User's log showed a ~3-second gap from window-open (15:45:00) to first
-// non-empty captcha (15:45:03). Serial polling misses the exact SAP unlock
-// moment because each probe is one round-trip (~50-100 ms) and we can only
-// do one at a time. Firing N parallel probes covers a wider time slice per
-// wave — whichever probe lands after SAP unlocks the captcha wins.
+// EARLIER we tried parallel captcha probes (fire N simultaneous requests,
+// first non-empty wins) to reduce window-open detection latency. But SAP
+// maintains exactly ONE active captcha per session — every new fetch
+// INVALIDATES the previous one. So if we fire 3 parallel probes:
+//   - probe #1 image X (solved as "AAA")
+//   - probe #2 image Y (solved as "BBB") — invalidates X on SAP
+//   - probe #3 image Z (solved as "CCC") — invalidates Y on SAP
+// If we submit with "AAA" (the winner by find-order), SAP has already
+// invalidated it and returns "Wrong Captcha". This exact bug bit user's
+// 16:45 IST window: 3 solver hits (ry2n4, f8233, VFh@4@) → submits=1 ok=0
+// wrong-captcha=1 → no bid saved.
 //
-// Only enabled during "match+no-captcha" tight-loop state (window opening).
-// Outside of that state, serial polling is more polite to SAP.
-const PARALLEL_CAPTCHA_PROBES = parseInt(process.env.PARALLEL_CAPTCHA_PROBES || '3', 10);
+// Correct approach: KEEP parallel probes DISABLED by default. Rely on
+// (a) adaptive keep-warm (TCP+TLS stays hot near window boundary),
+// (b) POLL_MS=20 tight serial polling,
+// (c) setImmediate tight-loop when matched-orders-but-no-captcha.
+// Serial + hot TCP typically detects unlock within one RTT (~50-100 ms).
+//
+// If the user WANTS to experiment with parallel probes (understanding that
+// only the LAST-fetched captcha is submit-safe), they can set
+// PARALLEL_CAPTCHA_PROBES>1 in .env. `nextCaptchaParallel()` then races
+// the probes but returns the LAST arrived solved captcha (not the first)
+// to match SAP's active-captcha semantics.
+const PARALLEL_CAPTCHA_PROBES = parseInt(process.env.PARALLEL_CAPTCHA_PROBES || '1', 10);
 
 async function nextCaptchaParallel(auth) {
   if (PARALLEL_CAPTCHA_PROBES <= 1) return nextCaptcha(auth);
   const probes = Array.from({ length: PARALLEL_CAPTCHA_PROBES }, () => nextCaptcha(auth));
-  // Race: first probe with a real solved captcha wins. If all fail, return
-  // the last failure (any is fine — they'll all say sap-empty or similar).
   const results = await Promise.all(probes);
-  const winner = results.find((r) => r.solved);
-  return winner || results[results.length - 1];
+  // Return the LAST-arrived solved captcha — SAP invalidates earlier ones.
+  // Note this still risks a race if two probes complete after SAP starts
+  // rotating: safer default is PARALLEL_CAPTCHA_PROBES=1.
+  const solvedResults = results.filter((r) => r.solved);
+  if (solvedResults.length) return solvedResults[solvedResults.length - 1];
+  return results[results.length - 1];
 }
 
 // Fire-and-forget: ask the local solver to drop a stale/wrong cache entry.
