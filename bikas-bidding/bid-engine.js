@@ -857,19 +857,18 @@ function buildBatches(orders, rules, blacklist, seenSubmitted, inFlight, cooldow
     }
   }
 
-  // ---- SMART BATCHING for multi-session parallelism ----
-  // Choose effective batch size to spread singles across ALL sessions when
-  // there are enough sessions. Example:
-  //   • 2 singles + 2 sessions → 2 batches of 1 (both sessions fire in parallel)
-  //   • 6 singles + 2 sessions → 2 batches of 3 (each session gets one)
-  //   • 3 singles + 4 sessions → 3 batches of 1 (3 sessions fire, 1 idle)
-  //   • 8 singles + 4 sessions → 4 batches of 2 (all fire in parallel)
-  // Falls back to BATCH_SIZE (usually 3) when there are far more singles than sessions.
-  const N = singles.length;
-  const S = Math.max(1, sessionCount);
-  const effectiveBatchSize = N > 0 ? Math.min(BATCH_SIZE, Math.max(1, Math.ceil(N / S))) : BATCH_SIZE;
+  // ---- BATCHING: singles-first (max BATCH_SIZE per submit), then clubs ----
+  //
+  // Since v3.4 sessions are SEQUENTIAL FALLBACKS (only one submit at a time),
+  // the old "spread across sessions" logic just fragmented singles into 1-per
+  // submit — which slowed the whole window because SAP costs ~200 ms per call.
+  // Restore the original pack-3-into-one behaviour so 3 singles = 1 SAP call.
+  //
+  // Order in the plan:
+  //   1) Singles chunked by BATCH_SIZE (default 3)
+  //   2) Club-id groups (already chunked by BATCH_SIZE upstream)
+  const effectiveBatchSize = BATCH_SIZE;
 
-  // Singles: chunk by effective batch size (session-aware)
   const singleBatches = [];
   for (let i = 0; i < singles.length; i += effectiveBatchSize) {
     singleBatches.push(singles.slice(i, i + effectiveBatchSize));
@@ -1037,9 +1036,13 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
       if (!fresh) return { retry: false };
       return handleBatch(ctx, session, item, fresh, workerId, retryDepth + 1);
     }
-    log.error(`[${workerId}] ✗ Wrong captcha 3× — will retry next scan`);
+    log.error(`[${workerId}] ✗ Wrong captcha 3× on this session — falling back to next session`);
     for (const b of item.bids) bidLogRow(b, 'WRONG_CAPTCHA_3X', result.text || '');
-    return { retry: true };
+    // Return { silentFail: true } so runAll's fallback loop tries the NEXT session
+    // (its captcha comes from an independent SAP session state, so the OCR
+    // usually succeeds where s1's did not). If ALL sessions burn 3× captchas
+    // in a row, runAll will cooldown the item just like other silent-fails.
+    return { silentFail: true };
   }
 
   if (isTimeEnded) {

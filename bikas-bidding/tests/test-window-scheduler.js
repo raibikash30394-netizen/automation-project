@@ -207,6 +207,66 @@ async function testSequentialFallback() {
   console.log('✓ Sequential fallback: all-silent-fail case triggers cooldown path');
 }
 
+// ---- Test batching: singles pack 3-per-batch, clubs come after ------------
+
+function testBatchingLogic() {
+  // Simulate the buildBatches core (singles + clubs → plan)
+  const BATCH_SIZE = 3;
+  function planFromCounts(numSingles, clubGroups = []) {
+    const singles = Array.from({ length: numSingles }, (_, i) => ({ id: `single-${i + 1}` }));
+    const singleBatches = [];
+    for (let i = 0; i < singles.length; i += BATCH_SIZE) {
+      singleBatches.push(singles.slice(i, i + BATCH_SIZE));
+    }
+    const plan = [];
+    for (const b of singleBatches) plan.push({ kind: 'single', bids: b });
+    for (const c of clubGroups)    plan.push({ kind: 'club',   bids: c.bids, clubId: c.clubId });
+    return plan;
+  }
+
+  // Case 1: 1 single → 1 batch of size 1
+  let p = planFromCounts(1);
+  assert.strictEqual(p.length, 1);
+  assert.strictEqual(p[0].bids.length, 1);
+  assert.strictEqual(p[0].kind, 'single');
+
+  // Case 2: 3 singles → 1 batch of size 3
+  p = planFromCounts(3);
+  assert.strictEqual(p.length, 1, `3 singles should be ONE batch of 3, got ${p.length} batches`);
+  assert.strictEqual(p[0].bids.length, 3);
+
+  // Case 3: 6 singles → 2 batches of 3
+  p = planFromCounts(6);
+  assert.strictEqual(p.length, 2);
+  assert.strictEqual(p[0].bids.length, 3);
+  assert.strictEqual(p[1].bids.length, 3);
+
+  // Case 4: 7 singles → 3 batches (3, 3, 1)
+  p = planFromCounts(7);
+  assert.strictEqual(p.length, 3);
+  assert.strictEqual(p[0].bids.length, 3);
+  assert.strictEqual(p[1].bids.length, 3);
+  assert.strictEqual(p[2].bids.length, 1);
+
+  // Case 5: 5 singles + 2 club groups → singles first, clubs after
+  p = planFromCounts(5, [
+    { clubId: 'C1', bids: [{ id: 'c1-1' }, { id: 'c1-2' }] },
+    { clubId: 'C2', bids: [{ id: 'c2-1' }] },
+  ]);
+  // 5 singles = 2 batches (3, 2), + 2 clubs = 4 items total
+  assert.strictEqual(p.length, 4);
+  assert.strictEqual(p[0].kind, 'single');
+  assert.strictEqual(p[0].bids.length, 3);
+  assert.strictEqual(p[1].kind, 'single');
+  assert.strictEqual(p[1].bids.length, 2);
+  assert.strictEqual(p[2].kind, 'club');
+  assert.strictEqual(p[2].clubId, 'C1');
+  assert.strictEqual(p[3].kind, 'club');
+  assert.strictEqual(p[3].clubId, 'C2');
+
+  console.log('✓ Batching: 5 cases pass (singles pack 3-per, clubs come after)');
+}
+
 // ---- Run --------------------------------------------------------------------
 
 (async () => {
@@ -215,6 +275,7 @@ async function testSequentialFallback() {
     testIsHotWindow();
     await testGlobalMutexSerialises();
     await testSequentialFallback();
+    testBatchingLogic();
     console.log('\n🎉 ALL TESTS PASS');
     process.exit(0);
   } catch (e) {
