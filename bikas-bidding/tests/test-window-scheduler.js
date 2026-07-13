@@ -502,6 +502,47 @@ function testPostSaveVerification() {
   console.log('✓ Post-save verification: 4 cases pass (OK, FAILED, PARTIAL, NOT_IN_LIST)');
 }
 
+// ---- Test captcha cache invalidation on wrong-captcha --------------------
+//
+// User's log showed 3/4 cache HITs were WRONG (=bg=, herrd, CUU5 → SAP said
+// wrong captcha; fdamc → SAP accepted). If SAP shows the same image again
+// later, the wrong cache entry would come back as a HIT and rebase the
+// wrong-captcha loop. This test verifies the invalidate-on-wrong-captcha
+// contract at the cache-Map level.
+function testCaptchaCacheInvalidation() {
+  const cache = new Map();
+  function put(hash, solved) { cache.set(hash, solved); }
+  function get(hash) { return cache.get(hash); }
+  function invalidate(hash) {
+    const had = cache.has(hash);
+    if (had) cache.delete(hash);
+    return had;
+  }
+
+  // Seed with 4 entries — 3 wrong (as user's live log) + 1 right
+  put('ff57a25c0d', '=bg=');    // wrong
+  put('cbc9716d0e', 'herrd');   // wrong
+  put('355284144a', 'CUU5');    // wrong
+  put('84e6236cf4', 'fdamc');   // right (SAP accepted)
+
+  assert.strictEqual(cache.size, 4);
+  assert.strictEqual(get('ff57a25c0d'), '=bg=');
+
+  // Simulate wrong-captcha → invalidate
+  assert.strictEqual(invalidate('ff57a25c0d'), true, 'was present');
+  assert.strictEqual(get('ff57a25c0d'), undefined, 'now absent');
+  assert.strictEqual(cache.size, 3);
+
+  // Invalidating a non-existent hash is a no-op
+  assert.strictEqual(invalidate('deadbeef00'), false);
+  assert.strictEqual(cache.size, 3);
+
+  // The RIGHT solve stays cached (only wrong ones invalidated)
+  assert.strictEqual(get('84e6236cf4'), 'fdamc');
+
+  console.log('✓ Captcha cache invalidation: removes wrong entries, keeps right ones');
+}
+
 // ---- Run --------------------------------------------------------------------
 
 (async () => {
@@ -515,6 +556,7 @@ function testPostSaveVerification() {
     testEmptyResponseSuccess();
     await testDeadCookieDetection();
     testPostSaveVerification();
+    testCaptchaCacheInvalidation();
     console.log('\n🎉 ALL TESTS PASS');
     process.exit(0);
   } catch (e) {

@@ -46,7 +46,7 @@ const SAP_PATH_PFX   = new URL(SAP_BASE_URL).pathname.replace(/\/$/, '');
 const CAPTCHA_URL    = process.env.CAPTCHA_URL || 'http://localhost:3000/solve-captcha';
 const CAPTCHA_ORIGIN = new URL(CAPTCHA_URL).origin;
 const CAPTCHA_PATH   = new URL(CAPTCHA_URL).pathname || '/';
-const VENDOR_ID      = process.env.VENDOR_ID || '2210181';
+const VENDOR_ID      = process.env.VENDOR_ID || '2207936';
 const PLANT_CODE     = process.env.PLANT_CODE || '6924';
 const POLL_MS        = parseInt(process.env.POLL_MS || '30', 10);
 const BATCH_SIZE     = parseInt(process.env.BATCH_SIZE || '3', 10);
@@ -740,7 +740,22 @@ async function nextCaptcha(auth) {
     globalThis.__firstCaptchaAt = Date.now();
     log.info(`⚡ First non-empty captcha detected [${auth.id}] — window open!`);
   }
-  return r;
+  // Attach the base64 image to the result so callers can invalidate the cache
+  // entry later if SAP rejects the solve with "Wrong Captcha".
+  return { ...r, img };
+}
+
+// Fire-and-forget: ask the local solver to drop a stale/wrong cache entry.
+// Called when SAP rejects a solve as "Wrong Captcha" — prevents the same
+// wrong answer from being returned as a cache HIT on subsequent scans.
+function invalidateCaptchaCache(base64Image, wrongSolved) {
+  if (!base64Image) return;
+  solverPool.request({
+    path: '/invalidate',
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ base64Image, solved: wrongSolved || '' }),
+  }).then((r) => r.body.dump()).catch(() => { /* silent */ });
 }
 
 // ---- Formatting helpers ---------------------------------------------------
@@ -996,7 +1011,7 @@ function makeWorkerPool(ctx) {
 
   async function fetchFreshCaptcha(auth, workerId) {
     const r1 = await nextCaptcha(auth);
-    if (r1.solved) return r1.solved;
+    if (r1.solved) { auth._lastCaptchaImg = r1.img; return r1.solved; }
     if (wafActive()) return '';
 
     // sap-empty = bid window is CLOSED on the SAP side. Retrying just wastes
@@ -1012,7 +1027,7 @@ function makeWorkerPool(ctx) {
     log.warn(`[${workerId}] captcha attempt 1/3 failed: ${r1.reason}`);
     for (let i = 1; i < 3; i++) {
       const r = await nextCaptcha(auth);
-      if (r.solved) return r.solved;
+      if (r.solved) { auth._lastCaptchaImg = r.img; return r.solved; }
       if (wafActive()) return '';
       if (r.reason === 'sap-empty') return '';
       log.warn(`[${workerId}] captcha attempt ${i + 1}/3 failed: ${r.reason}`);
@@ -1172,13 +1187,16 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
 
   if (isWrongCaptcha) {
     metrics.submitsWrongCaptcha++;
+    // The captcha we just used was rejected — flush it from the local cache
+    // so this same wrong OCR result never comes back as a HIT again.
+    invalidateCaptchaCache(auth._lastCaptchaImg, solvedCaptcha);
     if (retryDepth < 3) {
       log.warn(`[${workerId}] ↻ Wrong captcha — refetching + retry ${retryDepth + 1}/3`);
       // Immediate retry with a FRESH captcha (still inside session mutex).
       let fresh = '';
       for (let i = 0; i < 3; i++) {
         const r = await nextCaptcha(auth);
-        if (r.solved) { fresh = r.solved; break; }
+        if (r.solved) { fresh = r.solved; auth._lastCaptchaImg = r.img; break; }
         if (wafActive()) return { retry: false };
       }
       if (!fresh) return { retry: false };

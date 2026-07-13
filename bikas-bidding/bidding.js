@@ -230,6 +230,40 @@ app.post('/solve-captcha',  handleSolve);   // legacy alias used by old bid-engi
 app.post('/captcha',        handleSolve);
 app.post('/upload-base64-image', handleSolve);
 
+// ---- Cache invalidation ---------------------------------------------------
+//
+// When bid-engine gets "Wrong Captcha" from SAP, it POSTs the offending
+// image here so we DROP its cached (wrong) solve — next time the same image
+// appears, we force a fresh TrueCaptcha OCR. This eliminates the case where
+// a wrong OCR result (like "=bg=" or "herrd") sits in the cache and keeps
+// coming back as a HIT, guaranteeing repeated wrong-captcha rejections.
+async function handleInvalidate(req, res) {
+  try {
+    const { base64Image, solved: reportedSolved } = parseBody(req);
+    if (!base64Image) return res.status(400).json({ error: 'base64Image required' });
+    const raw = stripDataUri(base64Image);
+    const hash = sha256(raw);
+    const hadIt = hashMap.has(hash);
+    if (hadIt) {
+      const wasSolved = hashMap.get(hash);
+      hashMap.delete(hash);
+      // Also remove from entries[] so it doesn't come back after next disk load
+      entries = entries.filter((e) => e.hash !== hash);
+      dirty = true;
+      log.warn(
+        { hash: hash.slice(0, 10), wasSolved, reportedSolved },
+        `INVALIDATED wrong cache entry (SAP rejected "${wasSolved}")`,
+      );
+    }
+    res.json({ ok: true, invalidated: hadIt, cacheSize: hashMap.size });
+  } catch (e) {
+    log.error({ err: e.message }, 'invalidate handler failed');
+    res.status(500).json({ error: e.message });
+  }
+}
+
+app.post('/invalidate', handleInvalidate);
+
 app.get('/health', (_req, res) => {
   res.json({
     ok: true,
