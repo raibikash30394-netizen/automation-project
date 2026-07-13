@@ -684,6 +684,29 @@ function testAdaptiveKeepWarm() {
   console.log('✓ Adaptive keep-warm: hot=3s, cold=20s (TCP+TLS stays hot during window opens)');
 }
 
+// ---- Test SAP-late visibility log throttling -------------------------------
+//
+// User's 17:15 IST log showed a scary 80-second silence during hot window
+// because SAP unlocked captcha ~61s late. Fix: log "still waiting" every
+// ~10s during hot window with sap-empty state, so user knows the bot is
+// alive and doesn't panic-restart.
+function testSapLateVisibility() {
+  const THROTTLE_MS = 10_000;
+  function shouldLog(now, lastLog) {
+    return !lastLog || (now - lastLog) > THROTTLE_MS;
+  }
+
+  const t0 = 1_000_000;
+  assert.strictEqual(shouldLog(t0,          0),           true,  'first call: log');
+  assert.strictEqual(shouldLog(t0 + 5_000,  t0),          false, '5s later: no log');
+  assert.strictEqual(shouldLog(t0 + 9_999,  t0),          false, '9.999s later: no log');
+  assert.strictEqual(shouldLog(t0 + 10_001, t0),          true,  '10.001s later: log');
+  assert.strictEqual(shouldLog(t0 + 15_000, t0 + 10_001), false, 'reset window, 4.999s: no log');
+  assert.strictEqual(shouldLog(t0 + 20_002, t0 + 10_001), true,  'reset window, 10.001s: log');
+
+  console.log('✓ SAP-late visibility log: throttled at ~10s intervals (prevents log spam + prevents user panic)');
+}
+
 // ---- Run --------------------------------------------------------------------
 
 (async () => {
@@ -701,6 +724,7 @@ function testAdaptiveKeepWarm() {
     testL1UndercutDetection();
     await testParallelCaptchaProbes();
     testAdaptiveKeepWarm();
+    testSapLateVisibility();
     console.log('\n🎉 ALL TESTS PASS');
     process.exit(0);
   } catch (e) {

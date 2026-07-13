@@ -1069,10 +1069,24 @@ function makeWorkerPool(ctx) {
     if (r1.solved) { auth._lastCaptchaImg = r1.img; return r1.solved; }
     if (wafActive()) return '';
 
-    // sap-empty = bid window is CLOSED on the SAP side. Retrying just wastes
-    // ~500 ms per attempt. Return immediately, poll again next scan.
+    // sap-empty = SAP has not unlocked the captcha for this session yet.
+    // This is a SAP-SIDE STATE, not a client bug. During the 30-second
+    // pre-warm phase we expect empty responses; even inside an active
+    // :15/:45 window SAP sometimes takes 1-60 seconds after the clock
+    // boundary to actually generate the captcha. Retrying costs ~50-100 ms
+    // per attempt; we just poll again next scan.
+    //
+    // VISIBILITY: to reassure the user during long SAP-side delays (they
+    // may otherwise think the bot is stuck), emit a status log every
+    // ~10 seconds while inside a hot window. Includes seconds past the
+    // :15/:45 boundary so it's obvious this is SAP being slow, not us.
     if (r1.reason === 'sap-empty') {
-      if (ctx.scan % Math.max(1, Math.round(10_000 / Math.max(POLL_MS, 1))) === 0) {
+      const now = Date.now();
+      if (isHotWindow() && (!globalThis.__lastWaitLog || now - globalThis.__lastWaitLog > 10_000)) {
+        globalThis.__lastWaitLog = now;
+        const secsPast = 30 * 60 - Math.round(msUntilNextWindow() / 1000);
+        log.info(`[${workerId}] ⏳ waiting for SAP to unlock captcha… ~${secsPast}s past :15/:45 boundary (bot is polling, SAP is late — do NOT restart, will catch as soon as SAP responds)`);
+      } else if (!isHotWindow() && ctx.scan % Math.max(1, Math.round(10_000 / Math.max(POLL_MS, 1))) === 0) {
         log.warn(`[${workerId}] SAP returned empty captcha (bid window likely closed) — polling next scan`);
       }
       return '';
@@ -1629,6 +1643,7 @@ async function main() {
   //   • Whenever orders match but captcha is empty → tight loop regardless
   //     of clock (window may already be open).
   let lastPreWarmAt = 0;
+  let lastBoundaryLogAt = 0;
   while (true) {
     const untilNext = msUntilNextWindow();
     const hot = isHotWindow();
@@ -1639,6 +1654,19 @@ async function main() {
       log.info(`⏱  Pre-warming for next SAP bid-window (~${Math.round(untilNext / 1000)}s away, IST-aligned)`);
       // Fire-and-forget: refresh CSRF + touch SessionSet in parallel for all sessions.
       Promise.all(ctx.sessions.map((s) => s.refreshToken().catch(() => {})));
+    }
+
+    // Precise "window boundary reached" log — fires once per window when the
+    // clock hits :15:00 or :45:00. Distinct from the "first captcha detected"
+    // log (which fires whenever SAP finally unlocks, often later). This helps
+    // the user see immediately that the boundary is CROSSED but captcha
+    // hasn't unlocked yet — so they don't panic-restart.
+    if (hot && untilNext > (29 * 60_000) && Date.now() - lastBoundaryLogAt > 60_000) {
+      lastBoundaryLogAt = Date.now();
+      globalThis.__firstCaptchaAt = 0; // reset so first-captcha log fires per window
+      globalThis.__lastWaitLog = 0;    // reset waiting log timer
+      globalThis.__postSaveVerified = false; // allow post-save verify per window
+      log.info(`🕒 :15/:45 window BOUNDARY reached (per clock) — bot polling for SAP captcha unlock. SAP may take 1-60s to actually generate the captcha for this window.`);
     }
 
     await tick(ctx);
