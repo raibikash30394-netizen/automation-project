@@ -51,11 +51,20 @@ Two Node.js processes:
 ## Implemented (2026-02 — v3.14 SAP-late polling stall fix)
 - **Root cause of missing wait-log & no bids saved**: In v3.13 the wait-log lived ONLY inside `fetchFreshCaptcha()` (called when `sap-empty` captcha response). But when SAP is late, the `BidOrderListSet` endpoint also returns 0 orders (or 0 matched) — `tick()` then early-returned BEFORE ever calling captcha fetch. Result: wait-log never fired, main loop dropped to 2000ms idle poll, user thought bot was frozen.
 - **Fix in `tick()`** (bid-engine.js lines 1464-1509):
-  - `orders.length === 0` inside `isHotWindow()` → set `_matchedButNoCaptcha = true` (main loop tight-polls) + emit throttled wait-log ("waiting for SAP to populate order list… Ns past boundary — do NOT restart")
+  - `orders.length === 0` inside `isHotWindow()` → set tight-loop + emit throttled wait-log ("waiting for SAP to populate order list… Ns past boundary — do NOT restart")
   - `stats.matched === 0` inside `isHotWindow()` → same tight-loop + throttled wait-log ("waiting for matched orders to appear (N live, 0 matched)…")
   - Cold-window behaviour unchanged (idle 2000ms sleep + 10s heartbeat log)
-- New unit test `testEmptyOrdersInHotWindow` (6 cases: cold-empty=idle, hot-empty-first=log+tight, hot-empty-throttled=no-log, hot-empty-past-throttle=log-again, hot-matched=0=same, cold-matched=0=idle).
+- New unit test `testEmptyOrdersInHotWindow` (6 cases).
 - **Total tests: 16/16 pass**.
+
+## Implemented (2026-02 — v3.15 session-shake + cache-bypass on stall)
+- **Live 18:15 IST log analysis**: bot correctly detected boundary at 18:15:01, polled tight for 58s with `14 live, 0 matched`, user restarted at 18:15:59, and same session at 18:16:09 immediately found matched=1 & saved in 440ms. This proves SAP was hiding the matched order from that session's live view (stale-session filtering, not a client bug).
+- **WebSocket path DEAD**: SAP's `zapc_e_bid` WebSocket returns `NS_ERROR_WEBSOCKET_CONNECTION_REFUSED` even in the browser — externally blocked. Do NOT attempt WS again.
+- **Fix 1 — Cache bypass during stall**: `ctx._matchedButNoCaptcha=true` (which enabled 100 ms order-cache reuse) is NO LONGER set on hot-empty / hot-matched=0. Replaced with new flag `ctx._hotStall`. This forces a FRESH `BidOrderListSet` fetch on every tick during stall (~20ms/scan) so matched orders appear the microsecond SAP releases them.
+- **Fix 2 — Silent session-shake**: New `maybeShakeSession(ctx, reason)` fires a background `refreshToken()` on every session at most once every 15 s during a hot-window stall. Fire-and-forget, non-blocking, errors silent. Reset marker `__lastSessionShake` per window boundary so each new window gets an immediate shake.
+- **Main-loop tight-loop condition** extended: `sleepMs=0` when either `_matchedButNoCaptcha` OR `_hotStall` is true.
+- New unit test `testSessionShakeThrottle` (5 cases proving 15s throttle correctness).
+- **Total tests: 17/17 pass**.
 
 ## Verified
 - `bidding.js` starts, loads cache, `/health` returns metrics JSON

@@ -777,6 +777,26 @@ function testEmptyOrdersInHotWindow() {
   console.log('✓ SAP-late polling stall fix: hot-window empty orders / matched=0 → tight loop + throttled visibility log (6 cases)');
 }
 
+// v3.15 — Session-shake throttle:
+// During hot-window stall (orders=0 or matched=0), the bot silently
+// refreshes CSRF on every session at most once every 15s to shake loose
+// SAP-side stale-session filtering that may hide matched orders.
+function testSessionShakeThrottle() {
+  const THROTTLE_MS = 15_000;
+  function shouldShake(now, lastShake) {
+    return !lastShake || (now - lastShake) >= THROTTLE_MS;
+  }
+
+  const t0 = 2_000_000;
+  assert.strictEqual(shouldShake(t0,          0),           true,  'first stall tick: shake fires');
+  assert.strictEqual(shouldShake(t0 + 5_000,  t0),          false, '5s later: within throttle');
+  assert.strictEqual(shouldShake(t0 + 14_999, t0),          false, '14.999s later: within throttle');
+  assert.strictEqual(shouldShake(t0 + 15_000, t0),          true,  '15s later: shake again');
+  assert.strictEqual(shouldShake(t0 + 30_001, t0 + 15_000), true,  '30s later: another shake');
+
+  console.log('✓ Session-shake throttle: max once per 15s per process — CSRF refresh unblocks stale session filtering (5 cases)');
+}
+
 // ---- Run --------------------------------------------------------------------
 
 (async () => {
@@ -796,6 +816,7 @@ function testEmptyOrdersInHotWindow() {
     testAdaptiveKeepWarm();
     testSapLateVisibility();
     testEmptyOrdersInHotWindow();
+    testSessionShakeThrottle();
     console.log('\n🎉 ALL TESTS PASS');
     process.exit(0);
   } catch (e) {

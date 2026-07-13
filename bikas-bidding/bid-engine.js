@@ -1467,7 +1467,9 @@ async function tick(ctx) {
       // must keep tight-polling so we catch the moment SAP populates, and
       // emit a visibility log so the user doesn't panic-restart.
       if (isHotWindow()) {
-        ctx._matchedButNoCaptcha = true; // tight-loop 0-ms sleeps in main loop
+        ctx._hotStall = true;             // main loop tight-polls
+        ctx._matchedButNoCaptcha = false; // do NOT enable order-cache reuse in stall state
+        maybeShakeSession(ctx, 'no-orders');
         const now = Date.now();
         if (!globalThis.__lastWaitLog || now - globalThis.__lastWaitLog > 10_000) {
           globalThis.__lastWaitLog = now;
@@ -1476,6 +1478,7 @@ async function tick(ctx) {
         }
         return;
       }
+      ctx._hotStall = false;
       ctx._matchedButNoCaptcha = false;
       // Reset the "first captcha detected" marker between windows so the
       // next window-open log fires afresh.
@@ -1501,19 +1504,27 @@ async function tick(ctx) {
       // Hot-window but nothing matched yet — could mean SAP populated a few
       // orders but the ones matching our CSV rules aren't visible yet, or
       // they're all in cooldown/inFlight. Keep tight-loop + visibility log.
+      // ALSO: trigger a silent CSRF refresh every 15s ("session shake") in
+      // case SAP is filtering orders on stale session state.
       if (isHotWindow()) {
-        ctx._matchedButNoCaptcha = true;
+        ctx._hotStall = true;
+        ctx._matchedButNoCaptcha = false; // no cache reuse — force fresh order fetch each scan
+        maybeShakeSession(ctx, 'no-match');
         const now = Date.now();
         if (!globalThis.__lastWaitLog || now - globalThis.__lastWaitLog > 10_000) {
           globalThis.__lastWaitLog = now;
           const secsPast = 30 * 60 - Math.round(msUntilNextWindow() / 1000);
-          log.info(`⏳ waiting for matched orders to appear (${stats.total} live, 0 matched)… ~${secsPast}s past :15/:45 boundary (bot polling tight — do NOT restart)`);
+          log.info(`⏳ waiting for matched orders to appear (${stats.total} live, 0 matched)… ~${secsPast}s past :15/:45 boundary (bot polling tight, session-shake active — do NOT restart)`);
         }
         return;
       }
+      ctx._hotStall = false;
       ctx._matchedButNoCaptcha = false;
       return;
     }
+
+    // Matched orders exist — clear the stall flag.
+    ctx._hotStall = false;
 
     // Throttle the scan log: it repeats identically for every scan while
     // waiting for the captcha to appear. Log only when the plan changes or
@@ -1608,6 +1619,25 @@ function startKeepWarm(sessions) {
 
 // ---- Main ------------------------------------------------------------------
 
+/**
+ * "Session shake" — during a hot-window stall (SAP returning 0 orders or
+ * 0 matched) we silently refresh CSRF tokens on every session in the
+ * background. This shakes loose any SAP-side stale-session filtering that
+ * may be hiding matched orders from this cookie. Throttled to at most
+ * once every 15 seconds per process to avoid CSRF spam.
+ *
+ * Fire-and-forget (non-blocking, errors swallowed) so it never delays the
+ * tick that would otherwise catch a real match.
+ */
+function maybeShakeSession(ctx, reason) {
+  const now = Date.now();
+  if (globalThis.__lastSessionShake && now - globalThis.__lastSessionShake < 15_000) return;
+  globalThis.__lastSessionShake = now;
+  const secsPast = 30 * 60 - Math.round(msUntilNextWindow() / 1000);
+  log.info(`🔄 session-shake (${reason}) — refreshing CSRF on ${ctx.sessions.length} session(s) at ~${secsPast}s past boundary`);
+  Promise.all(ctx.sessions.map((s) => s.refreshToken().catch(() => {}))).catch(() => {});
+}
+
 async function main() {
   log.info('🚀 Bikas Bidding v2 engine starting…');
 
@@ -1692,6 +1722,7 @@ async function main() {
       lastBoundaryLogAt = Date.now();
       globalThis.__firstCaptchaAt = 0; // reset so first-captcha log fires per window
       globalThis.__lastWaitLog = 0;    // reset waiting log timer
+      globalThis.__lastSessionShake = 0; // allow immediate session-shake on new window
       globalThis.__postSaveVerified = false; // allow post-save verify per window
       log.info(`🕒 :15/:45 window BOUNDARY reached (per clock) — bot polling for SAP captcha unlock. SAP may take 1-60s to actually generate the captcha for this window.`);
     }
@@ -1699,8 +1730,8 @@ async function main() {
     await tick(ctx);
 
     let sleepMs;
-    if (ctx._matchedButNoCaptcha) {
-      sleepMs = 0; // tight loop — window is opening/open
+    if (ctx._matchedButNoCaptcha || ctx._hotStall) {
+      sleepMs = 0; // tight loop — window is opening/open OR waiting for orders/matches to appear
     } else if (hot) {
       sleepMs = POLL_MS; // inside 5-min active window (or 30s pre-warm) — user-tunable
     } else if (untilNext < 10_000) {
