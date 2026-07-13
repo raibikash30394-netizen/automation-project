@@ -39,14 +39,15 @@ Two Node.js processes:
 - **Wrong-captcha exhaustion → fallback**: After 3× wrong-captcha on one session, `handleBatch` returns `{ silentFail: true }` so runAll retries with next session (its captcha comes from independent SAP session state, so OCR often succeeds).
 - **Unit tests** in `tests/test-window-scheduler.js` — 7 groups, all pass (msUntilNextWindow 7 cases, isHotWindow 22 cases, mutex serialisation 4-way, sequential fallback success + all-fail paths, batching 5 cases, rank hint extraction 3 cases).
 
-## Implemented (2026-02 — v3.6 single-session revert per user)
-- **Reverted to SINGLE-SESSION mode** — `discoverSessions()` only picks up cookie.txt. Any cookie2/3/4.txt files are IGNORED with a warning log. Matches the user-verified working baseline they shared.
-- **Empty HTTP 200/201 = SILENT SAVE SUCCESS** (restored from pre-multi-session working build). SAP returns empty NavEBiddingMessage + empty Ev_Text as its silent confirmation — the browser row appears after this response. Previous "anti-fraud silent-fail" theory was actually caused by parallel multi-cookie submissions, not by empty 201 itself. In single-session mode empty 201 is a real save.
-- **Wrong-captcha 3×** now returns `{ retry: true }` (retry next scan) — single session has nowhere to fall back to.
-- **Preserved** all v3.4/v3.5 improvements: IST bid-window scheduler (`:15`/`:45` pre-warm 30s + hot polling), adaptive main-loop sleep (0/30/100/500/2000 ms tiers), bid log CSV, rank/L1 extraction, raw response dump, batching 3-per-call, longest-first city matching, JIT captcha, order caching, TCP keep-warm ping.
-- **New unit test**: `testEmptyResponseSuccess` — 6 cases verifying empty 200/201 → ACCEPTED, real save text → ACCEPTED, time-ended text → TIME_ENDED, wrong-captcha text → WRONG_CAPTCHA, HTTP 500 → UNKNOWN.
-- **Total test groups: 8/8 pass**.
-- **testing_agent iteration_4**: 100% pass, no critical/minor issues.
+## Implemented (2026-02 — v3.7 dead-cookie diagnostic)
+- **Root cause detected**: SAP returns fresh CSRF token via `SessionSet('')` EVEN when the underlying browser cookie is dead (logged out elsewhere, admin killed, session timeout). Prior code went into an infinite 403-loop hammering SAP.
+- **`sapRequest()` now tracks** consecutive 403-after-refresh on `auth._deadCount`. After 3 (default `AUTH_DEAD_THRESHOLD=3`), sets `auth._deadUntil = now + 30_000ms` (default `AUTH_DEAD_COOLDOWN_MS`).
+- **ONE loud instructional error** logged with 🔒 emoji + explicit steps: paste fresh Cookie header from DevTools Network → cookie.txt, delete token.txt, `pm2 restart bid-engine`.
+- **During cool-off**: sapRequest short-circuits with synthetic `{ statusCode: 401, data: { _cookieDead: true, remainingMs } }` — no SAP hit, no rate-limit burn.
+- **`fetchLiveOrders()`** suppresses per-poll `HTTP 403` warn spam when it sees the `_cookieDead` marker.
+- **Self-heal**: any 2xx/3xx response clears `_deadCount` — if user updates cookie mid-run and it takes effect, bot recovers automatically.
+- New unit test `testDeadCookieDetection`: 3 cases (alive-at-start, 3× triggers dead flag, mid-stream success resets counter).
+- **testing_agent iteration_5**: 100% pass, no issues. 9/9 test groups.
 
 ## Verified
 - `bidding.js` starts, loads cache, `/health` returns metrics JSON
