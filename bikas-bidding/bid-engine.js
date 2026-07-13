@@ -123,6 +123,80 @@ function markWaf(reason) {
 function wafActive()      { return Date.now() < waf.until; }
 function wafRemainingMs() { return Math.max(0, waf.until - Date.now()); }
 
+// ---- GLOBAL SUBMIT MUTEX ---------------------------------------------------
+//
+// SAP's anti-fraud triggers when the SAME vendor submits from multiple sessions
+// concurrently — result: HTTP 201 with EMPTY body, bid NOT saved server-side
+// (browser shows nothing, user gets Rank 10). Fix: serialise the actual submit
+// HTTP call across ALL sessions so only ONE bid hits SAP at any instant.
+//
+// Multiple cookies (cookie2/3/4.txt) are still useful — they become sequential
+// FALLBACKS (session A silent-fails → session B retries with a fresh captcha,
+// etc.) instead of concurrent bombardment.
+const globalSubmitMutex = (() => {
+  let chain = Promise.resolve();
+  const obj = {
+    _busy: false,
+    run(fn) {
+      const wrapped = async () => {
+        obj._busy = true;
+        try { return await fn(); }
+        finally { obj._busy = false; }
+      };
+      const p = chain.then(wrapped, wrapped);
+      chain = p.catch(() => {});
+      return p;
+    },
+  };
+  return obj;
+})();
+
+// ---- IST bid-window scheduler ----------------------------------------------
+//
+// User confirmed: SAP bid windows open on FIXED clock schedule in IST:
+//   :15 and :45 of every hour  → e.g. 14:15, 14:45, 15:15, 15:45 …
+// Each window stays open ~5 min then closes. This lets us:
+//   1) Pre-warm TLS + refresh CSRF ~30 s BEFORE the window opens
+//   2) Aggressively poll captcha ~10 s BEFORE + first 5 min AFTER the window
+//   3) Idle-sleep between windows to avoid needless SAP hits (WAF-safe)
+function getISTNow() {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Kolkata',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+  }).formatToParts(new Date());
+  const o = {};
+  for (const p of parts) if (p.type !== 'literal') o[p.type] = parseInt(p.value, 10);
+  return o; // { hour, minute, second }
+}
+
+// ms until the next :15 or :45 IST boundary. Always > 0, < 30 min.
+function msUntilNextWindow() {
+  const { minute, second } = getISTNow();
+  const ms = new Date().getMilliseconds();
+  const secondsIntoMinute = second + ms / 1000;
+  // Determine next boundary in minutes-into-hour
+  let nextMin;
+  if (minute < 15) nextMin = 15;
+  else if (minute < 45) nextMin = 45;
+  else nextMin = 75; // next hour :15 (i.e. 60 + 15)
+  const secondsToGo = (nextMin - minute) * 60 - secondsIntoMinute;
+  return Math.max(0, Math.round(secondsToGo * 1000));
+}
+
+// Are we in an active/soon bid-window window?
+//   pre-warm : 30 s BEFORE :15 / :45  → true (aggressive polling starts)
+//   active   : first 5 min AFTER      → true (window is open, keep tight)
+//   idle     : otherwise              → false
+function isHotWindow() {
+  const { minute, second } = getISTNow();
+  // Pre-warm: last 30 s of minute :14 or :44
+  if ((minute === 14 || minute === 44) && second >= 30) return true;
+  // Active window: :15–:19 and :45–:49 (first 5 min after open)
+  if (minute >= 15 && minute < 20) return true;
+  if (minute >= 45 && minute < 50) return true;
+  return false;
+}
+
 // ---- Auth (cookie + CSRF token) --------------------------------------------
 
 /**
@@ -848,24 +922,55 @@ function makeWorkerPool(ctx) {
     return '';
   }
 
-  async function runOne(session) {
-    const workerId = session.id;
+  async function runAll() {
     while (cursor < ctx.plan.length) {
       const item = ctx.plan[cursor++];
       const t0 = Date.now();
       for (const b of item.bids) ctx.inFlight.add(String(b.order.SapOrderId));
 
-      // Critical section — per-session mutex (independent across sessions):
-      // fetch captcha → solve → submit as one atomic unit for THIS session.
-      const outcome = await session.mutex.run(async () => {
-        const solved = await fetchFreshCaptcha(session, workerId);
-        if (!solved) return { skipped: true };
-        return await handleBatch(ctx, session, item, solved, workerId);
-      });
+      // ---- Sequential FALLBACK across sessions -----------------------------
+      // We iterate cookies (s1 → s2 → s3 → …). For each session:
+      //   1. Fetch a fresh captcha (JIT — inside session's own mutex).
+      //   2. Acquire the GLOBAL submit mutex (only ONE session hits SAP at a time).
+      //   3. Submit. If SAP returns empty 201 (silent anti-fraud fail),
+      //      try the next session immediately with a fresh captcha.
+      //   4. Stop on real success or definitive rejection.
+      // If ALL sessions silent-fail → mark cooldown so we retry next scan.
+      let finalOutcome = null;
+      let allSilentFail = true;
+      for (const session of ctx.sessions) {
+        const outcome = await session.mutex.run(async () => {
+          const solved = await fetchFreshCaptcha(session, session.id);
+          if (!solved) return { skipped: true };
+          // Global mutex: serialise the actual submit HTTP call across ALL sessions.
+          return await globalSubmitMutex.run(async () => {
+            return await handleBatch(ctx, session, item, solved, session.id);
+          });
+        });
 
-      if (outcome && outcome.skipped) {
-        for (const b of item.bids) ctx.inFlight.delete(String(b.order.SapOrderId));
-        continue;
+        finalOutcome = outcome;
+        if (!outcome || outcome.skipped) continue;
+        if (outcome.silentFail) {
+          log.warn(`[${session.id}] Silent 201 → falling back to next session`);
+          continue;
+        }
+        // Real result (success OR definitive rejection) → stop fallback loop
+        allSilentFail = false;
+        break;
+      }
+
+      // If every session silent-failed on this item, cooldown so we retry later
+      if (allSilentFail && ctx.sessions.length > 0 && finalOutcome && finalOutcome.silentFail) {
+        const retryAt = Date.now() + TIME_ENDED_COOLDOWN_MS;
+        for (const b of item.bids) {
+          ctx.cooldown.set(String(b.order.SapOrderId), retryAt);
+          bidLog.write({
+            session: 'all', sap_order_id: b.order.SapOrderId, city: b.city, spi: b.spi,
+            csv_rate: b.amount, submit_ms: '', status: 'SILENT_TIME_ENDED_ALL',
+            message: `all ${ctx.sessions.length} sessions returned empty 201`,
+          });
+        }
+        metrics.submitsTimeEnded++;
       }
 
       for (const b of item.bids) ctx.inFlight.delete(String(b.order.SapOrderId));
@@ -873,8 +978,9 @@ function makeWorkerPool(ctx) {
     }
   }
 
-  // One worker per session — pure parallelism across cookies.
-  return ctx.sessions.map((s) => runOne(s));
+  // Single serialised worker — sessions are FALLBACKS, not concurrent hitters.
+  // This prevents the SAP vendor-lockout that causes silent HTTP 201 empties.
+  return [runAll()];
 }
 
 async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0) {
@@ -998,23 +1104,26 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
     return handleBatch(ctx, session, item, fresh, workerId, retryDepth + 1);
   }
 
-  // ---- HTTP 200/201 with empty response body = TIME-ENDED (silent failure) ----
-  // Earlier we treated empty 201 as success, but the user's browser showed
-  // NOTHING was saved server-side — meaning SAP returns empty 201 as a
-  // "silent time-ended" response (bid window closed by the time our submit
-  // landed). Treating this as success caused false "ACCEPTED" logs and let
-  // stale orders sit in ctx.submitted (not retried). Now it's classified
-  // properly and orders get a cooldown so we can retry when window re-opens.
+  // ---- HTTP 200/201 with empty response body = SILENT FAIL --------------------
+  // SAP returns an empty 200/201 in two cases we care about:
+  //   (a) bid window closed between our captcha fetch and our submit (real time-ended)
+  //   (b) SAP anti-fraud vendor-lockout when the same vendor submits from
+  //       multiple sessions concurrently — bid is NOT saved server-side.
+  // We now surface this as `silentFail: true` so the caller (runAll) can
+  // FALL BACK to the next session (fresh captcha) instead of accepting the
+  // false-negative. If ALL sessions silent-fail on this item, runAll sets
+  // the cooldown itself.
   if ((result.statusCode === 200 || result.statusCode === 201) &&
       !result.info && !result.text && !isTimeEnded && !isWrongCaptcha && reduceBy === null && minFloor === null) {
-    metrics.submitsTimeEnded++;
-    const retryAt = Date.now() + TIME_ENDED_COOLDOWN_MS;
-    log.warn(`[${workerId}] ⏰ HTTP ${result.statusCode} EMPTY = silent time-ended in ${result.submitMs}ms — cooldown ${Math.round(TIME_ENDED_COOLDOWN_MS / 1000)}s (bid NOT saved)`);
+    log.warn(`[${workerId}] ⚠  HTTP ${result.statusCode} EMPTY (silent fail, likely anti-fraud) in ${result.submitMs}ms — trying next session`);
     for (const b of item.bids) {
-      ctx.cooldown.set(String(b.order.SapOrderId), retryAt);
-      bidLogRow(b, 'SILENT_TIME_ENDED', `HTTP ${result.statusCode} empty`);
+      bidLog.write({
+        session: workerId, sap_order_id: b.order.SapOrderId, city: b.city, spi: b.spi,
+        csv_rate: b.amount, submit_ms: result.submitMs, status: 'SILENT_FAIL',
+        message: `HTTP ${result.statusCode} empty`,
+      });
     }
-    return { retry: false };
+    return { silentFail: true };
   }
 
   if (result.info === 'I') {
@@ -1195,7 +1304,7 @@ async function main() {
     `Config: POLL_MS=${POLL_MS} BATCH_SIZE=${BATCH_SIZE} SESSIONS=${sessions.length} ` +
     `AUTO_ADJUST=${AUTO_ADJUST} WAF=${WAF_MIN_MS}→${WAF_MAX_MS}ms metrics=${METRICS_MS}ms`
   );
-  log.info(`Cookies loaded: ${sessions.map((s) => s.id).join(', ')} — each will submit bids in parallel.`);
+  log.info(`Cookies loaded: ${sessions.map((s) => s.id).join(', ')} — sessions act as SEQUENTIAL FALLBACKS (only one submits at a time; if s1's HTTP 201 is empty, s2 retries with a fresh captcha, then s3, then s4).`);
 
   // Refresh CSRF for every session in parallel.
   await Promise.all(sessions.map((s) => (s.token ? Promise.resolve() : s.refreshToken())));
@@ -1225,18 +1334,46 @@ async function main() {
 
   // Main polling loop.
   //
-  // SPEED: adaptive sleep. During pre-window state (orders matched but
-  // captcha still empty), sleep is 0 → we probe captcha as tightly as the
-  // network allows, catching the "window opens" moment within one SAP RTT
-  // (~30-50 ms). Otherwise use POLL_MS + small jitter to avoid perfect
-  // burst alignment with SAP's WAF.
+  // SPEED strategy — IST-window-aware:
+  //   • Pre-window (30 s BEFORE :15 or :45 IST) → aggressive polling
+  //     (100 ms sleep) to be first to catch the "window opens" moment.
+  //   • Active window (:15–:19 / :45–:49 IST, i.e. first 5 min) → tight
+  //     loop (0-ms setImmediate) when we have matched orders but no captcha.
+  //   • Between windows (idle) → slow poll (2000 ms) — WAF-safe & CPU-safe.
+  //   • Whenever orders match but captcha is empty → tight loop regardless
+  //     of clock (window may already be open).
+  let lastPreWarmAt = 0;
   while (true) {
+    const untilNext = msUntilNextWindow();
+    const hot = isHotWindow();
+
+    // Pre-warm CSRF + TLS ~30s before each window. Runs once per window.
+    if (untilNext < 30_000 && Date.now() - lastPreWarmAt > 60_000) {
+      lastPreWarmAt = Date.now();
+      log.info(`⏱  Pre-warming for next SAP bid-window (~${Math.round(untilNext / 1000)}s away, IST-aligned)`);
+      // Fire-and-forget: refresh CSRF + touch SessionSet in parallel for all sessions.
+      Promise.all(ctx.sessions.map((s) => s.refreshToken().catch(() => {})));
+    }
+
     await tick(ctx);
+
+    let sleepMs;
     if (ctx._matchedButNoCaptcha) {
-      // No sleep — tight-loop probe until window opens or state changes.
+      sleepMs = 0; // tight loop — window is opening/open
+    } else if (hot) {
+      sleepMs = 30; // inside 5-min active window (or 30s pre-warm)
+    } else if (untilNext < 10_000) {
+      sleepMs = 100; // 10 s before window opens
+    } else if (untilNext < 60_000) {
+      sleepMs = 500; // 1 min before window opens
+    } else {
+      sleepMs = 2000; // idle between windows — WAF-safe
+    }
+
+    if (sleepMs === 0) {
       await new Promise((r) => setImmediate(r));
     } else {
-      await new Promise((r) => setTimeout(r, POLL_MS + Math.floor(Math.random() * 20)));
+      await new Promise((r) => setTimeout(r, sleepMs + Math.floor(Math.random() * 20)));
     }
   }
 }
