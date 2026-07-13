@@ -48,11 +48,19 @@ const CAPTCHA_ORIGIN = new URL(CAPTCHA_URL).origin;
 const CAPTCHA_PATH   = new URL(CAPTCHA_URL).pathname || '/';
 const VENDOR_ID      = process.env.VENDOR_ID || '2207936';
 const PLANT_CODE     = process.env.PLANT_CODE || '6924';
-const POLL_MS        = parseInt(process.env.POLL_MS || '30', 10);
+const POLL_MS        = parseInt(process.env.POLL_MS || '20', 10);
 const BATCH_SIZE     = parseInt(process.env.BATCH_SIZE || '3', 10);
 const PARALLEL_BATCHES = parseInt(process.env.PARALLEL_BATCHES || '4', 10);
 
 const TIME_ENDED_COOLDOWN_MS = parseInt(process.env.TIME_ENDED_COOLDOWN_MS || '30000', 10);
+
+// L1 auto-undercut settings — after each save, re-refetch the Order List and
+// if we're not rank 1 (someone else tied our amount and came first), auto
+// re-bid at (L1BidAmount - L1_UNDERCUT_STEP) to secure rank 1.
+const L1_UNDERCUT              = String(process.env.L1_UNDERCUT || 'true').toLowerCase() === 'true';
+const L1_UNDERCUT_STEP         = parseFloat(process.env.L1_UNDERCUT_STEP || '1');
+const L1_UNDERCUT_MAX_ATTEMPTS = parseInt(process.env.L1_UNDERCUT_MAX_ATTEMPTS || '2', 10);
+const L1_UNDERCUT_MIN_REMAINING_MS = parseInt(process.env.L1_UNDERCUT_MIN_REMAINING_MS || '15000', 10);
 
 const AUTO_ADJUST         = String(process.env.AUTO_ADJUST || 'false').toLowerCase() === 'true';
 const MAX_ADJUST_RETRIES  = parseInt(process.env.MAX_ADJUST_RETRIES || '3', 10);
@@ -1142,46 +1150,85 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
         : (result.text || 'OK');
       bidLogRow(b, 'ACCEPTED', rankMsg);
     }
-    // POST-SAVE VERIFICATION (fire-and-forget, non-blocking).
-    // Refetch the order list 1.5s later and check whether the BiddingAmount
-    // for each submitted order is actually non-zero on the server. This
-    // conclusively detects "SAP said 'Saved' but the bid didn't persist".
-    // We do this at most ONCE per process to keep it lightweight.
-    if (!globalThis.__postSaveVerified) {
-      globalThis.__postSaveVerified = true;
-      const submittedIds = new Set(item.bids.map((b) => String(b.order.SapOrderId)));
-      const expectedAmounts = Object.fromEntries(item.bids.map((b) => [String(b.order.SapOrderId), b.amount]));
-      setTimeout(async () => {
-        try {
-          const check = await fetchLiveOrders(auth);
-          const found = [];
-          const missing = [];
-          for (const o of check.orders || []) {
-            const oid = String(o.SapOrderId || '');
-            if (!submittedIds.has(oid)) continue;
-            const persistedAmt = parseFloat(o.BiddingAmount || 0);
-            if (persistedAmt > 0) found.push(`${oid}=${persistedAmt}`);
-            else missing.push(`${oid} (expected ${expectedAmounts[oid]})`);
+    // POST-SAVE MONITOR (fire-and-forget, non-blocking) — runs AFTER EVERY
+    // successful save (not just first) because L1_UNDERCUT needs live rank
+    // data per submit. Two responsibilities:
+    //   1. VERIFY that the bid actually persisted (once per process).
+    //   2. L1-UNDERCUT: if we're not rank 1 and the L1BidAmount equals our
+    //      submitted amount (someone else tied and came first), auto-
+    //      resubmit at (L1 - L1_UNDERCUT_STEP) to secure rank 1. Guarded by
+    //      per-order attempt counter so we don't race forever.
+    const submittedIds = new Set(item.bids.map((b) => String(b.order.SapOrderId)));
+    const expectedAmounts = Object.fromEntries(item.bids.map((b) => [String(b.order.SapOrderId), b.amount]));
+    const bidsById       = Object.fromEntries(item.bids.map((b) => [String(b.order.SapOrderId), b]));
+    setTimeout(async () => {
+      try {
+        const check = await fetchLiveOrders(auth);
+        const found = [];
+        const missing = [];
+        const undercutTargets = [];
+        for (const o of check.orders || []) {
+          const oid = String(o.SapOrderId || '');
+          if (!submittedIds.has(oid)) continue;
+          const persistedAmt = parseFloat(o.BiddingAmount || 0);
+          const rank         = parseInt(o.BiddingRank || 0, 10);
+          const l1Amt        = parseFloat(o.L1BidAmount || 0);
+          if (persistedAmt > 0) found.push(`${oid}=${persistedAmt}(rank=${rank || '?'}, L1=${l1Amt || '?'})`);
+          else missing.push(`${oid} (expected ${expectedAmounts[oid]})`);
+          // Candidate for undercut: rank > 1 AND we have valid L1 amount
+          if (L1_UNDERCUT && rank > 1 && l1Amt > 0 && bidsById[oid]) {
+            const attempts = ctx.undercutAttempts.get(oid) || 0;
+            if (attempts < L1_UNDERCUT_MAX_ATTEMPTS) {
+              const newAmt = l1Amt - L1_UNDERCUT_STEP;
+              if (newAmt > 0 && newAmt < parseFloat(bidsById[oid].amount || 0)) {
+                undercutTargets.push({ ...bidsById[oid], amount: newAmt, _origRank: rank, _origL1: l1Amt, _attempt: attempts + 1 });
+                ctx.undercutAttempts.set(oid, attempts + 1);
+              }
+            }
           }
+        }
+        // Verification log (first time only)
+        if (!globalThis.__postSaveVerified) {
+          globalThis.__postSaveVerified = true;
           if (missing.length && !found.length) {
             log.error(
-              `🚨 POST-SAVE VERIFICATION FAILED: SAP replied 'Saved Successfully' but NONE of the ${submittedIds.size} bids appear persisted on refetch. ` +
+              `🚨 POST-SAVE VERIFICATION FAILED: SAP replied 'Saved Successfully' but NONE of the ${submittedIds.size} bids appear persisted. ` +
               `Missing: ${missing.join(', ')}. ` +
-              `→ Share logs/submit-responses.jsonl with support. Root cause is a payload or Flag mismatch, not a code bug in our submit flow.`
+              `→ Share logs/submit-responses.jsonl with support.`
             );
           } else if (missing.length && found.length) {
-            log.warn(
-              `⚠  POST-SAVE PARTIAL: ${found.length}/${submittedIds.size} bids persisted. ` +
-              `Persisted: ${found.join(', ')} | Missing: ${missing.join(', ')}.`
-            );
+            log.warn(`⚠  POST-SAVE PARTIAL: ${found.length}/${submittedIds.size} bids persisted. Persisted: ${found.join(', ')} | Missing: ${missing.join(', ')}.`);
           } else if (found.length) {
-            log.info(`✅ POST-SAVE OK: verified ${found.length} bid(s) persisted server-side (${found.join(', ')}).`);
+            log.info(`✅ POST-SAVE OK: verified ${found.length} bid(s) persisted (${found.join(', ')}).`);
           }
-        } catch (e) {
-          log.warn(`Post-save verification refetch failed: ${e.message}`);
         }
-      }, 1500).unref();
-    }
+        // L1-Undercut re-bid (fire additional submits for non-rank-1 orders)
+        if (undercutTargets.length && msUntilNextWindow() > L1_UNDERCUT_MIN_REMAINING_MS + (25 * 60_000)) {
+          // We're INSIDE a bid window: msUntilNextWindow() is time to NEXT window
+          // start. If it's > (25 min + safety), we still have >= 5 min in current
+          // window (windows are 30-min apart). Skip block below — undercut safe.
+        }
+        // Simpler condition: refetch order's Expires field OR trust that we're
+        // still in the active window (isHotWindow). If hot, we have time.
+        if (undercutTargets.length && isHotWindow()) {
+          log.warn(`🎯 L1-UNDERCUT: ${undercutTargets.length} order(s) not rank 1 — re-bidding at (L1 - ${L1_UNDERCUT_STEP})`);
+          // Chunk undercut targets into batches of BATCH_SIZE and re-submit.
+          for (let i = 0; i < undercutTargets.length; i += BATCH_SIZE) {
+            const chunk = undercutTargets.slice(i, i + BATCH_SIZE);
+            const undercutItem = { kind: 'single', bids: chunk };
+            // Fetch a fresh captcha (JIT) and submit inside the same session mutex.
+            session.mutex.run(async () => {
+              const solved = await fetchFreshCaptcha(session, session.id);
+              if (!solved) { log.warn(`L1-undercut: captcha unavailable, skipping`); return; }
+              log.info(`[${session.id}] → UNDERCUT (${chunk.length}): ${chunk.map((b) => `${b.order.SapOrderId}@${b.amount}(was rank ${b._origRank}, L1=${b._origL1})`).join(', ')}`);
+              await globalSubmitMutex.run(() => handleBatch(ctx, session, undercutItem, solved, session.id));
+            }).catch((e) => log.warn(`L1-undercut submit failed: ${e.message}`));
+          }
+        }
+      } catch (e) {
+        log.warn(`Post-save monitor failed: ${e.message}`);
+      }
+    }, 1500).unref();
     return { ok: true };
   }
 
@@ -1493,7 +1540,19 @@ async function main() {
     inFlight:  new Set(),
     cooldown:  new Map(),
     adjustAttempts: new Map(),
+    undercutAttempts: new Map(), // sapOrderId → attempt count (max L1_UNDERCUT_MAX_ATTEMPTS per window)
+    windowStartAt: Date.now(),   // reset at each new bid window (below)
   };
+
+  // Reset undercut attempts at the start of each new bid window so we can
+  // undercut fresh in the next window even if we've maxed out in this one.
+  setInterval(() => {
+    const untilNext = msUntilNextWindow();
+    if (untilNext > 25 * 60_000 && ctx.undercutAttempts.size > 0) {
+      log.info(`🔄 New bid-window boundary — clearing ${ctx.undercutAttempts.size} undercut counters`);
+      ctx.undercutAttempts.clear();
+    }
+  }, 60_000).unref();
 
   process.on('SIGINT',  () => { log.info('SIGINT — bye'); process.exit(0); });
   process.on('SIGTERM', () => { log.info('SIGTERM — bye'); process.exit(0); });
@@ -1529,7 +1588,7 @@ async function main() {
     if (ctx._matchedButNoCaptcha) {
       sleepMs = 0; // tight loop — window is opening/open
     } else if (hot) {
-      sleepMs = 30; // inside 5-min active window (or 30s pre-warm)
+      sleepMs = POLL_MS; // inside 5-min active window (or 30s pre-warm) — user-tunable
     } else if (untilNext < 10_000) {
       sleepMs = 100; // 10 s before window opens
     } else if (untilNext < 60_000) {

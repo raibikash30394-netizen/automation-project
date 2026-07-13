@@ -543,6 +543,71 @@ function testCaptchaCacheInvalidation() {
   console.log('✓ Captcha cache invalidation: removes wrong entries, keeps right ones');
 }
 
+// ---- Test L1-undercut candidate detection ----------------------------------
+//
+// Scenario from user's live screenshot: some bids saved at L1 amount but got
+// rank > 1 (tie-loser). L1-undercut should identify those and compute a new
+// bid = L1BidAmount - L1_UNDERCUT_STEP, capped by per-order attempt counter.
+function testL1UndercutDetection() {
+  const L1_UNDERCUT_STEP = 1;
+  const L1_UNDERCUT_MAX_ATTEMPTS = 2;
+
+  function planUndercuts(submittedItems, refetchedOrders, attemptsMap) {
+    const bidsById = Object.fromEntries(submittedItems.map((b) => [String(b.order.SapOrderId), b]));
+    const submittedIds = new Set(Object.keys(bidsById));
+    const targets = [];
+    for (const o of refetchedOrders) {
+      const oid = String(o.SapOrderId || '');
+      if (!submittedIds.has(oid)) continue;
+      const rank  = parseInt(o.BiddingRank || 0, 10);
+      const l1Amt = parseFloat(o.L1BidAmount || 0);
+      if (rank > 1 && l1Amt > 0) {
+        const attempts = attemptsMap.get(oid) || 0;
+        if (attempts < L1_UNDERCUT_MAX_ATTEMPTS) {
+          const newAmt = l1Amt - L1_UNDERCUT_STEP;
+          if (newAmt > 0 && newAmt < parseFloat(bidsById[oid].amount || 0)) {
+            targets.push({ oid, newAmt, origRank: rank, origL1: l1Amt });
+            attemptsMap.set(oid, attempts + 1);
+          }
+        }
+      }
+    }
+    return targets;
+  }
+
+  const submittedItems = [
+    { order: { SapOrderId: '1153420264' }, amount: 472 }, // KHARGRAM  → rank 01 (skip)
+    { order: { SapOrderId: '1153420262' }, amount: 878 }, // RASAKHOA  → rank 03 (undercut)
+    { order: { SapOrderId: '1153406814' }, amount: 535 }, // GOLAPGANJ → rank 04 (undercut)
+    { order: { SapOrderId: '1153403459' }, amount: 869 }, // BALURGHAT → rank 04 (undercut)
+    { order: { SapOrderId: '1153390830' }, amount: 589 }, // PANCHANANDAPUR → rank 02 (undercut)
+  ];
+  const refetched = [
+    { SapOrderId: '1153420264', BiddingRank: '01', L1BidAmount: '472.000' },
+    { SapOrderId: '1153420262', BiddingRank: '03', L1BidAmount: '878.000' },
+    { SapOrderId: '1153406814', BiddingRank: '04', L1BidAmount: '535.000' },
+    { SapOrderId: '1153403459', BiddingRank: '04', L1BidAmount: '869.000' },
+    { SapOrderId: '1153390830', BiddingRank: '02', L1BidAmount: '589.000' },
+  ];
+  const attempts = new Map();
+  const t1 = planUndercuts(submittedItems, refetched, attempts);
+  assert.strictEqual(t1.length, 4, 'should undercut 4 orders (skip the rank-1 one)');
+  assert.deepStrictEqual(t1.map((x) => x.oid).sort(), ['1153390830', '1153403459', '1153406814', '1153420262']);
+  assert.strictEqual(t1.find((x) => x.oid === '1153420262').newAmt, 877); // 878 - 1
+  assert.strictEqual(t1.find((x) => x.oid === '1153390830').newAmt, 588); // 589 - 1
+
+  // 2nd pass: same rejected → 4 undercuts again (attempts now 2 each — at limit)
+  const t2 = planUndercuts(submittedItems, refetched, attempts);
+  assert.strictEqual(t2.length, 4);
+  attempts.forEach((v) => assert.strictEqual(v, 2, 'each order attempted twice'));
+
+  // 3rd pass: should be blocked by max-attempts (2)
+  const t3 = planUndercuts(submittedItems, refetched, attempts);
+  assert.strictEqual(t3.length, 0, 'max-attempts reached, no more undercuts');
+
+  console.log('✓ L1-undercut detection: correctly identifies tie-loser orders + respects max-attempts');
+}
+
 // ---- Run --------------------------------------------------------------------
 
 (async () => {
@@ -557,6 +622,7 @@ function testCaptchaCacheInvalidation() {
     await testDeadCookieDetection();
     testPostSaveVerification();
     testCaptchaCacheInvalidation();
+    testL1UndercutDetection();
     console.log('\n🎉 ALL TESTS PASS');
     process.exit(0);
   } catch (e) {
