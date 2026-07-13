@@ -1503,7 +1503,7 @@ async function tick(ctx) {
     if (stats.matched === 0) {
       // Hot-window but nothing matched yet — could mean SAP populated a few
       // orders but the ones matching our CSV rules aren't visible yet, or
-      // they're all in cooldown/inFlight. Keep tight-loop + visibility log.
+      // they're all in cooldown/inFlight/already-submitted-this-window.
       // ALSO: trigger a silent CSRF refresh every 15s ("session shake") in
       // case SAP is filtering orders on stale session state.
       if (isHotWindow()) {
@@ -1514,7 +1514,8 @@ async function tick(ctx) {
         if (!globalThis.__lastWaitLog || now - globalThis.__lastWaitLog > 10_000) {
           globalThis.__lastWaitLog = now;
           const secsPast = 30 * 60 - Math.round(msUntilNextWindow() / 1000);
-          log.info(`⏳ waiting for matched orders to appear (${stats.total} live, 0 matched)… ~${secsPast}s past :15/:45 boundary (bot polling tight, session-shake active — do NOT restart)`);
+          const alreadySubmitted = ctx.submitted.size;
+          log.info(`⏳ waiting for matched orders to appear (${stats.total} live: bl=${stats.blacklisted} no-rule=${stats.noRule} club-drop=${stats.clubDropped} cool=${stats.coolskip} sub-this-window=${alreadySubmitted} → 0 matched)… ~${secsPast}s past :15/:45 boundary (bot polling tight, session-shake active — do NOT restart)`);
         }
         return;
       }
@@ -1674,15 +1675,8 @@ async function main() {
     windowStartAt: Date.now(),   // reset at each new bid window (below)
   };
 
-  // Reset undercut attempts at the start of each new bid window so we can
-  // undercut fresh in the next window even if we've maxed out in this one.
-  setInterval(() => {
-    const untilNext = msUntilNextWindow();
-    if (untilNext > 25 * 60_000 && ctx.undercutAttempts.size > 0) {
-      log.info(`🔄 New bid-window boundary — clearing ${ctx.undercutAttempts.size} undercut counters`);
-      ctx.undercutAttempts.clear();
-    }
-  }, 60_000).unref();
+  // Per-window state (submitted, cooldown, undercut counters) is cleared
+  // inline at the boundary-log moment in the main loop below.
 
   process.on('SIGINT',  () => { log.info('SIGINT — bye'); process.exit(0); });
   process.on('SIGTERM', () => { log.info('SIGTERM — bye'); process.exit(0); });
@@ -1724,7 +1718,20 @@ async function main() {
       globalThis.__lastWaitLog = 0;    // reset waiting log timer
       globalThis.__lastSessionShake = 0; // allow immediate session-shake on new window
       globalThis.__postSaveVerified = false; // allow post-save verify per window
-      log.info(`🕒 :15/:45 window BOUNDARY reached (per clock) — bot polling for SAP captcha unlock. SAP may take 1-60s to actually generate the captcha for this window.`);
+      // *** v3.16 CRITICAL FIX ***
+      // Clear per-window state so orders that were successfully submitted in
+      // PREVIOUS windows become eligible again if SAP re-lists them for a
+      // fresh bidding round. Before this fix, ctx.submitted grew forever →
+      // repeat orders showed matched=0 in every subsequent window, and only
+      // a bot restart (which built a fresh in-memory Set) rescued them.
+      const clearedSub = ctx.submitted.size;
+      const clearedCd  = ctx.cooldown.size;
+      const clearedUc  = ctx.undercutAttempts.size;
+      ctx.submitted.clear();
+      ctx.cooldown.clear();
+      ctx.undercutAttempts.clear();
+      ctx._cachedOrders = null; // force fresh order fetch for new window
+      log.info(`🕒 :15/:45 window BOUNDARY reached — cleared per-window state (submitted=${clearedSub}, cooldown=${clearedCd}, undercut=${clearedUc}). Bot polling for SAP captcha unlock. SAP may take 1-60s to actually generate the captcha for this window.`);
     }
 
     await tick(ctx);

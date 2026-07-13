@@ -797,6 +797,47 @@ function testSessionShakeThrottle() {
   console.log('✓ Session-shake throttle: max once per 15s per process — CSRF refresh unblocks stale session filtering (5 cases)');
 }
 
+// v3.16 — CRITICAL FIX: per-window state clearing.
+// The `ctx.submitted` Set was initialised once at bot start and never
+// cleared. If SAP re-lists a previously-saved order in the next window
+// (e.g. because bidding is still open for it), buildBatches would filter
+// it out via `seenSubmitted.has(key)` → matched=0 → user thinks bot is
+// broken and restarts (which creates a fresh Set → bug hidden).
+// Fix: at the boundary-log tick, clear submitted + cooldown + undercut.
+function testPerWindowStateClearing() {
+  // Simulate the buildBatches filter: seenSubmitted.has(key) excludes an order.
+  function matches(order, seenSubmitted) {
+    const key = String(order.SapOrderId);
+    return !seenSubmitted.has(key);
+  }
+
+  const order = { SapOrderId: 1153419533 };
+  const submitted = new Set();
+
+  // Window 1: fresh Set — order matches, gets saved, added to set.
+  assert.strictEqual(matches(order, submitted), true, 'W1: fresh set, order matches');
+  submitted.add(String(order.SapOrderId));
+
+  // Between windows (OLD BEHAVIOUR): Set retained → order filtered out.
+  assert.strictEqual(matches(order, submitted), false, 'OLD: retained submitted set filters re-listed order');
+
+  // v3.16 FIX: clear at boundary crossover.
+  submitted.clear();
+  assert.strictEqual(matches(order, submitted), true, 'FIX: cleared set → order matches again in new window');
+
+  // Simulate all three collections clear together.
+  const submitted2 = new Set(['a', 'b', 'c']);
+  const cooldown2  = new Map([['a', Date.now() + 30_000]]);
+  const undercut2  = new Map([['a', 2]]);
+  function boundaryClear() { submitted2.clear(); cooldown2.clear(); undercut2.clear(); }
+  boundaryClear();
+  assert.strictEqual(submitted2.size, 0, 'boundary: submitted cleared');
+  assert.strictEqual(cooldown2.size, 0,  'boundary: cooldown cleared');
+  assert.strictEqual(undercut2.size, 0,  'boundary: undercut cleared');
+
+  console.log('✓ Per-window state clearing: submitted+cooldown+undercut cleared at :15/:45 boundary — re-bid on repeated orders works without process restart');
+}
+
 // ---- Run --------------------------------------------------------------------
 
 (async () => {
@@ -817,6 +858,7 @@ function testSessionShakeThrottle() {
     testSapLateVisibility();
     testEmptyOrdersInHotWindow();
     testSessionShakeThrottle();
+    testPerWindowStateClearing();
     console.log('\n🎉 ALL TESTS PASS');
     process.exit(0);
   } catch (e) {

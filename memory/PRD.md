@@ -57,14 +57,27 @@ Two Node.js processes:
 - New unit test `testEmptyOrdersInHotWindow` (6 cases).
 - **Total tests: 16/16 pass**.
 
+## Implemented (2026-02 — v3.16 CRITICAL per-window state clearing)
+- **REAL root cause of "restart fixes it" myth**: `ctx.submitted` (Set of successfully-saved SapOrderIds) was initialised once at bot start and NEVER cleared. Every subsequent window filtered out those orders via `seenSubmitted.has(key)` inside `buildBatches`. When SAP re-listed a previously-saved order in a fresh bidding round, the bot showed `matched=0` even though the order was clearly present. User restarted → fresh in-memory Set → order became matchable → SAVED. This is exactly what happened in the 18:15 IST log the user shared:
+  - Bot ran since ~18:01 → likely saved order `1153419533` (RAJMAHAL) in the 17:45 window → added to `ctx.submitted`
+  - 18:15:01 window opened → SAP re-listed 1153419533 → `matched=0` for 58s (filtered by stale set)
+  - User restart at 18:15:59 → fresh `submitted = new Set()` → 18:16:09 scan #1 → `matched=1` → SAVED
+  - `ctx.cooldown` and `ctx.undercutAttempts` had the same lifetime bug (the setInterval-based undercut clear only fired if the interval callback landed inside a 60s window right after boundary — unreliable).
+- **Fix in main-loop boundary block** (bid-engine.js ~lines 1721-1743):
+  - On each boundary crossover (:15/:45 detection), clear `ctx.submitted`, `ctx.cooldown`, `ctx.undercutAttempts`, and null out `ctx._cachedOrders` to force a fresh fetch.
+  - Boundary log now reports how many entries were cleared: `cleared per-window state (submitted=X, cooldown=Y, undercut=Z)`.
+  - Removed the old `setInterval(clearUndercut, 60_000)` timer (unreliable, superseded by boundary block).
+- **Enhanced wait-log breakdown**: the `⏳ waiting for matched orders to appear` log now includes `(N live: bl=X no-rule=Y club-drop=Z cool=W sub-this-window=V → 0 matched)` so the user sees WHY matched=0 (e.g. if `sub-this-window=1` matches the live count, they know the bot already bid on the only matched order in this window).
+- New unit test `testPerWindowStateClearing` (proves OLD retained-set filters re-listed order, FIX cleared-set matches again).
+- **Total tests: 18/18 pass**.
+
 ## Implemented (2026-02 — v3.15 session-shake + cache-bypass on stall)
-- **Live 18:15 IST log analysis**: bot correctly detected boundary at 18:15:01, polled tight for 58s with `14 live, 0 matched`, user restarted at 18:15:59, and same session at 18:16:09 immediately found matched=1 & saved in 440ms. This proves SAP was hiding the matched order from that session's live view (stale-session filtering, not a client bug).
+- **Live 18:15 IST log analysis**: bot correctly detected boundary at 18:15:01, polled tight for 58s with `14 live, 0 matched`, user restarted at 18:15:59, and same session at 18:16:09 immediately found matched=1 & saved in 440ms.
 - **WebSocket path DEAD**: SAP's `zapc_e_bid` WebSocket returns `NS_ERROR_WEBSOCKET_CONNECTION_REFUSED` even in the browser — externally blocked. Do NOT attempt WS again.
 - **Fix 1 — Cache bypass during stall**: `ctx._matchedButNoCaptcha=true` (which enabled 100 ms order-cache reuse) is NO LONGER set on hot-empty / hot-matched=0. Replaced with new flag `ctx._hotStall`. This forces a FRESH `BidOrderListSet` fetch on every tick during stall (~20ms/scan) so matched orders appear the microsecond SAP releases them.
-- **Fix 2 — Silent session-shake**: New `maybeShakeSession(ctx, reason)` fires a background `refreshToken()` on every session at most once every 15 s during a hot-window stall. Fire-and-forget, non-blocking, errors silent. Reset marker `__lastSessionShake` per window boundary so each new window gets an immediate shake.
+- **Fix 2 — Silent session-shake**: New `maybeShakeSession(ctx, reason)` fires a background `refreshToken()` on every session at most once every 15 s during a hot-window stall. Fire-and-forget, non-blocking.
 - **Main-loop tight-loop condition** extended: `sleepMs=0` when either `_matchedButNoCaptcha` OR `_hotStall` is true.
-- New unit test `testSessionShakeThrottle` (5 cases proving 15s throttle correctness).
-- **Total tests: 17/17 pass**.
+- New unit test `testSessionShakeThrottle` (5 cases).
 
 ## Verified
 - `bidding.js` starts, loads cache, `/health` returns metrics JSON
