@@ -1202,24 +1202,27 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
             log.info(`✅ POST-SAVE OK: verified ${found.length} bid(s) persisted (${found.join(', ')}).`);
           }
         }
-        // L1-Undercut re-bid (fire additional submits for non-rank-1 orders)
-        if (undercutTargets.length && msUntilNextWindow() > L1_UNDERCUT_MIN_REMAINING_MS + (25 * 60_000)) {
-          // We're INSIDE a bid window: msUntilNextWindow() is time to NEXT window
-          // start. If it's > (25 min + safety), we still have >= 5 min in current
-          // window (windows are 30-min apart). Skip block below — undercut safe.
-        }
-        // Simpler condition: refetch order's Expires field OR trust that we're
-        // still in the active window (isHotWindow). If hot, we have time.
+        // L1-Undercut re-bid — only during active window. isHotWindow() covers
+        // both the 30 s pre-warm AND the 5-min active window (:15–:19 / :45–:49),
+        // which is exactly when this feature should fire.
         if (undercutTargets.length && isHotWindow()) {
           log.warn(`🎯 L1-UNDERCUT: ${undercutTargets.length} order(s) not rank 1 — re-bidding at (L1 - ${L1_UNDERCUT_STEP})`);
-          // Chunk undercut targets into batches of BATCH_SIZE and re-submit.
           for (let i = 0; i < undercutTargets.length; i += BATCH_SIZE) {
             const chunk = undercutTargets.slice(i, i + BATCH_SIZE);
             const undercutItem = { kind: 'single', bids: chunk };
-            // Fetch a fresh captcha (JIT) and submit inside the same session mutex.
             session.mutex.run(async () => {
               const solved = await fetchFreshCaptcha(session, session.id);
-              if (!solved) { log.warn(`L1-undercut: captcha unavailable, skipping`); return; }
+              if (!solved) {
+                // Captcha fetch failed — the attempt didn't actually reach SAP,
+                // so give the user back this attempt.
+                for (const b of chunk) {
+                  const oid = String(b.order.SapOrderId);
+                  const cur = ctx.undercutAttempts.get(oid) || 0;
+                  if (cur > 0) ctx.undercutAttempts.set(oid, cur - 1);
+                }
+                log.warn(`L1-undercut: captcha unavailable, skipping (attempt refunded)`);
+                return;
+              }
               log.info(`[${session.id}] → UNDERCUT (${chunk.length}): ${chunk.map((b) => `${b.order.SapOrderId}@${b.amount}(was rank ${b._origRank}, L1=${b._origL1})`).join(', ')}`);
               await globalSubmitMutex.run(() => handleBatch(ctx, session, undercutItem, solved, session.id));
             }).catch((e) => log.warn(`L1-undercut submit failed: ${e.message}`));

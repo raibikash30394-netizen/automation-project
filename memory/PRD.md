@@ -39,20 +39,15 @@ Two Node.js processes:
 - **Wrong-captcha exhaustion → fallback**: After 3× wrong-captcha on one session, `handleBatch` returns `{ silentFail: true }` so runAll retries with next session (its captcha comes from independent SAP session state, so OCR often succeeds).
 - **Unit tests** in `tests/test-window-scheduler.js` — 7 groups, all pass (msUntilNextWindow 7 cases, isHotWindow 22 cases, mutex serialisation 4-way, sequential fallback success + all-fail paths, batching 5 cases, rank hint extraction 3 cases).
 
-## Implemented (2026-02 — v3.9 vendor switch + captcha cache invalidation)
-- **VENDOR_ID: 2210181 → 2207936** in `.env` and default constant. User was logged in with 2207936 in browser; bot was silently bidding on the old vendor's behalf.
-- **NEW `/invalidate` endpoint** in `bidding.js` — accepts `{ base64Image, solved? }`, drops the cache entry from both `hashMap` Map AND `entries[]` array (so it doesn't resurrect on next disk load). Response: `{ ok, invalidated, cacheSize }`.
-- **Wrong-captcha auto-invalidation in bid-engine**:
-  - `nextCaptcha()` now returns `{ solved, reason, img }` — the image is propagated.
-  - `fetchFreshCaptcha()` stores `auth._lastCaptchaImg` on each successful solve.
-  - When SAP responds "Wrong Captcha", `invalidateCaptchaCache()` is fired (fire-and-forget) BEFORE the retry captcha fetch → prevents the same wrong cached OCR from coming back as a HIT.
-- **Root-cause context** (from user's 14:45 IST log):
-  - solver metrics: `hits=4 misses=0` (all cache hits) but only the 4th solve was correct
-  - 3 wrong OCRs (`=bg=`, `herrd`, `CUU5`) were previously cached and kept coming back as HITs when SAP reused the same captcha images
-  - after v3.9, those wrong entries get evicted the moment SAP rejects them, so the next same-image sighting triggers a fresh TrueCaptcha OCR (~90% chance of a different, correct result)
-- **Speed impact estimate**: 1767ms slow-path → ~800-1200ms typical (saves ~600-1000ms per session that used to burn multiple wrong retries).
-- New unit test `testCaptchaCacheInvalidation` (matches the exact 4 hashes from the user's live log).
-- **Total tests: 11/11 pass**. **testing_agent iteration_7: 100% pass, no issues**.
+## Implemented (2026-02 — v3.10 L1-undercut auto rank-1 optimizer)
+- **POLL_MS default 30 → 20** (in `.env` and constant), hot-window sleep also uses POLL_MS (was hardcoded 30).
+- **L1-Undercut Auto Re-bid**: after every successful save, 1.5s later refetch order list. If any submitted order came back rank > 1 AND `L1BidAmount > 0`, auto-resubmit at `(L1 - L1_UNDERCUT_STEP)` to secure rank 1.
+- **Guard rails**: per-order max-attempts counter (default 2) prevents infinite race. Only fires during `isHotWindow()` (active window). Fresh captcha per undercut batch (JIT). Uses same session.mutex + globalSubmitMutex serialisation as normal submits (no anti-fraud risk).
+- **Refunds attempt** if captcha fetch fails (didn't actually reach SAP → not a real attempt).
+- **Window boundary reset**: 60s-interval clears `ctx.undercutAttempts` when we cross into a new bid window (next windows get fresh 2 attempts each).
+- **Env knobs**: `L1_UNDERCUT=true`, `L1_UNDERCUT_STEP=1`, `L1_UNDERCUT_MAX_ATTEMPTS=2`, `L1_UNDERCUT_MIN_REMAINING_MS=15000` (all overridable).
+- New unit test `testL1UndercutDetection` using EXACT hashes/ranks from user's 15:15 IST screenshot (KHARGRAM rank-1 excluded, 4 tie-loser orders targeted, max-attempts=2 stops 3rd wave).
+- **Total tests: 12/12 pass**. **testing_agent iteration_8: 100% pass**, cleaned up 2 minor review comments.
 
 ## Verified
 - `bidding.js` starts, loads cache, `/health` returns metrics JSON
