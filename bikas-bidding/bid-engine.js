@@ -296,23 +296,38 @@ class AuthConfig {
  * Returns an array of { id, cookieFile, tokenFile } (never empty; falls back
  * to single cookie.txt if it's the only one).
  */
+/**
+ * SINGLE-SESSION mode (v3.6 — reverted from multi-session).
+ *
+ * Old-file behaviour that was proven to save bids in the browser: use ONE
+ * cookie (cookie.txt) with ONE SAP session. Multi-cookie parallel submits
+ * were causing SAP anti-fraud vendor-lockouts (silent empty HTTP 201). Even
+ * with a global submit mutex, having 4 sessions doing fetch-captcha in
+ * background was polluting SAP's session-captcha state and lowering the
+ * observed save rate.
+ *
+ * Any cookie2.txt/cookie3.txt/cookie4.txt files in the folder are IGNORED
+ * (kept on disk for future manual failover if the user ever wants to
+ * hot-swap primary session — just move cookie2.txt → cookie.txt and restart).
+ */
 function discoverSessions() {
   const sessions = [];
-  // First session: cookie.txt / token.txt (existing files stay untouched)
-  if (fs.existsSync(COOKIE_FILE)) {
+  if (fs.existsSync(COOKIE_FILE) && fs.readFileSync(COOKIE_FILE, 'utf8').trim()) {
     sessions.push({ id: 's1', cookieFile: COOKIE_FILE, tokenFile: TOKEN_FILE });
-  }
-  // Additional sessions: cookie2.txt … cookie10.txt
-  for (let n = 2; n <= 10; n++) {
-    const cf = path.join(ROOT, `cookie${n}.txt`);
-    if (fs.existsSync(cf) && fs.readFileSync(cf, 'utf8').trim()) {
-      const tf = path.join(ROOT, `token${n}.txt`);
-      sessions.push({ id: `s${n}`, cookieFile: cf, tokenFile: tf });
-    }
   }
   if (!sessions.length) {
     log.error(`No cookie file found. Paste your logged-in browser Cookie header into ${COOKIE_FILE}`);
     process.exit(1);
+  }
+  // Warn (once) if the user still has old multi-cookie files sitting around,
+  // so it's clear they are being ignored now.
+  const extraCookies = [];
+  for (let n = 2; n <= 10; n++) {
+    const cf = path.join(ROOT, `cookie${n}.txt`);
+    if (fs.existsSync(cf) && fs.readFileSync(cf, 'utf8').trim()) extraCookies.push(path.basename(cf));
+  }
+  if (extraCookies.length) {
+    log.warn(`ⓘ Ignoring ${extraCookies.length} extra cookie file(s): ${extraCookies.join(', ')} — single-session mode is more reliable. Move one to cookie.txt to switch primary.`);
   }
   return sessions;
 }
@@ -1091,13 +1106,9 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
       if (!fresh) return { retry: false };
       return handleBatch(ctx, session, item, fresh, workerId, retryDepth + 1);
     }
-    log.error(`[${workerId}] ✗ Wrong captcha 3× on this session — falling back to next session`);
+    log.error(`[${workerId}] ✗ Wrong captcha 3× — will retry next scan`);
     for (const b of item.bids) bidLogRow(b, 'WRONG_CAPTCHA_3X', result.text || '');
-    // Return { silentFail: true } so runAll's fallback loop tries the NEXT session
-    // (its captcha comes from an independent SAP session state, so the OCR
-    // usually succeeds where s1's did not). If ALL sessions burn 3× captchas
-    // in a row, runAll will cooldown the item just like other silent-fails.
-    return { silentFail: true };
+    return { retry: true };
   }
 
   if (isTimeEnded) {
@@ -1162,26 +1173,29 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
     return handleBatch(ctx, session, item, fresh, workerId, retryDepth + 1);
   }
 
-  // ---- HTTP 200/201 with empty response body = SILENT FAIL --------------------
-  // SAP returns an empty 200/201 in two cases we care about:
-  //   (a) bid window closed between our captcha fetch and our submit (real time-ended)
-  //   (b) SAP anti-fraud vendor-lockout when the same vendor submits from
-  //       multiple sessions concurrently — bid is NOT saved server-side.
-  // We now surface this as `silentFail: true` so the caller (runAll) can
-  // FALL BACK to the next session (fresh captcha) instead of accepting the
-  // false-negative. If ALL sessions silent-fail on this item, runAll sets
-  // the cooldown itself.
+  // ---- HTTP 201 with empty response body = SILENT SAVE SUCCESS ---------------
+  // Restored behaviour from the pre-multi-session working build: SAP returns
+  // HTTP 200/201 + empty NavEBiddingMessage + empty Ev_Text as its silent
+  // confirmation that the bid was saved (the browser shows the row after
+  // this). User confirmed this file version was reliably persisting bids.
+  //
+  // The earlier "silent-fail / anti-fraud" theory was actually caused by
+  // multi-cookie parallel submits, NOT by SAP itself. In single-session mode
+  // an empty 201 IS a real save. Treat it as ACCEPTED so we don't skip the
+  // "add to submitted" bookkeeping (which caused endless re-submits).
   if ((result.statusCode === 200 || result.statusCode === 201) &&
       !result.info && !result.text && !isTimeEnded && !isWrongCaptcha && reduceBy === null && minFloor === null) {
-    log.warn(`[${workerId}] ⚠  HTTP ${result.statusCode} EMPTY (silent fail, likely anti-fraud) in ${result.submitMs}ms — trying next session`);
+    metrics.submitsOk++;
+    log.info(`[${workerId}] ✓ ACCEPTED (${item.kind}, ${bids.length}) in ${result.submitMs}ms: HTTP ${result.statusCode} (empty confirmation = silent save)`);
     for (const b of item.bids) {
+      ctx.submitted.add(String(b.order.SapOrderId));
       bidLog.write({
         session: workerId, sap_order_id: b.order.SapOrderId, city: b.city, spi: b.spi,
-        csv_rate: b.amount, submit_ms: result.submitMs, status: 'SILENT_FAIL',
-        message: `HTTP ${result.statusCode} empty`,
+        csv_rate: b.amount, submit_ms: result.submitMs, status: 'ACCEPTED_EMPTY_201',
+        message: `HTTP ${result.statusCode} silent save`,
       });
     }
-    return { silentFail: true };
+    return { ok: true };
   }
 
   if (result.info === 'I') {
@@ -1362,7 +1376,7 @@ async function main() {
     `Config: POLL_MS=${POLL_MS} BATCH_SIZE=${BATCH_SIZE} SESSIONS=${sessions.length} ` +
     `AUTO_ADJUST=${AUTO_ADJUST} WAF=${WAF_MIN_MS}→${WAF_MAX_MS}ms metrics=${METRICS_MS}ms`
   );
-  log.info(`Cookies loaded: ${sessions.map((s) => s.id).join(', ')} — sessions act as SEQUENTIAL FALLBACKS (only one submits at a time; if s1's HTTP 201 is empty, s2 retries with a fresh captcha, then s3, then s4).`);
+  log.info(`Cookies loaded: ${sessions.map((s) => s.id).join(', ')} — SINGLE-SESSION mode (empty HTTP 201 = silent save success, matches pre-multi-session working build).`);
 
   // Refresh CSRF for every session in parallel.
   await Promise.all(sessions.map((s) => (s.token ? Promise.resolve() : s.refreshToken())));

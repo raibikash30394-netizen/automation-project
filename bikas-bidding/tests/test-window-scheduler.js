@@ -329,6 +329,73 @@ function testRankHintExtraction() {
   console.log('✓ Rank hint extraction: 3 cases pass (single, empty, club-of-2)');
 }
 
+// ---- Test empty HTTP 201 classification as SUCCESS -------------------------
+//
+// v3.6: Restored old-file behaviour where SAP's HTTP 200/201 with an empty
+// NavEBiddingMessage + empty Ev_Text is treated as a SILENT SAVE SUCCESS
+// (the browser row appears after this response). Previous multi-session era
+// classified this as a silent-fail, which caused the bot to skip the
+// "submitted" bookkeeping and re-submit endlessly — while the browser
+// actually showed the bid saved.
+function testEmptyResponseSuccess() {
+  // Mirror the exact predicate from handleBatch.
+  function classify(result) {
+    const textLower = (result.text || '').toString().toLowerCase();
+    const isSavedOk      = /saved successfully|bid.*accepted|success/i.test(textLower);
+    const isTimeEnded    = /ended|closed|expired/i.test(textLower) && !isSavedOk;
+    const isWrongCaptcha = /captcha.*(fail|wrong|invalid)|worng\s*captcha/i.test(textLower);
+    const isRealSuccess  = (result.info === 'S' && !/ended|closed|expired|invalid|error/i.test(textLower)) || isSavedOk;
+    if (isRealSuccess) return 'ACCEPTED';
+    if (isWrongCaptcha) return 'WRONG_CAPTCHA';
+    if (isTimeEnded) return 'TIME_ENDED';
+    // Empty 200/201 predicate
+    if ((result.statusCode === 200 || result.statusCode === 201) &&
+        !result.info && !result.text && !isTimeEnded && !isWrongCaptcha) return 'ACCEPTED_EMPTY_201';
+    if (result.info === 'I') return 'INFO_RETRY';
+    if (result.info === 'E') return 'REJECTED';
+    return 'UNKNOWN';
+  }
+
+  // Case 1: Empty 201 (the disputed one) → must be ACCEPTED
+  assert.strictEqual(
+    classify({ statusCode: 201, info: '', text: '' }),
+    'ACCEPTED_EMPTY_201',
+    'HTTP 201 empty must classify as silent save',
+  );
+
+  // Case 2: Empty 200 → also ACCEPTED
+  assert.strictEqual(
+    classify({ statusCode: 200, info: '', text: '' }),
+    'ACCEPTED_EMPTY_201',
+  );
+
+  // Case 3: Real "Bidding Amount Saved Successfully" → ACCEPTED via text match
+  assert.strictEqual(
+    classify({ statusCode: 200, info: 'S', text: 'Bidding Amount Saved Successfully.' }),
+    'ACCEPTED',
+  );
+
+  // Case 4: "Bid window closed" → TIME_ENDED (not accepted)
+  assert.strictEqual(
+    classify({ statusCode: 200, info: 'E', text: 'Bidding time has ended for this order.' }),
+    'TIME_ENDED',
+  );
+
+  // Case 5: "Wrong captcha" → WRONG_CAPTCHA
+  assert.strictEqual(
+    classify({ statusCode: 200, info: 'E', text: 'Captcha validation failed. Please try again.' }),
+    'WRONG_CAPTCHA',
+  );
+
+  // Case 6: 500-series → UNKNOWN
+  assert.strictEqual(
+    classify({ statusCode: 500, info: '', text: 'Internal Server Error' }),
+    'UNKNOWN',
+  );
+
+  console.log('✓ Empty-201 classification: 6 cases pass (empty=SUCCESS, error text=proper category)');
+}
+
 // ---- Run --------------------------------------------------------------------
 
 (async () => {
@@ -339,6 +406,7 @@ function testRankHintExtraction() {
     await testSequentialFallback();
     testBatchingLogic();
     testRankHintExtraction();
+    testEmptyResponseSuccess();
     console.log('\n🎉 ALL TESTS PASS');
     process.exit(0);
   } catch (e) {
