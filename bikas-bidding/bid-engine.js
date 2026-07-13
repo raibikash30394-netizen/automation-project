@@ -745,7 +745,52 @@ async function submitBid(auth, bids, solvedCaptcha) {
     if ((severity[m.info] || 0) > (severity[primary.info] || 0)) primary = m;
   }
   if (!primary.text && d.Ev_Text) primary = { info: primary.info || '', text: d.Ev_Text };
-  return { statusCode: res.statusCode, info: primary.info, text: primary.text, messages, raw: res.data, submitMs };
+
+  // Dump the first 5 submit responses to logs/submit-responses.jsonl for
+  // post-mortem when the user reports "SAP says saved but browser doesn't
+  // show the rate". Without this raw dump we cannot distinguish between
+  // (a) SAP genuinely saved, (b) SAP returned success text but info was
+  // 'I'/'E' with a hidden warning, (c) SAP saved with an unexpected rank.
+  try {
+    if (!globalThis.__submitDumps) globalThis.__submitDumps = 0;
+    if (globalThis.__submitDumps < 5) {
+      globalThis.__submitDumps++;
+      const dir = path.join(__dirname, 'logs');
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      fs.appendFileSync(path.join(dir, 'submit-responses.jsonl'),
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          session: auth.id,
+          submitted: bids.map((b) => ({ sapOrderId: b.sapOrderId, amount: b.amount, clubId: b.clubId })),
+          submitMs,
+          statusCode: res.statusCode,
+          primary,
+          messages,
+          topLevelKeys: Object.keys(d),
+          rawPreview: JSON.stringify(res.data).slice(0, 4000),
+        }) + '\n',
+        'utf8',
+      );
+    }
+  } catch (_) { /* never let dumping break bidding */ }
+
+  // Extract rank + L1 hints from the response if SAP echoed them back.
+  // Different SAP tenants echo different keys — check the common ones.
+  const rankHints = [];
+  const trackHis = d?.NavEBiddingTrackHis?.results || [];
+  if (Array.isArray(trackHis) && trackHis.length) {
+    for (const t of trackHis) {
+      rankHints.push({
+        sapOrderId: (t.SapOrderId || '').toString(),
+        rank      : (t.BiddingRank || '').toString(),
+        savedAmt  : (t.BiddingAmount || '').toString(),
+        l1Amt     : (t.L1BidAmount || '').toString(),
+        avgAmt    : (t.AvgWtBidAmount || '').toString(),
+      });
+    }
+  }
+
+  return { statusCode: res.statusCode, info: primary.info, text: primary.text, messages, raw: res.data, submitMs, rankHints };
 }
 
 function extractSapMessages(d) {
@@ -1014,10 +1059,20 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
 
   if (isRealSuccess) {
     metrics.submitsOk++;
-    log.info(`[${workerId}] ✓ ACCEPTED (${item.kind}, ${bids.length}) in ${result.submitMs}ms: ${result.text || 'OK'}`);
+    // Include rank + L1 hints if SAP echoed them (helps user verify what actually
+    // landed on the server vs. what's in the browser view).
+    const rankStr = (result.rankHints && result.rankHints.length)
+      ? ' | ' + result.rankHints.map((r) => `${r.sapOrderId} rank=${r.rank || '?'} L1=${r.l1Amt || '?'} saved=${r.savedAmt || '?'}`).join('; ')
+      : '';
+    log.info(`[${workerId}] ✓ ACCEPTED (${item.kind}, ${bids.length}) in ${result.submitMs}ms: ${result.text || 'OK'}${rankStr}`);
     for (const b of item.bids) {
       ctx.submitted.add(String(b.order.SapOrderId));
-      bidLogRow(b, 'ACCEPTED', result.text || 'OK');
+      // Find matching rank hint for this bid
+      const hint = (result.rankHints || []).find((h) => h.sapOrderId === String(b.order.SapOrderId));
+      const rankMsg = hint
+        ? `rank=${hint.rank || '?'} L1=${hint.l1Amt || '?'} saved=${hint.savedAmt || '?'} | ${result.text || 'OK'}`
+        : (result.text || 'OK');
+      bidLogRow(b, 'ACCEPTED', rankMsg);
     }
     return { ok: true };
   }

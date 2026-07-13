@@ -267,6 +267,68 @@ function testBatchingLogic() {
   console.log('✓ Batching: 5 cases pass (singles pack 3-per, clubs come after)');
 }
 
+// ---- Test rank hint extraction from SAP submit response --------------------
+
+function testRankHintExtraction() {
+  // Simulate what submitBid does when SAP echoes NavEBiddingTrackHis back.
+  function extractRankHints(d) {
+    const rankHints = [];
+    const trackHis = d?.NavEBiddingTrackHis?.results || [];
+    if (Array.isArray(trackHis) && trackHis.length) {
+      for (const t of trackHis) {
+        rankHints.push({
+          sapOrderId: (t.SapOrderId || '').toString(),
+          rank      : (t.BiddingRank || '').toString(),
+          savedAmt  : (t.BiddingAmount || '').toString(),
+          l1Amt     : (t.L1BidAmount || '').toString(),
+          avgAmt    : (t.AvgWtBidAmount || '').toString(),
+        });
+      }
+    }
+    return rankHints;
+  }
+
+  // Case 1: SAP echoes back one order with rank 5, L1=564, saved=564
+  const resp1 = {
+    NavEBiddingTrackHis: {
+      results: [{
+        SapOrderId    : '1153385318',
+        BiddingRank   : '05',
+        BiddingAmount : '564.000',
+        L1BidAmount   : '564.000',
+        AvgWtBidAmount: '569.000',
+      }],
+    },
+  };
+  const h1 = extractRankHints(resp1);
+  assert.strictEqual(h1.length, 1);
+  assert.strictEqual(h1[0].sapOrderId, '1153385318');
+  assert.strictEqual(h1[0].rank, '05');
+  assert.strictEqual(h1[0].l1Amt, '564.000');
+  assert.strictEqual(h1[0].savedAmt, '564.000');
+
+  // Case 2: Empty response — no hints
+  assert.deepStrictEqual(extractRankHints({}), []);
+  assert.deepStrictEqual(extractRankHints({ NavEBiddingTrackHis: { results: [] } }), []);
+
+  // Case 3: Club with 2 items
+  const resp3 = {
+    NavEBiddingTrackHis: {
+      results: [
+        { SapOrderId: '1153406328', BiddingRank: '03', BiddingAmount: '690.000', L1BidAmount: '685.000' },
+        { SapOrderId: '1153406322', BiddingRank: '03', BiddingAmount: '690.000', L1BidAmount: '685.000' },
+      ],
+    },
+  };
+  const h3 = extractRankHints(resp3);
+  assert.strictEqual(h3.length, 2);
+  assert.strictEqual(h3[0].rank, '03');
+  assert.strictEqual(h3[1].rank, '03');
+  assert.notStrictEqual(h3[0].l1Amt, h3[0].savedAmt, 'saved > L1 means outbid — user is 2nd/3rd place');
+
+  console.log('✓ Rank hint extraction: 3 cases pass (single, empty, club-of-2)');
+}
+
 // ---- Run --------------------------------------------------------------------
 
 (async () => {
@@ -276,6 +338,7 @@ function testBatchingLogic() {
     await testGlobalMutexSerialises();
     await testSequentialFallback();
     testBatchingLogic();
+    testRankHintExtraction();
     console.log('\n🎉 ALL TESTS PASS');
     process.exit(0);
   } catch (e) {
