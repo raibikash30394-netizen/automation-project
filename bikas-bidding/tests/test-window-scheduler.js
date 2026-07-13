@@ -396,6 +396,56 @@ function testEmptyResponseSuccess() {
   console.log('✓ Empty-201 classification: 6 cases pass (empty=SUCCESS, error text=proper category)');
 }
 
+// ---- Test dead-cookie detection (3× 403 after refresh → cool-off) ---------
+//
+// Scenario the user hit: SAP session cookie expired, but SessionSet('')
+// still returns a fresh CSRF. Every subsequent OData call is 403. Before
+// this fix: infinite loop of refresh→403→refresh→403 pounding SAP.
+// After this fix: after 3 consecutive 403-after-refresh, mark auth as dead
+// and cool off for AUTH_DEAD_COOLDOWN_MS.
+async function testDeadCookieDetection() {
+  // Simulate sapRequest's post-refresh 403 tracking.
+  function makeAuthTracker(threshold = 3, cooldownMs = 30_000) {
+    const auth = { _deadCount: 0, _deadUntil: 0 };
+    return {
+      auth,
+      // Called when a request that had csrf=required also fails 403 after refresh.
+      onPostRefresh403() {
+        auth._deadCount = (auth._deadCount || 0) + 1;
+        if (auth._deadCount >= threshold) {
+          auth._deadUntil = Date.now() + cooldownMs;
+        }
+      },
+      onSuccess() { auth._deadCount = 0; },
+      isDead() { return Boolean(auth._deadUntil && Date.now() < auth._deadUntil); },
+    };
+  }
+
+  const t = makeAuthTracker(3, 30_000);
+  assert.strictEqual(t.isDead(), false, 'starts alive');
+
+  t.onPostRefresh403(); // 1
+  assert.strictEqual(t.isDead(), false);
+  t.onPostRefresh403(); // 2
+  assert.strictEqual(t.isDead(), false);
+  t.onPostRefresh403(); // 3 → dead
+  assert.strictEqual(t.isDead(), true, 'dead after 3 consecutive 403-after-refresh');
+  assert.strictEqual(t.auth._deadCount, 3);
+  assert(t.auth._deadUntil > Date.now(), '_deadUntil is in the future');
+
+  // Success clears the counter (but not _deadUntil until cool-off passes)
+  const t2 = makeAuthTracker(3, 30_000);
+  t2.onPostRefresh403();
+  t2.onPostRefresh403();
+  t2.onSuccess();
+  assert.strictEqual(t2.auth._deadCount, 0);
+  t2.onPostRefresh403();
+  t2.onPostRefresh403();
+  assert.strictEqual(t2.isDead(), false, 'no dead: counter was reset by success');
+
+  console.log('✓ Dead-cookie detection: 3 cases pass (threshold triggers, success resets counter)');
+}
+
 // ---- Run --------------------------------------------------------------------
 
 (async () => {
@@ -407,6 +457,7 @@ function testEmptyResponseSuccess() {
     testBatchingLogic();
     testRankHintExtraction();
     testEmptyResponseSuccess();
+    await testDeadCookieDetection();
     console.log('\n🎉 ALL TESTS PASS');
     process.exit(0);
   } catch (e) {

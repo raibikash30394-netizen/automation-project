@@ -382,6 +382,18 @@ const bidLog = (() => {
 })();
 
 // ---- Small SAP request helper (with 403 CSRF-refresh once) ----------------
+//
+// If the SAP cookie itself has expired/been invalidated (different browser
+// login, timeout, admin-kill), then `SessionSet('')` still returns a NEW
+// CSRF token successfully — but any subsequent OData call is rejected with
+// HTTP 403 "CSRF token validation failed". That looked to the user like a
+// bug in our code — it isn't; it's SAP saying "your cookie is dead".
+//
+// We track consecutive 403-after-refresh failures on the auth object and,
+// after 3 of them in a row, log a LOUD RE-LOGIN warning and set a global
+// cool-off so we stop hammering SAP with useless requests.
+const AUTH_DEAD_THRESHOLD = parseInt(process.env.AUTH_DEAD_THRESHOLD || '3', 10);
+const AUTH_DEAD_COOLDOWN_MS = parseInt(process.env.AUTH_DEAD_COOLDOWN_MS || '30000', 10);
 
 async function sapRequest(auth, { path: p, method = 'POST', body, timeoutMs = 5000 }) {
   const doOnce = () => sapPool.request({
@@ -392,6 +404,10 @@ async function sapRequest(auth, { path: p, method = 'POST', body, timeoutMs = 50
     headersTimeout: timeoutMs,
     bodyTimeout: timeoutMs,
   });
+  // If auth is currently marked dead, refuse to send until cool-off passes.
+  if (auth._deadUntil && Date.now() < auth._deadUntil) {
+    return { statusCode: 401, headers: {}, data: { _cookieDead: true, remainingMs: auth._deadUntil - Date.now() } };
+  }
   if (!auth.token) await auth.refreshToken();
   let r = await doOnce();
   const csrfHdr = (r.headers['x-csrf-token'] || '').toString().toLowerCase();
@@ -399,6 +415,26 @@ async function sapRequest(auth, { path: p, method = 'POST', body, timeoutMs = 50
     log.warn('CSRF rejected — refreshing token and retrying once.');
     await auth.refreshToken();
     r = await doOnce();
+
+    // If retry ALSO comes back 403, the cookie itself is dead (not the token).
+    // Track consecutive dead-cookie failures per auth.
+    if (r.statusCode === 403) {
+      auth._deadCount = (auth._deadCount || 0) + 1;
+      if (auth._deadCount >= AUTH_DEAD_THRESHOLD) {
+        auth._deadUntil = Date.now() + AUTH_DEAD_COOLDOWN_MS;
+        log.error(
+          `🔒 COOKIE EXPIRED / SESSION KILLED for [${auth.id}] — SAP returns fresh CSRF but rejects every request.\n` +
+          `   → Log into SAP again in your browser, copy the FULL "Cookie" request header from DevTools → Network,\n` +
+          `   → Paste it into ${path.basename(auth.cookieFile)} (overwrite the whole file), delete ${path.basename(auth.tokenFile)},\n` +
+          `   → Then restart the bot (pm2 restart bid-engine).\n` +
+          `   ⏸  Pausing SAP requests for ${Math.round(AUTH_DEAD_COOLDOWN_MS / 1000)}s to avoid rate-limits.`
+        );
+      }
+    } else {
+      auth._deadCount = 0; // recovered
+    }
+  } else if (r.statusCode >= 200 && r.statusCode < 400) {
+    auth._deadCount = 0; // any success clears the dead counter
   }
   const text = await r.body.text();
   let data;
@@ -594,6 +630,11 @@ async function fetchLiveOrders(auth) {
     const preview = typeof res.data === 'string' ? res.data.slice(0, 300) : JSON.stringify(res.data).slice(0, 300);
     if (res.statusCode === 406 || /Not Acceptable|<!DOCTYPE html>/i.test(preview)) {
       markWaf(`BidOrderListSet HTTP ${res.statusCode}`);
+      return { orders: [], plantConf: null };
+    }
+    // Suppress spam when the cookie is confirmed dead — sapRequest already
+    // logged a loud one-time re-login instruction and set _deadUntil.
+    if (res.data && typeof res.data === 'object' && res.data._cookieDead) {
       return { orders: [], plantConf: null };
     }
     log.warn(`BidOrderListSet → HTTP ${res.statusCode} | ${preview}`);
