@@ -39,16 +39,20 @@ Two Node.js processes:
 - **Wrong-captcha exhaustion → fallback**: After 3× wrong-captcha on one session, `handleBatch` returns `{ silentFail: true }` so runAll retries with next session (its captcha comes from independent SAP session state, so OCR often succeeds).
 - **Unit tests** in `tests/test-window-scheduler.js` — 7 groups, all pass (msUntilNextWindow 7 cases, isHotWindow 22 cases, mutex serialisation 4-way, sequential fallback success + all-fail paths, batching 5 cases, rank hint extraction 3 cases).
 
-## Implemented (2026-02 — v3.8 post-save verification diagnostic)
-- **Post-save verification** — on FIRST successful save per process, refetch order list 1.5s later and cross-check whether submitted SapOrderIds actually show non-zero `BiddingAmount`. Three outcomes:
-  - `✅ POST-SAVE OK` — all persisted (info log)
-  - `⚠  POST-SAVE PARTIAL` — some persisted (warn log)
-  - `🚨 POST-SAVE VERIFICATION FAILED` — none persisted despite SAP text 'Saved Successfully' (error log with "share submit-responses.jsonl" guidance)
-- **Runs once per process** — fire-and-forget setTimeout(1500ms) with unref(). Zero impact on hot submit path.
-- **Log label rename**: `saved=X` → `submitted=X` in ACCEPTED log line + CSV. The value is what we SENT (echoed by SAP), NOT confirmed persistence.
-- **Raw dump limit** bumped from 5 → 50 samples so user can collect more diagnostic data.
-- New unit test `testPostSaveVerification` — 4 cases (OK/FAILED/PARTIAL/NOT_IN_LIST).
-- **Total tests: 10/10 pass**. **testing_agent iteration_6: 100% pass**.
+## Implemented (2026-02 — v3.9 vendor switch + captcha cache invalidation)
+- **VENDOR_ID: 2210181 → 2207936** in `.env` and default constant. User was logged in with 2207936 in browser; bot was silently bidding on the old vendor's behalf.
+- **NEW `/invalidate` endpoint** in `bidding.js` — accepts `{ base64Image, solved? }`, drops the cache entry from both `hashMap` Map AND `entries[]` array (so it doesn't resurrect on next disk load). Response: `{ ok, invalidated, cacheSize }`.
+- **Wrong-captcha auto-invalidation in bid-engine**:
+  - `nextCaptcha()` now returns `{ solved, reason, img }` — the image is propagated.
+  - `fetchFreshCaptcha()` stores `auth._lastCaptchaImg` on each successful solve.
+  - When SAP responds "Wrong Captcha", `invalidateCaptchaCache()` is fired (fire-and-forget) BEFORE the retry captcha fetch → prevents the same wrong cached OCR from coming back as a HIT.
+- **Root-cause context** (from user's 14:45 IST log):
+  - solver metrics: `hits=4 misses=0` (all cache hits) but only the 4th solve was correct
+  - 3 wrong OCRs (`=bg=`, `herrd`, `CUU5`) were previously cached and kept coming back as HITs when SAP reused the same captcha images
+  - after v3.9, those wrong entries get evicted the moment SAP rejects them, so the next same-image sighting triggers a fresh TrueCaptcha OCR (~90% chance of a different, correct result)
+- **Speed impact estimate**: 1767ms slow-path → ~800-1200ms typical (saves ~600-1000ms per session that used to burn multiple wrong retries).
+- New unit test `testCaptchaCacheInvalidation` (matches the exact 4 hashes from the user's live log).
+- **Total tests: 11/11 pass**. **testing_agent iteration_7: 100% pass, no issues**.
 
 ## Verified
 - `bidding.js` starts, loads cache, `/health` returns metrics JSON
