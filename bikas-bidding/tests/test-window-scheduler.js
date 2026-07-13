@@ -446,6 +446,62 @@ async function testDeadCookieDetection() {
   console.log('✓ Dead-cookie detection: 3 cases pass (threshold triggers, success resets counter)');
 }
 
+// ---- Test post-save verification classification --------------------------
+//
+// After a save that SAP replies 'Saved Successfully' to, we refetch the
+// order list ~1.5s later and check whether the submitted orders now show
+// non-zero BiddingAmount. Three outcomes: ALL_PERSISTED / PARTIAL / NONE.
+function testPostSaveVerification() {
+  function verify(submitted, refetchedOrders) {
+    const submittedIds = new Set(submitted.map((s) => String(s.sapOrderId)));
+    const found = [];
+    const missing = [];
+    for (const o of refetchedOrders) {
+      const oid = String(o.SapOrderId || '');
+      if (!submittedIds.has(oid)) continue;
+      const persistedAmt = parseFloat(o.BiddingAmount || 0);
+      if (persistedAmt > 0) found.push({ oid, amt: persistedAmt });
+      else missing.push(oid);
+    }
+    if (missing.length && !found.length) return 'FAILED';
+    if (missing.length && found.length)  return 'PARTIAL';
+    if (found.length)                    return 'OK';
+    return 'NOT_IN_LIST';
+  }
+
+  // Case 1: All 3 bids persisted (browser will show)
+  const s1 = [{ sapOrderId: '1153390721', amount: 690 }, { sapOrderId: '1153379947', amount: 408 }, { sapOrderId: '1153375640', amount: 569 }];
+  const r1 = [
+    { SapOrderId: '1153390721', BiddingAmount: '690.000' },
+    { SapOrderId: '1153379947', BiddingAmount: '408.000' },
+    { SapOrderId: '1153375640', BiddingAmount: '569.000' },
+    { SapOrderId: '9999999999', BiddingAmount: '0' }, // unrelated
+  ];
+  assert.strictEqual(verify(s1, r1), 'OK');
+
+  // Case 2: SAP said 'Saved' but nothing actually persisted (user's scenario)
+  const r2 = [
+    { SapOrderId: '1153390721', BiddingAmount: '0' },
+    { SapOrderId: '1153379947', BiddingAmount: '0' },
+    { SapOrderId: '1153375640', BiddingAmount: '0' },
+  ];
+  assert.strictEqual(verify(s1, r2), 'FAILED', 'when all show 0 despite SAP saying Saved');
+
+  // Case 3: Partial persist — 1 of 3 saved
+  const r3 = [
+    { SapOrderId: '1153390721', BiddingAmount: '690.000' },
+    { SapOrderId: '1153379947', BiddingAmount: '0' },
+    { SapOrderId: '1153375640', BiddingAmount: '0' },
+  ];
+  assert.strictEqual(verify(s1, r3), 'PARTIAL');
+
+  // Case 4: Orders vanished from list (probably went past window)
+  const r4 = [{ SapOrderId: '9999999999', BiddingAmount: '0' }];
+  assert.strictEqual(verify(s1, r4), 'NOT_IN_LIST');
+
+  console.log('✓ Post-save verification: 4 cases pass (OK, FAILED, PARTIAL, NOT_IN_LIST)');
+}
+
 // ---- Run --------------------------------------------------------------------
 
 (async () => {
@@ -458,6 +514,7 @@ async function testDeadCookieDetection() {
     testRankHintExtraction();
     testEmptyResponseSuccess();
     await testDeadCookieDetection();
+    testPostSaveVerification();
     console.log('\n🎉 ALL TESTS PASS');
     process.exit(0);
   } catch (e) {

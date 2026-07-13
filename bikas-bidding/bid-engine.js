@@ -802,14 +802,12 @@ async function submitBid(auth, bids, solvedCaptcha) {
   }
   if (!primary.text && d.Ev_Text) primary = { info: primary.info || '', text: d.Ev_Text };
 
-  // Dump the first 5 submit responses to logs/submit-responses.jsonl for
-  // post-mortem when the user reports "SAP says saved but browser doesn't
-  // show the rate". Without this raw dump we cannot distinguish between
-  // (a) SAP genuinely saved, (b) SAP returned success text but info was
-  // 'I'/'E' with a hidden warning, (c) SAP saved with an unexpected rank.
+  // Dump submit responses to logs/submit-responses.jsonl for post-mortem when
+  // the user reports "SAP says saved but browser doesn't show the rate".
+  // Cap at 50 samples per process so disk doesn't grow unboundedly.
   try {
     if (!globalThis.__submitDumps) globalThis.__submitDumps = 0;
-    if (globalThis.__submitDumps < 5) {
+    if (globalThis.__submitDumps < 50) {
       globalThis.__submitDumps++;
       const dir = path.join(__dirname, 'logs');
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -1115,20 +1113,59 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
 
   if (isRealSuccess) {
     metrics.submitsOk++;
-    // Include rank + L1 hints if SAP echoed them (helps user verify what actually
-    // landed on the server vs. what's in the browser view).
+    // Rename `saved=` (which is what WE sent, echoed back) to `submitted=` so
+    // it's clear this is our input, not confirmed persisted value.
     const rankStr = (result.rankHints && result.rankHints.length)
-      ? ' | ' + result.rankHints.map((r) => `${r.sapOrderId} rank=${r.rank || '?'} L1=${r.l1Amt || '?'} saved=${r.savedAmt || '?'}`).join('; ')
+      ? ' | ' + result.rankHints.map((r) => `${r.sapOrderId} rank=${r.rank || '?'} L1=${r.l1Amt || '?'} submitted=${r.savedAmt || '?'}`).join('; ')
       : '';
     log.info(`[${workerId}] ✓ ACCEPTED (${item.kind}, ${bids.length}) in ${result.submitMs}ms: ${result.text || 'OK'}${rankStr}`);
     for (const b of item.bids) {
       ctx.submitted.add(String(b.order.SapOrderId));
-      // Find matching rank hint for this bid
       const hint = (result.rankHints || []).find((h) => h.sapOrderId === String(b.order.SapOrderId));
       const rankMsg = hint
-        ? `rank=${hint.rank || '?'} L1=${hint.l1Amt || '?'} saved=${hint.savedAmt || '?'} | ${result.text || 'OK'}`
+        ? `rank=${hint.rank || '?'} L1=${hint.l1Amt || '?'} submitted=${hint.savedAmt || '?'} | ${result.text || 'OK'}`
         : (result.text || 'OK');
       bidLogRow(b, 'ACCEPTED', rankMsg);
+    }
+    // POST-SAVE VERIFICATION (fire-and-forget, non-blocking).
+    // Refetch the order list 1.5s later and check whether the BiddingAmount
+    // for each submitted order is actually non-zero on the server. This
+    // conclusively detects "SAP said 'Saved' but the bid didn't persist".
+    // We do this at most ONCE per process to keep it lightweight.
+    if (!globalThis.__postSaveVerified) {
+      globalThis.__postSaveVerified = true;
+      const submittedIds = new Set(item.bids.map((b) => String(b.order.SapOrderId)));
+      const expectedAmounts = Object.fromEntries(item.bids.map((b) => [String(b.order.SapOrderId), b.amount]));
+      setTimeout(async () => {
+        try {
+          const check = await fetchLiveOrders(auth);
+          const found = [];
+          const missing = [];
+          for (const o of check.orders || []) {
+            const oid = String(o.SapOrderId || '');
+            if (!submittedIds.has(oid)) continue;
+            const persistedAmt = parseFloat(o.BiddingAmount || 0);
+            if (persistedAmt > 0) found.push(`${oid}=${persistedAmt}`);
+            else missing.push(`${oid} (expected ${expectedAmounts[oid]})`);
+          }
+          if (missing.length && !found.length) {
+            log.error(
+              `🚨 POST-SAVE VERIFICATION FAILED: SAP replied 'Saved Successfully' but NONE of the ${submittedIds.size} bids appear persisted on refetch. ` +
+              `Missing: ${missing.join(', ')}. ` +
+              `→ Share logs/submit-responses.jsonl with support. Root cause is a payload or Flag mismatch, not a code bug in our submit flow.`
+            );
+          } else if (missing.length && found.length) {
+            log.warn(
+              `⚠  POST-SAVE PARTIAL: ${found.length}/${submittedIds.size} bids persisted. ` +
+              `Persisted: ${found.join(', ')} | Missing: ${missing.join(', ')}.`
+            );
+          } else if (found.length) {
+            log.info(`✅ POST-SAVE OK: verified ${found.length} bid(s) persisted server-side (${found.join(', ')}).`);
+          }
+        } catch (e) {
+          log.warn(`Post-save verification refetch failed: ${e.message}`);
+        }
+      }, 1500).unref();
     }
     return { ok: true };
   }
