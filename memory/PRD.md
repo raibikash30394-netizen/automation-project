@@ -39,15 +39,16 @@ Two Node.js processes:
 - **Wrong-captcha exhaustion → fallback**: After 3× wrong-captcha on one session, `handleBatch` returns `{ silentFail: true }` so runAll retries with next session (its captcha comes from independent SAP session state, so OCR often succeeds).
 - **Unit tests** in `tests/test-window-scheduler.js` — 7 groups, all pass (msUntilNextWindow 7 cases, isHotWindow 22 cases, mutex serialisation 4-way, sequential fallback success + all-fail paths, batching 5 cases, rank hint extraction 3 cases).
 
-## Implemented (2026-02 — v3.7 dead-cookie diagnostic)
-- **Root cause detected**: SAP returns fresh CSRF token via `SessionSet('')` EVEN when the underlying browser cookie is dead (logged out elsewhere, admin killed, session timeout). Prior code went into an infinite 403-loop hammering SAP.
-- **`sapRequest()` now tracks** consecutive 403-after-refresh on `auth._deadCount`. After 3 (default `AUTH_DEAD_THRESHOLD=3`), sets `auth._deadUntil = now + 30_000ms` (default `AUTH_DEAD_COOLDOWN_MS`).
-- **ONE loud instructional error** logged with 🔒 emoji + explicit steps: paste fresh Cookie header from DevTools Network → cookie.txt, delete token.txt, `pm2 restart bid-engine`.
-- **During cool-off**: sapRequest short-circuits with synthetic `{ statusCode: 401, data: { _cookieDead: true, remainingMs } }` — no SAP hit, no rate-limit burn.
-- **`fetchLiveOrders()`** suppresses per-poll `HTTP 403` warn spam when it sees the `_cookieDead` marker.
-- **Self-heal**: any 2xx/3xx response clears `_deadCount` — if user updates cookie mid-run and it takes effect, bot recovers automatically.
-- New unit test `testDeadCookieDetection`: 3 cases (alive-at-start, 3× triggers dead flag, mid-stream success resets counter).
-- **testing_agent iteration_5**: 100% pass, no issues. 9/9 test groups.
+## Implemented (2026-02 — v3.8 post-save verification diagnostic)
+- **Post-save verification** — on FIRST successful save per process, refetch order list 1.5s later and cross-check whether submitted SapOrderIds actually show non-zero `BiddingAmount`. Three outcomes:
+  - `✅ POST-SAVE OK` — all persisted (info log)
+  - `⚠  POST-SAVE PARTIAL` — some persisted (warn log)
+  - `🚨 POST-SAVE VERIFICATION FAILED` — none persisted despite SAP text 'Saved Successfully' (error log with "share submit-responses.jsonl" guidance)
+- **Runs once per process** — fire-and-forget setTimeout(1500ms) with unref(). Zero impact on hot submit path.
+- **Log label rename**: `saved=X` → `submitted=X` in ACCEPTED log line + CSV. The value is what we SENT (echoed by SAP), NOT confirmed persistence.
+- **Raw dump limit** bumped from 5 → 50 samples so user can collect more diagnostic data.
+- New unit test `testPostSaveVerification` — 4 cases (OK/FAILED/PARTIAL/NOT_IN_LIST).
+- **Total tests: 10/10 pass**. **testing_agent iteration_6: 100% pass**.
 
 ## Verified
 - `bidding.js` starts, loads cache, `/health` returns metrics JSON
