@@ -1462,6 +1462,20 @@ async function tick(ctx) {
     }
 
     if (!orders.length) {
+      // Inside an active :15/:45 hot-window, SAP sometimes lags 1-60s AFTER
+      // the boundary before ANY orders show up (not just the captcha). We
+      // must keep tight-polling so we catch the moment SAP populates, and
+      // emit a visibility log so the user doesn't panic-restart.
+      if (isHotWindow()) {
+        ctx._matchedButNoCaptcha = true; // tight-loop 0-ms sleeps in main loop
+        const now = Date.now();
+        if (!globalThis.__lastWaitLog || now - globalThis.__lastWaitLog > 10_000) {
+          globalThis.__lastWaitLog = now;
+          const secsPast = 30 * 60 - Math.round(msUntilNextWindow() / 1000);
+          log.info(`⏳ waiting for SAP to populate order list… ~${secsPast}s past :15/:45 boundary (bot is polling tight, SAP is late — do NOT restart)`);
+        }
+        return;
+      }
       ctx._matchedButNoCaptcha = false;
       // Reset the "first captcha detected" marker between windows so the
       // next window-open log fires afresh.
@@ -1484,6 +1498,19 @@ async function tick(ctx) {
       ctx.sessions.length
     );
     if (stats.matched === 0) {
+      // Hot-window but nothing matched yet — could mean SAP populated a few
+      // orders but the ones matching our CSV rules aren't visible yet, or
+      // they're all in cooldown/inFlight. Keep tight-loop + visibility log.
+      if (isHotWindow()) {
+        ctx._matchedButNoCaptcha = true;
+        const now = Date.now();
+        if (!globalThis.__lastWaitLog || now - globalThis.__lastWaitLog > 10_000) {
+          globalThis.__lastWaitLog = now;
+          const secsPast = 30 * 60 - Math.round(msUntilNextWindow() / 1000);
+          log.info(`⏳ waiting for matched orders to appear (${stats.total} live, 0 matched)… ~${secsPast}s past :15/:45 boundary (bot polling tight — do NOT restart)`);
+        }
+        return;
+      }
       ctx._matchedButNoCaptcha = false;
       return;
     }

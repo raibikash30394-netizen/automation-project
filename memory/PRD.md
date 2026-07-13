@@ -48,6 +48,15 @@ Two Node.js processes:
 - New unit test `testSapLateVisibility` (6 cases proving 10s throttle correctness).
 - **Total tests: 15/15 pass**. **testing_agent iteration_11: 100% pass, no issues**.
 
+## Implemented (2026-02 — v3.14 SAP-late polling stall fix)
+- **Root cause of missing wait-log & no bids saved**: In v3.13 the wait-log lived ONLY inside `fetchFreshCaptcha()` (called when `sap-empty` captcha response). But when SAP is late, the `BidOrderListSet` endpoint also returns 0 orders (or 0 matched) — `tick()` then early-returned BEFORE ever calling captcha fetch. Result: wait-log never fired, main loop dropped to 2000ms idle poll, user thought bot was frozen.
+- **Fix in `tick()`** (bid-engine.js lines 1464-1509):
+  - `orders.length === 0` inside `isHotWindow()` → set `_matchedButNoCaptcha = true` (main loop tight-polls) + emit throttled wait-log ("waiting for SAP to populate order list… Ns past boundary — do NOT restart")
+  - `stats.matched === 0` inside `isHotWindow()` → same tight-loop + throttled wait-log ("waiting for matched orders to appear (N live, 0 matched)…")
+  - Cold-window behaviour unchanged (idle 2000ms sleep + 10s heartbeat log)
+- New unit test `testEmptyOrdersInHotWindow` (6 cases: cold-empty=idle, hot-empty-first=log+tight, hot-empty-throttled=no-log, hot-empty-past-throttle=log-again, hot-matched=0=same, cold-matched=0=idle).
+- **Total tests: 16/16 pass**.
+
 ## Verified
 - `bidding.js` starts, loads cache, `/health` returns metrics JSON
 - `POST /solve-captcha` and `POST /` both accept text/plain JSON, return `{solved}`

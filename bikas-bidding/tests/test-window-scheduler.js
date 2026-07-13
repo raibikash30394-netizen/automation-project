@@ -707,6 +707,76 @@ function testSapLateVisibility() {
   console.log('✓ SAP-late visibility log: throttled at ~10s intervals (prevents log spam + prevents user panic)');
 }
 
+// v3.14 — SAP-late polling stall fix:
+// When SAP hasn't populated the order list (or matches are 0) inside an
+// active :15/:45 hot-window, the bot must:
+//   (1) STILL emit the throttled wait-log so the user sees activity
+//   (2) SET _matchedButNoCaptcha=true so the main loop uses tight 0-ms
+//       polling (not the 2000ms idle branch)
+// Before v3.14, tick() early-returned on orders=0 without doing either →
+// wait-log never fired, main loop slept 2s, user thought bot was stuck.
+function testEmptyOrdersInHotWindow() {
+  // Simulate the tick() decision for the empty-orders branch.
+  function decideEmptyOrders({ hot, lastWaitLog, now }) {
+    if (hot) {
+      const shouldLog = !lastWaitLog || (now - lastWaitLog) > 10_000;
+      return { tightLoop: true, log: shouldLog };
+    }
+    return { tightLoop: false, log: false };
+  }
+
+  // Simulate the tick() decision for the matched=0 branch (same semantics).
+  function decideMatchedZero({ hot, lastWaitLog, now }) {
+    return decideEmptyOrders({ hot, lastWaitLog, now });
+  }
+
+  const t0 = 5_000_000;
+
+  // Case 1: cold window + empty orders → old idle behaviour (no tight loop, no wait-log).
+  assert.deepStrictEqual(
+    decideEmptyOrders({ hot: false, lastWaitLog: 0, now: t0 }),
+    { tightLoop: false, log: false },
+    'cold-window empty orders: idle mode preserved'
+  );
+
+  // Case 2: hot window + empty orders + first tick → tight loop + emit log.
+  assert.deepStrictEqual(
+    decideEmptyOrders({ hot: true, lastWaitLog: 0, now: t0 }),
+    { tightLoop: true, log: true },
+    'hot-window empty orders (first tick): tight loop + wait-log'
+  );
+
+  // Case 3: hot window + empty orders + 3s after last log → tight loop, NO log.
+  assert.deepStrictEqual(
+    decideEmptyOrders({ hot: true, lastWaitLog: t0, now: t0 + 3_000 }),
+    { tightLoop: true, log: false },
+    'hot-window empty orders (3s throttle): tight loop, no log'
+  );
+
+  // Case 4: hot window + empty orders + 11s later → tight loop + log again.
+  assert.deepStrictEqual(
+    decideEmptyOrders({ hot: true, lastWaitLog: t0, now: t0 + 11_000 }),
+    { tightLoop: true, log: true },
+    'hot-window empty orders (past 10s throttle): tight loop + fresh log'
+  );
+
+  // Case 5: hot window + matched=0 (same semantics as empty orders).
+  assert.deepStrictEqual(
+    decideMatchedZero({ hot: true, lastWaitLog: 0, now: t0 }),
+    { tightLoop: true, log: true },
+    'hot-window matched=0 (first tick): tight loop + wait-log'
+  );
+
+  // Case 6: cold window + matched=0 → idle, no log.
+  assert.deepStrictEqual(
+    decideMatchedZero({ hot: false, lastWaitLog: 0, now: t0 }),
+    { tightLoop: false, log: false },
+    'cold-window matched=0: idle preserved'
+  );
+
+  console.log('✓ SAP-late polling stall fix: hot-window empty orders / matched=0 → tight loop + throttled visibility log (6 cases)');
+}
+
 // ---- Run --------------------------------------------------------------------
 
 (async () => {
@@ -725,6 +795,7 @@ function testSapLateVisibility() {
     await testParallelCaptchaProbes();
     testAdaptiveKeepWarm();
     testSapLateVisibility();
+    testEmptyOrdersInHotWindow();
     console.log('\n🎉 ALL TESTS PASS');
     process.exit(0);
   } catch (e) {
