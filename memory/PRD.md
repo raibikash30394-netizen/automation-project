@@ -39,15 +39,16 @@ Two Node.js processes:
 - **Wrong-captcha exhaustion → fallback**: After 3× wrong-captcha on one session, `handleBatch` returns `{ silentFail: true }` so runAll retries with next session (its captcha comes from independent SAP session state, so OCR often succeeds).
 - **Unit tests** in `tests/test-window-scheduler.js` — 7 groups, all pass (msUntilNextWindow 7 cases, isHotWindow 22 cases, mutex serialisation 4-way, sequential fallback success + all-fail paths, batching 5 cases, rank hint extraction 3 cases).
 
-## Implemented (2026-02 — v3.10 L1-undercut auto rank-1 optimizer)
-- **POLL_MS default 30 → 20** (in `.env` and constant), hot-window sleep also uses POLL_MS (was hardcoded 30).
-- **L1-Undercut Auto Re-bid**: after every successful save, 1.5s later refetch order list. If any submitted order came back rank > 1 AND `L1BidAmount > 0`, auto-resubmit at `(L1 - L1_UNDERCUT_STEP)` to secure rank 1.
-- **Guard rails**: per-order max-attempts counter (default 2) prevents infinite race. Only fires during `isHotWindow()` (active window). Fresh captcha per undercut batch (JIT). Uses same session.mutex + globalSubmitMutex serialisation as normal submits (no anti-fraud risk).
-- **Refunds attempt** if captcha fetch fails (didn't actually reach SAP → not a real attempt).
-- **Window boundary reset**: 60s-interval clears `ctx.undercutAttempts` when we cross into a new bid window (next windows get fresh 2 attempts each).
-- **Env knobs**: `L1_UNDERCUT=true`, `L1_UNDERCUT_STEP=1`, `L1_UNDERCUT_MAX_ATTEMPTS=2`, `L1_UNDERCUT_MIN_REMAINING_MS=15000` (all overridable).
-- New unit test `testL1UndercutDetection` using EXACT hashes/ranks from user's 15:15 IST screenshot (KHARGRAM rank-1 excluded, 4 tie-loser orders targeted, max-attempts=2 stops 3rd wave).
-- **Total tests: 12/12 pass**. **testing_agent iteration_8: 100% pass**, cleaned up 2 minor review comments.
+## Implemented (2026-02 — v3.11 speed optimizations for window-open latency)
+- **Parallel captcha probes** (`PARALLEL_CAPTCHA_PROBES=3` env, default 3):
+  - `nextCaptchaParallel()` fires N simultaneous captcha requests via `Promise.all`
+  - First response with a non-empty solved captcha wins (`.find(r => r.solved)`)
+  - Only active during tight-loop state (`_matchedButNoCaptcha`) OR `isHotWindow()` — polite to SAP otherwise
+  - Sub-linearly reduces window-open → first-submit latency (each wave covers 3x more time-slice)
+- **Adaptive keep-warm frequency** — 3s during hot window, 20s during cold time. Prevents TCP+TLS from going idle right at the window boundary (was costing ~200-500ms TLS renegotiation on the first captcha probe post-window-open).
+- **Precise latency logging** — "First non-empty captcha detected" log now includes `(~Ns past :15/:45 boundary)` so user can measure the actual SAP-side delay per window.
+- New unit tests: `testParallelCaptchaProbes` (3 cases), `testAdaptiveKeepWarm` (hot/cold threshold).
+- **Total tests: 14/14 pass**. **testing_agent iteration_9: 100% pass, no issues**.
 
 ## Verified
 - `bidding.js` starts, loads cache, `/health` returns metrics JSON
