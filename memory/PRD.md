@@ -39,17 +39,14 @@ Two Node.js processes:
 - **Wrong-captcha exhaustion → fallback**: After 3× wrong-captcha on one session, `handleBatch` returns `{ silentFail: true }` so runAll retries with next session (its captcha comes from independent SAP session state, so OCR often succeeds).
 - **Unit tests** in `tests/test-window-scheduler.js` — 7 groups, all pass (msUntilNextWindow 7 cases, isHotWindow 22 cases, mutex serialisation 4-way, sequential fallback success + all-fail paths, batching 5 cases, rank hint extraction 3 cases).
 
-## Implemented (2026-02 — v3.12 revert parallel-captcha race, keep other speed wins)
-- **PARALLEL_CAPTCHA_PROBES default 3 → 1** (disabled). v3.11's parallel probing broke the SAP single-active-captcha invariant that the original code explicitly warned about — user's 16:45 IST log confirmed: 3 solver hits (`ry2n4`, `f8233`, `VFh@4@`), `submits=1 ok=0 wrong-captcha=1`, no bid saved.
-- **Kept the machinery** for users who want to experiment: `nextCaptchaParallel()` when N>1 now returns the **LAST-arrived solved captcha** (submit-safe with SAP), not the first (which gets invalidated).
-- **Explanatory comment** at the top of the function cites the exact user log for future regression protection.
-- **All v3.11 speed wins preserved**:
-  - Adaptive keep-warm (3s hot / 20s cold) — kept TCP+TLS hot near boundary
-  - POLL_MS=20 tight polling
-  - setImmediate tight-loop when matched-but-no-captcha
-  - "~Ns past :15/:45 boundary" precise latency logging
-- User's v3.11 improvement (3s → 1s detection latency) came from **adaptive keep-warm**, not parallel probes — those wins remain.
-- **Total tests: 14/14 pass**. **testing_agent iteration_10: 100% pass, no issues**.
+## Implemented (2026-02 — v3.13 SAP-late visibility / anti-panic-restart)
+- **Root cause explained**: SAP tenant's captcha unlock time varies by ±60s per window. User's 17:15 IST log showed 61 seconds delay — bot was polling correctly, SAP was slow. User panicked and restarted at 17:15:51; SAP unlocked at 17:16:00; restart-bot caught it coincidentally. Restart didn't fix anything.
+- **Fix**: Pure visibility/UX (no behavior change):
+  - `🕒 :15/:45 window BOUNDARY reached` — fires once per window at boundary crossover, tells user bot is polling
+  - `⏳ waiting for SAP to unlock captcha… ~Ns past :15/:45 boundary (bot is polling, SAP is late — do NOT restart)` — throttled to every 10s during hot-window sap-empty state
+  - Per-window resets of `__firstCaptchaAt`, `__lastWaitLog`, `__postSaveVerified` so signals fire fresh each window instead of once per process
+- New unit test `testSapLateVisibility` (6 cases proving 10s throttle correctness).
+- **Total tests: 15/15 pass**. **testing_agent iteration_11: 100% pass, no issues**.
 
 ## Verified
 - `bidding.js` starts, loads cache, `/health` returns metrics JSON
