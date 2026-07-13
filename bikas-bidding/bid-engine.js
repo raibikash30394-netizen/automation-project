@@ -998,16 +998,23 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
     return handleBatch(ctx, session, item, fresh, workerId, retryDepth + 1);
   }
 
-  // ---- HTTP 201 with empty response body = success ----
+  // ---- HTTP 200/201 with empty response body = TIME-ENDED (silent failure) ----
+  // Earlier we treated empty 201 as success, but the user's browser showed
+  // NOTHING was saved server-side — meaning SAP returns empty 201 as a
+  // "silent time-ended" response (bid window closed by the time our submit
+  // landed). Treating this as success caused false "ACCEPTED" logs and let
+  // stale orders sit in ctx.submitted (not retried). Now it's classified
+  // properly and orders get a cooldown so we can retry when window re-opens.
   if ((result.statusCode === 200 || result.statusCode === 201) &&
       !result.info && !result.text && !isTimeEnded && !isWrongCaptcha && reduceBy === null && minFloor === null) {
-    metrics.submitsOk++;
-    log.info(`[${workerId}] ✓ ACCEPTED (${item.kind}, ${bids.length}) in ${result.submitMs}ms: HTTP ${result.statusCode} (empty confirmation)`);
+    metrics.submitsTimeEnded++;
+    const retryAt = Date.now() + TIME_ENDED_COOLDOWN_MS;
+    log.warn(`[${workerId}] ⏰ HTTP ${result.statusCode} EMPTY = silent time-ended in ${result.submitMs}ms — cooldown ${Math.round(TIME_ENDED_COOLDOWN_MS / 1000)}s (bid NOT saved)`);
     for (const b of item.bids) {
-      ctx.submitted.add(String(b.order.SapOrderId));
-      bidLogRow(b, 'ACCEPTED', `HTTP ${result.statusCode} empty`);
+      ctx.cooldown.set(String(b.order.SapOrderId), retryAt);
+      bidLogRow(b, 'SILENT_TIME_ENDED', `HTTP ${result.statusCode} empty`);
     }
-    return { ok: true };
+    return { retry: false };
   }
 
   if (result.info === 'I') {
