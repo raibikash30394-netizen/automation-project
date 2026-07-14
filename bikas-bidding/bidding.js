@@ -148,7 +148,96 @@ function parseBody(req) {
   return req.body || {};
 }
 
-// ---- External captcha (TrueCaptcha) ---------------------------------------
+// ---- Local OCR (tesseract.js) — primary solver, offline & free ------------
+//
+// SAP captchas are 4-6 char alphanumeric single-line images. tesseract.js
+// runs a WASM-based OCR entirely in-process (no network, no cost). On first
+// use it downloads the ~15MB `eng.traineddata` language model to a local
+// cache dir (`./tessdata`) — subsequent runs load instantly.
+//
+// Strategy: cache → local OCR → TrueCaptcha fallback (only if OCR result is
+// empty OR confidence below threshold OR doesn't look like a valid captcha).
+// This saves TrueCaptcha credits AND is often faster (~80-200ms vs 300-500ms
+// round-trip). If tesseract.js fails to init (network blocked, disk full),
+// the server logs the error and silently falls back to TrueCaptcha-only.
+
+const LOCAL_OCR_ENABLED        = String(process.env.LOCAL_OCR_ENABLED ?? 'true') !== 'false';
+const LOCAL_OCR_MIN_CONFIDENCE = parseInt(process.env.LOCAL_OCR_MIN_CONFIDENCE || '60', 10);
+const LOCAL_OCR_MIN_LEN        = parseInt(process.env.LOCAL_OCR_MIN_LEN || '4', 10);
+const LOCAL_OCR_MAX_LEN        = parseInt(process.env.LOCAL_OCR_MAX_LEN || '8', 10);
+const LOCAL_OCR_CHARS          = process.env.LOCAL_OCR_CHARS
+  || 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+
+let ocrWorker = null;
+let ocrInitPromise = null;
+const ocrStats = { attempts: 0, ok: 0, lowConf: 0, badFormat: 0, errors: 0, totalMs: 0 };
+
+async function initLocalOcr() {
+  if (!LOCAL_OCR_ENABLED) return null;
+  if (ocrWorker) return ocrWorker;
+  if (ocrInitPromise) return ocrInitPromise;
+  ocrInitPromise = (async () => {
+    try {
+      const { createWorker } = require('tesseract.js');
+      const w = await createWorker('eng', 1, {
+        cachePath: path.join(__dirname, 'tessdata'),
+        logger: () => {}, // silence progress noise
+      });
+      // Single-line mode + restrict alphabet → dramatically improves accuracy
+      // on the 4-6 char SAP captchas.
+      await w.setParameters({
+        tessedit_pageseg_mode: '7', // single text line
+        tessedit_char_whitelist: LOCAL_OCR_CHARS,
+      });
+      ocrWorker = w;
+      log.info(`Local OCR ready (tesseract.js) — whitelist=${LOCAL_OCR_CHARS.length} chars, min-conf=${LOCAL_OCR_MIN_CONFIDENCE}%, TrueCaptcha=fallback`);
+      return w;
+    } catch (e) {
+      log.warn(`Local OCR init failed: ${e.message} — falling back to TrueCaptcha-only`);
+      return null;
+    }
+  })();
+  return ocrInitPromise;
+}
+
+function looksLikeCaptcha(text) {
+  if (!text) return false;
+  const trimmed = text.replace(/\s+/g, '');
+  if (trimmed.length < LOCAL_OCR_MIN_LEN || trimmed.length > LOCAL_OCR_MAX_LEN) return false;
+  return /^[A-Za-z0-9]+$/.test(trimmed);
+}
+
+async function solveViaLocalOcr(base64Raw) {
+  if (!LOCAL_OCR_ENABLED) return { solved: '', reason: 'disabled' };
+  const worker = await initLocalOcr();
+  if (!worker) return { solved: '', reason: 'init-failed' };
+  const t0 = Date.now();
+  ocrStats.attempts++;
+  try {
+    const buf = Buffer.from(base64Raw, 'base64');
+    const { data } = await worker.recognize(buf);
+    const raw = (data && data.text ? data.text : '').replace(/\s+/g, '');
+    const conf = data && typeof data.confidence === 'number' ? data.confidence : 0;
+    const ms = Date.now() - t0;
+    ocrStats.totalMs += ms;
+    if (!looksLikeCaptcha(raw)) {
+      ocrStats.badFormat++;
+      return { solved: '', reason: 'bad-format', raw, conf, ms };
+    }
+    if (conf < LOCAL_OCR_MIN_CONFIDENCE) {
+      ocrStats.lowConf++;
+      return { solved: '', reason: 'low-conf', raw, conf, ms };
+    }
+    ocrStats.ok++;
+    return { solved: raw, reason: 'ok', conf, ms };
+  } catch (e) {
+    ocrStats.errors++;
+    return { solved: '', reason: 'error', err: e.message, ms: Date.now() - t0 };
+  }
+}
+
+
+// ---- External captcha (TrueCaptcha, fallback) -----------------------------
 
 async function solveViaApi(base64Raw) {
   const t0 = Date.now();
@@ -184,24 +273,37 @@ async function solveViaApi(base64Raw) {
 }
 
 // ---- Main solve dispatcher -------------------------------------------------
+//
+// Priority: cache → local OCR (tesseract.js) → TrueCaptcha API
+// Local OCR result is accepted only if it meets format + confidence gates
+// (see LOCAL_OCR_MIN_CONFIDENCE / LOCAL_OCR_MIN_LEN etc.). Otherwise falls
+// through to TrueCaptcha so no bid is ever attempted with a bad solve.
 
 async function solve(base64Input) {
   if (!base64Input) return { solved: '', source: 'empty' };
   const raw = stripDataUri(base64Input);
   const hash = sha256(raw);
 
-  // Cache-first
+  // 1) Cache-first (sub-ms)
   const hit = cacheHit(hash);
   if (hit) {
     stats.hits++;
     return { solved: hit, source: 'cache', hash };
   }
 
-  // Miss → external
   stats.misses++;
+
+  // 2) Local OCR (tesseract.js) — offline, free, ~80-200ms
+  const ocr = await solveViaLocalOcr(raw);
+  if (ocr.solved) {
+    cachePut(hash, ocr.solved);
+    return { solved: ocr.solved, source: 'local-ocr', hash, conf: ocr.conf, ms: ocr.ms };
+  }
+
+  // 3) TrueCaptcha fallback (paid, ~300-500ms)
   const solved = await solveViaApi(raw);
   if (solved && solved !== 'Redo') cachePut(hash, solved);
-  return { solved, source: 'api', hash };
+  return { solved, source: 'api', hash, ocrReason: ocr.reason };
 }
 
 // ---- Express app -----------------------------------------------------------
@@ -214,10 +316,11 @@ async function handleSolve(req, res) {
   try {
     const { base64Image } = parseBody(req);
     if (!base64Image) return res.status(400).json({ error: 'Base64 image data is required' });
-    const { solved, source, hash } = await solve(base64Image);
+    const { solved, source, hash, conf } = await solve(base64Image);
     const ms = Date.now() - t0;
-    if (source === 'cache') log.info({ ms, hash: hash.slice(0, 10) }, `HIT ${solved}`);
-    else                    log.info({ ms, hash: hash?.slice(0, 10) }, `MISS ${solved || '(empty)'}`);
+    if (source === 'cache')          log.info({ ms, hash: hash.slice(0, 10) }, `HIT ${solved}`);
+    else if (source === 'local-ocr') log.info({ ms, hash: hash?.slice(0, 10), conf: `${conf}%` }, `OCR ${solved}`);
+    else                             log.info({ ms, hash: hash?.slice(0, 10) }, `API ${solved || '(empty)'}`);
     res.json({ solved });
   } catch (e) {
     log.error({ err: e.message, stack: e.stack }, 'solve handler failed');
@@ -275,19 +378,36 @@ app.get('/health', (_req, res) => {
     saves: stats.saves,
     hitRatePct: stats.hits + stats.misses > 0
       ? +(100 * stats.hits / (stats.hits + stats.misses)).toFixed(1) : 0,
+    localOcr: {
+      enabled: LOCAL_OCR_ENABLED,
+      ready: !!ocrWorker,
+      attempts: ocrStats.attempts,
+      ok: ocrStats.ok,
+      lowConf: ocrStats.lowConf,
+      badFormat: ocrStats.badFormat,
+      errors: ocrStats.errors,
+      avgMs: ocrStats.attempts ? Math.round(ocrStats.totalMs / ocrStats.attempts) : 0,
+    },
   });
 });
 
 // ---- Boot ------------------------------------------------------------------
 
 loadCache();
+// Warm up local OCR in the background so the first bid-window doesn't pay
+// the model-load cost (~2s). If init fails we silently fall back to API-only.
+if (LOCAL_OCR_ENABLED) initLocalOcr().catch(() => {});
 setInterval(saveCache, CACHE_SAVE_MS).unref();
 setInterval(() => {
   const total = stats.hits + stats.misses;
   if (!total) return;
+  const ocrOk    = ocrStats.ok;
+  const ocrTotal = ocrStats.attempts;
+  const ocrAvg   = ocrTotal ? Math.round(ocrStats.totalMs / ocrTotal) : 0;
   log.info(
     `[metrics] cache=${hashMap.size} hits=${stats.hits} misses=${stats.misses} ` +
-    `errors=${stats.apiErrors} hit-rate=${(100 * stats.hits / total).toFixed(1)}%`
+    `api-err=${stats.apiErrors} hit-rate=${(100 * stats.hits / total).toFixed(1)}% ` +
+    `| local-ocr: ${ocrOk}/${ocrTotal} solved (low-conf=${ocrStats.lowConf} bad-format=${ocrStats.badFormat} err=${ocrStats.errors}, avg=${ocrAvg}ms)`
   );
 }, parseInt(process.env.METRICS_INTERVAL_MS || '30000', 10)).unref();
 
@@ -297,11 +417,12 @@ const server = app.listen(PORT, '127.0.0.1', () => {
 server.keepAliveTimeout = 30_000;
 server.headersTimeout   = 35_000;
 
-// Graceful shutdown → flush cache
+// Graceful shutdown → flush cache + terminate OCR worker
 function shutdown(sig) {
   log.info(`${sig} — flushing cache…`);
   dirty = true;
   saveCache();
+  if (ocrWorker) { try { ocrWorker.terminate(); } catch { /* ignore */ } }
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 2000).unref();
 }

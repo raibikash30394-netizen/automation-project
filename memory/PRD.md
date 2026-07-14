@@ -57,6 +57,27 @@ Two Node.js processes:
 - New unit test `testEmptyOrdersInHotWindow` (6 cases).
 - **Total tests: 16/16 pass**.
 
+## Implemented (2026-02 — v3.17 duplicate-submit race fix + Local OCR primary)
+
+### v3.17.1 — Duplicate-submit race at delayed boundary tick
+- **Bug**: 07:45 IST live log showed JURANPUR order 1153441825 submitted TWICE (07:45:04 SAVED @ ₹598, then 07:45:10 resubmitted). Root cause: main loop was blocked inside a submit tick at :45:04 → boundary block fired 4s LATE → `ctx.submitted.clear()` wiped the just-added entry → next tick re-matched → duplicate submit.
+- **Fix**: `ctx.submitted` is now `Map<sapOrderId, submitTimestamp>` (was Set). Boundary clear uses `clearOlderThan(ctx.submitted, now - 30_000)` which removes only entries ≥30s old. Since windows are 30min apart, any entry <30s old provably belongs to the just-opened window and MUST be preserved.
+- **Additional guard**: `__firstCaptchaAt` reset in boundary block now also uses 30s window preservation → prevents the duplicate "First non-empty captcha detected" log within the same window.
+- New unit test `testAgeBasedBoundaryClear` (7 cases including edge at exactly 30s).
+
+### v3.17.2 — Local OCR (tesseract.js) primary, TrueCaptcha fallback
+- **Motivation**: user's TrueCaptcha credits kept running low. SAP captchas are 4-6 char alphanumeric — perfect for tesseract.js WASM OCR (~80-200ms, 100% offline, zero cost).
+- **Integration in `bidding.js`**:
+  - New `solveViaLocalOcr(base64)` — tesseract.js worker with `pageseg_mode=7` (single line) + `char_whitelist=A-Za-z0-9`. Rejects results below `LOCAL_OCR_MIN_CONFIDENCE` (default 60%) or that don't match `[A-Za-z0-9]{4,8}` format.
+  - Dispatcher: **cache → local OCR → TrueCaptcha API**. Local OCR result cached same as API result. Falls through transparently on reject.
+  - Worker warmed at boot (background), so first bid-window doesn't pay model-load cost.
+  - `GET /health` reports OCR readiness + attempts/ok/lowConf/badFormat/errors/avgMs.
+  - Log format: `HIT xyz` (cache) | `OCR xyz` (tesseract) | `API xyz` (TrueCaptcha).
+- **Config**: `LOCAL_OCR_ENABLED=true` (default), `LOCAL_OCR_MIN_CONFIDENCE=60`, `LOCAL_OCR_MIN_LEN=4`, `LOCAL_OCR_MAX_LEN=8`.
+- Model files (~15MB) auto-download into `./tessdata/` (gitignored).
+- **Boot verified**: `Local OCR ready (tesseract.js) — whitelist=62 chars, min-conf=60%, TrueCaptcha=fallback` in ~1 second.
+- **Total tests: 19/19 pass** + boot smoke test OK.
+
 ## Implemented (2026-02 — v3.16 CRITICAL per-window state clearing)
 - **REAL root cause of "restart fixes it" myth**: `ctx.submitted` (Set of successfully-saved SapOrderIds) was initialised once at bot start and NEVER cleared. Every subsequent window filtered out those orders via `seenSubmitted.has(key)` inside `buildBatches`. When SAP re-listed a previously-saved order in a fresh bidding round, the bot showed `matched=0` even though the order was clearly present. User restarted → fresh in-memory Set → order became matchable → SAVED. This is exactly what happened in the 18:15 IST log the user shared:
   - Bot ran since ~18:01 → likely saved order `1153419533` (RAJMAHAL) in the 17:45 window → added to `ctx.submitted`
