@@ -25,6 +25,7 @@ logs/
 # User CSVs (bidding rules are private business data)
 files/input2.csv
 files/delete.csv
+files/priority.csv
 
 # Reference / scratch
 reference/

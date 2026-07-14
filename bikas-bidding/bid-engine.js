@@ -78,6 +78,16 @@ const TOKEN_FILE  = path.join(ROOT, 'token.txt');
 const FILES_DIR   = path.join(ROOT, 'files');
 const INPUT_CSV   = path.join(FILES_DIR, 'input2.csv');
 const DELETE_CSV  = path.join(FILES_DIR, 'delete.csv');
+const PRIORITY_CSV = path.join(FILES_DIR, 'priority.csv');
+
+// Priority COF Order IDs (Vbeln) — matched orders whose Vbeln is in this
+// set are pushed to the FRONT of the bid plan, so they get submitted before
+// any non-priority order in the same window. Sources are merged:
+//   1) files/priority.csv           — one Vbeln per line (or CSV column "Vbeln"/"COF Order ID")
+//   2) PRIORITY_VBELNS env var      — comma-separated Vbelns
+// Reloaded once per :15/:45 window boundary so user can edit priority.csv
+// mid-run without restarting the bot.
+const PRIORITY_VBELNS_ENV = process.env.PRIORITY_VBELNS || '';
 
 // ---- Undici pools ----------------------------------------------------------
 
@@ -624,6 +634,57 @@ function isCustomerBlacklisted(order, blacklist) {
   return blacklist.some((b) => names.some((n) => n === b || n.includes(b) || b.includes(n)));
 }
 
+// ---- Priority (COF Order ID / Vbeln) list ----------------------------------
+//
+// Returns a Set<string> of priority Vbelns (COF Order IDs) merged from:
+//   • files/priority.csv       — one Vbeln per line, OR CSV with a column
+//                                 named "Vbeln" / "COF Order ID" / "OrderId"
+//   • PRIORITY_VBELNS env var  — comma-separated Vbelns
+// Blank lines, whitespace, comment lines (starting with #) and headers are
+// ignored. Vbelns are normalised via `String(v).trim()` — SAP's Vbeln field
+// is a numeric string (10 chars), so string equality is safe and O(1).
+function loadPriorityVbelns() {
+  const set = new Set();
+  // 1) File source
+  try {
+    if (fs.existsSync(PRIORITY_CSV)) {
+      const raw = fs.readFileSync(PRIORITY_CSV, 'utf8');
+      const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+      // Detect header row (contains letters). If header present, extract Vbeln column.
+      const hdrIdx = lines.findIndex((l) => /[A-Za-z]/.test(l) && !/^#/.test(l));
+      let vbelnCol = -1;
+      if (hdrIdx === 0) {
+        const cols = lines[0].split(',').map((c) => c.trim().toLowerCase());
+        vbelnCol = cols.findIndex((c) => c === 'vbeln' || c === 'cof order id' || c === 'coforderid' || c === 'orderid' || c === 'order id');
+      }
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (line.startsWith('#')) continue;
+        if (i === 0 && hdrIdx === 0) continue; // skip header
+        // If line has commas + header had a Vbeln column, extract that column;
+        // otherwise treat the entire line as a Vbeln.
+        let val;
+        if (vbelnCol >= 0 && line.includes(',')) {
+          val = (line.split(',')[vbelnCol] || '').trim();
+        } else {
+          val = line.split(',')[0].trim(); // first column if CSV without header
+        }
+        if (val) set.add(String(val));
+      }
+    }
+  } catch (e) {
+    log.warn(`priority.csv read failed: ${e.message}`);
+  }
+  // 2) Env source
+  if (PRIORITY_VBELNS_ENV) {
+    for (const v of PRIORITY_VBELNS_ENV.split(',')) {
+      const t = v.trim();
+      if (t) set.add(t);
+    }
+  }
+  return set;
+}
+
 // ---- SAP calls -------------------------------------------------------------
 
 async function fetchLiveOrders(auth) {
@@ -1000,10 +1061,11 @@ function parseMinFloor(text) {
 
 // ---- Batcher --------------------------------------------------------------
 
-function buildBatches(orders, rules, blacklist, seenSubmitted, inFlight, cooldown, sessionCount = 1) {
+function buildBatches(orders, rules, blacklist, seenSubmitted, inFlight, cooldown, sessionCount = 1, priorityVbelns = null) {
   const now = Date.now();
   const byClub = new Map();
-  const stats = { total: orders.length, matched: 0, blacklisted: 0, noRule: 0, clubDropped: 0, coolskip: 0 };
+  const stats = { total: orders.length, matched: 0, blacklisted: 0, noRule: 0, clubDropped: 0, coolskip: 0, priority: 0 };
+  const priSet = priorityVbelns instanceof Set ? priorityVbelns : new Set();
 
   // Pre-sort rule cities: longest first → "KRISHNANAGAR - STO" wins over "KRISHNANAGAR"
   const ruleCitiesByLen = Array.from(rules.keys()).sort((a, b) => b.length - a.length);
@@ -1026,6 +1088,16 @@ function buildBatches(orders, rules, blacklist, seenSubmitted, inFlight, cooldow
   const singles = [];
   const clubGroups = [];
 
+  // Helper: is this order a priority (COF Order ID / Vbeln in priorityVbelns)?
+  const isPriorityOrder = (o) => {
+    if (!priSet.size) return false;
+    const v = (o.Vbeln || o.CofOrderId || o.CofOrder || '').toString().trim();
+    if (v && priSet.has(v)) return true;
+    // Fallback: some SAP tenants expose the COF id under SapOrderId itself.
+    const sid = (o.SapOrderId || '').toString().trim();
+    return Boolean(sid && priSet.has(sid));
+  };
+
   for (const [club, members] of byClub.entries()) {
     if (!club) {
       for (const o of members) {
@@ -1033,23 +1105,28 @@ function buildBatches(orders, rules, blacklist, seenSubmitted, inFlight, cooldow
         const m = matchOrder(o, rules, ruleCitiesByLen);
         if (!m) { stats.noRule++; continue; }
         stats.matched++;
-        singles.push({ order: o, amount: m.amount, city: m.matchedCity, spi: m.matchedSpi });
+        const priority = isPriorityOrder(o);
+        if (priority) stats.priority++;
+        singles.push({ order: o, amount: m.amount, city: m.matchedCity, spi: m.matchedSpi, priority });
       }
     } else {
       const items = [];
       let drop = false;
+      let clubPriority = false;
       for (const o of members) {
         if (isCustomerBlacklisted(o, blacklist)) { drop = true; break; }
         const m = matchOrder(o, rules, ruleCitiesByLen);
         if (!m) { drop = true; break; }
+        if (isPriorityOrder(o)) clubPriority = true;
         items.push({ order: o, amount: m.amount, city: m.matchedCity, spi: m.matchedSpi });
       }
       if (drop) stats.clubDropped++;
       else if (items.length) {
         stats.matched += items.length;
+        if (clubPriority) stats.priority += items.length;
         // clubs also split at BATCH_SIZE (SAP hard-limit 3 per submit)
         for (let i = 0; i < items.length; i += BATCH_SIZE) {
-          clubGroups.push({ clubId: club, bids: items.slice(i, i + BATCH_SIZE) });
+          clubGroups.push({ clubId: club, bids: items.slice(i, i + BATCH_SIZE), priority: clubPriority });
         }
       }
     }
@@ -1063,19 +1140,38 @@ function buildBatches(orders, rules, blacklist, seenSubmitted, inFlight, cooldow
   // Restore the original pack-3-into-one behaviour so 3 singles = 1 SAP call.
   //
   // Order in the plan:
-  //   1) Singles chunked by BATCH_SIZE (default 3)
-  //   2) Club-id groups (already chunked by BATCH_SIZE upstream)
+  //   1) PRIORITY singles chunked by BATCH_SIZE (default 3)   ← v3.19
+  //   2) Non-priority singles chunked by BATCH_SIZE
+  //   3) PRIORITY club-id groups (already chunked upstream)   ← v3.19
+  //   4) Non-priority club-id groups
   const effectiveBatchSize = BATCH_SIZE;
 
-  const singleBatches = [];
-  for (let i = 0; i < singles.length; i += effectiveBatchSize) {
-    singleBatches.push(singles.slice(i, i + effectiveBatchSize));
-  }
+  // Stable partition: preserve original discovery order within each bucket.
+  // (Priority Vbelns must go FIRST so they're hitting SAP within the first
+  //  ~300 ms of the window; but we don't reshuffle among priority items.)
+  const singlesPriority    = singles.filter((s) => s.priority);
+  const singlesNonPriority = singles.filter((s) => !s.priority);
+  const clubsPriority      = clubGroups.filter((c) => c.priority);
+  const clubsNonPriority   = clubGroups.filter((c) => !c.priority);
 
-  // Order: singles first, then clubs
+  const packSingles = (arr) => {
+    const out = [];
+    for (let i = 0; i < arr.length; i += effectiveBatchSize) {
+      out.push(arr.slice(i, i + effectiveBatchSize));
+    }
+    return out;
+  };
+  const singleBatchesP = packSingles(singlesPriority);
+  const singleBatchesN = packSingles(singlesNonPriority);
+
+  // Order: priority-singles → priority-clubs → non-priority-singles → non-priority-clubs
+  // Rationale: within priority tier, singles still pack-3 per SAP call (fewest
+  // calls = fastest); then priority clubs; then everything else.
   const plan = [];
-  for (const b of singleBatches) plan.push({ kind: 'single', bids: b });
-  for (const c of clubGroups)    plan.push({ kind: 'club',   bids: c.bids, clubId: c.clubId });
+  for (const b of singleBatchesP) plan.push({ kind: 'single', bids: b, priority: true });
+  for (const c of clubsPriority)  plan.push({ kind: 'club',   bids: c.bids, clubId: c.clubId, priority: true });
+  for (const b of singleBatchesN) plan.push({ kind: 'single', bids: b, priority: false });
+  for (const c of clubsNonPriority) plan.push({ kind: 'club', bids: c.bids, clubId: c.clubId, priority: false });
 
   return { plan, stats, effectiveBatchSize };
 }
@@ -1528,7 +1624,7 @@ async function tick(ctx) {
 
     const { plan, stats, effectiveBatchSize } = buildBatches(
       orders, ctx.rules, ctx.blacklist, ctx.submitted, ctx.inFlight, ctx.cooldown,
-      ctx.sessions.length
+      ctx.sessions.length, ctx.priorityVbelns
     );
     if (stats.matched === 0) {
       // Hot-window but nothing matched yet — could mean SAP populated a few
@@ -1559,10 +1655,11 @@ async function tick(ctx) {
     // Throttle the scan log: it repeats identically for every scan while
     // waiting for the captcha to appear. Log only when the plan changes or
     // every ~5s so log stays readable.
-    const planSig = `${stats.matched}/${plan.length}`;
+    const planSig = `${stats.matched}/${plan.length}/${stats.priority}`;
     if (ctx._lastPlanSig !== planSig || (ctx.scan - (ctx._lastPlanLoggedScan || 0)) * POLL_MS > 5000) {
+      const priTag = stats.priority ? ` priority=${stats.priority}★` : '';
       log.info(
-        `Scan #${ctx.scan} | orders=${stats.total} matched=${stats.matched} bl=${stats.blacklisted} ` +
+        `Scan #${ctx.scan} | orders=${stats.total} matched=${stats.matched}${priTag} bl=${stats.blacklisted} ` +
         `no-rule=${stats.noRule} club-drop=${stats.clubDropped} cool=${stats.coolskip} | ` +
         `plan=[batches=${plan.length}×${effectiveBatchSize || BATCH_SIZE}, sessions=${ctx.sessions.length}]` +
         (canReuseOrders ? ' [cached-orders]' : '')
@@ -1692,8 +1789,16 @@ async function main() {
   for (const list of rules.values()) totalRules += list.length;
   log.info(`Loaded ${rules.size} cities (${totalRules} rule rows), ${blacklist.length} blacklisted customers`);
 
+  const priorityVbelns = loadPriorityVbelns();
+  if (priorityVbelns.size) {
+    const sample = Array.from(priorityVbelns).slice(0, 5).join(', ');
+    log.info(`⭐ PRIORITY loaded: ${priorityVbelns.size} Vbelns will be bid FIRST (sample: ${sample}${priorityVbelns.size > 5 ? ', …' : ''})`);
+  } else {
+    log.info(`⭐ PRIORITY list empty — add COF Order IDs to files/priority.csv (one per line) or PRIORITY_VBELNS env to bid them first.`);
+  }
+
   const ctx = {
-    sessions, rules, blacklist,
+    sessions, rules, blacklist, priorityVbelns,
     scan: 0,
     submitted: new Map(),  // Map<sapOrderId, submitTimestamp> — timestamp lets us
                             // preserve pre-warm-window submissions when the delayed
@@ -1787,6 +1892,16 @@ async function main() {
       const clearedUc  = ctx.undercutAttempts.size;
       ctx.undercutAttempts.clear();
       ctx._cachedOrders = null; // force fresh order fetch for new window
+      // Reload priority Vbelns so user can edit files/priority.csv mid-run
+      // without restarting the bot. Only diff-log if it changed.
+      const beforeSize = ctx.priorityVbelns ? ctx.priorityVbelns.size : 0;
+      const beforeKey  = ctx.priorityVbelns ? Array.from(ctx.priorityVbelns).sort().join(',') : '';
+      ctx.priorityVbelns = loadPriorityVbelns();
+      const afterKey = Array.from(ctx.priorityVbelns).sort().join(',');
+      if (afterKey !== beforeKey) {
+        const sample = Array.from(ctx.priorityVbelns).slice(0, 5).join(', ');
+        log.info(`⭐ PRIORITY reloaded: ${beforeSize}→${ctx.priorityVbelns.size} Vbelns (sample: ${sample || 'none'})`);
+      }
       log.info(`🕒 :15/:45 window BOUNDARY reached — cleared stale per-window state (submitted=${clearedSub}, cooldown=${clearedCd}, undercut=${clearedUc}, kept fresh=${ctx.submitted.size}). Bot polling for SAP captcha unlock.`);
     }
 

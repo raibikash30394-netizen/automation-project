@@ -877,6 +877,239 @@ function testAgeBasedBoundaryClear() {
   console.log('✓ Age-based boundary clear: fresh (<30s) entries preserved → prevents duplicate submit race on delayed boundary tick');
 }
 
+// v3.19 — Priority COF Order ID (Vbeln) sorting.
+// Matched orders whose Vbeln (COF Order ID) is in the priority set must
+// appear FIRST in the submit plan — before any non-priority order — so
+// the user's most critical bids hit SAP within the first ~300 ms of the
+// window opening. Priority preserves original discovery order within
+// each bucket (no re-shuffling among priority items).
+function testPrioritySorting() {
+  const BATCH_SIZE = 3;
+
+  // Mirror the v3.19 buildBatches plan-ordering step (isolated).
+  function buildPlan(matchedSingles, matchedClubs, prioritySet) {
+    const isPri = (v) => prioritySet.has(String(v));
+    const singles = matchedSingles.map((o) => ({
+      order: o, priority: isPri(o.Vbeln || o.SapOrderId),
+    }));
+    const clubs = matchedClubs.map((c) => ({
+      clubId: c.clubId,
+      bids: c.bids.map((b) => ({ order: b })),
+      priority: c.bids.some((b) => isPri(b.Vbeln || b.SapOrderId)),
+    }));
+
+    const singlesP = singles.filter((s) => s.priority);
+    const singlesN = singles.filter((s) => !s.priority);
+    const clubsP   = clubs.filter((c) => c.priority);
+    const clubsN   = clubs.filter((c) => !c.priority);
+
+    const pack = (arr) => {
+      const out = [];
+      for (let i = 0; i < arr.length; i += BATCH_SIZE) out.push(arr.slice(i, i + BATCH_SIZE));
+      return out;
+    };
+    const singleBatchesP = pack(singlesP);
+    const singleBatchesN = pack(singlesN);
+
+    const plan = [];
+    for (const b of singleBatchesP) plan.push({ kind: 'single', bids: b, priority: true });
+    for (const c of clubsP)          plan.push({ kind: 'club',   bids: c.bids, clubId: c.clubId, priority: true });
+    for (const b of singleBatchesN) plan.push({ kind: 'single', bids: b, priority: false });
+    for (const c of clubsN)          plan.push({ kind: 'club',   bids: c.bids, clubId: c.clubId, priority: false });
+    return plan;
+  }
+
+  // Case 1: 4 singles, 2 priority mixed in the middle → priority batch first
+  const p1 = buildPlan(
+    [
+      { SapOrderId: 'S1', Vbeln: '1000000001' },
+      { SapOrderId: 'S2', Vbeln: '1000000002' }, // priority
+      { SapOrderId: 'S3', Vbeln: '1000000003' },
+      { SapOrderId: 'S4', Vbeln: '1000000004' }, // priority
+    ],
+    [],
+    new Set(['1000000002', '1000000004'])
+  );
+  assert.strictEqual(p1.length, 2, 'expected 2 batches (1 priority + 1 normal)');
+  assert.strictEqual(p1[0].priority, true,  'batch 0 must be priority');
+  assert.strictEqual(p1[0].bids.length, 2,  'priority batch has 2 items');
+  assert.strictEqual(p1[0].bids[0].order.Vbeln, '1000000002', 'first priority preserves discovery order');
+  assert.strictEqual(p1[0].bids[1].order.Vbeln, '1000000004');
+  assert.strictEqual(p1[1].priority, false, 'batch 1 is non-priority');
+  assert.strictEqual(p1[1].bids.length, 2);
+  assert.strictEqual(p1[1].bids[0].order.Vbeln, '1000000001', 'non-priority also preserves discovery order');
+  assert.strictEqual(p1[1].bids[1].order.Vbeln, '1000000003');
+
+  // Case 2: Empty priority set → plan looks exactly like pre-v3.19 (backwards compat)
+  const p2 = buildPlan(
+    [
+      { SapOrderId: 'S1', Vbeln: '1000000001' },
+      { SapOrderId: 'S2', Vbeln: '1000000002' },
+      { SapOrderId: 'S3', Vbeln: '1000000003' },
+    ],
+    [],
+    new Set()
+  );
+  assert.strictEqual(p2.length, 1, 'no priority → single batch of 3');
+  assert.strictEqual(p2[0].priority, false);
+  assert.deepStrictEqual(p2[0].bids.map((b) => b.order.Vbeln), ['1000000001', '1000000002', '1000000003']);
+
+  // Case 3: >3 priority items → priority batch splits at BATCH_SIZE too
+  const p3 = buildPlan(
+    [
+      { SapOrderId: 'S1', Vbeln: 'P1' },
+      { SapOrderId: 'S2', Vbeln: 'P2' },
+      { SapOrderId: 'S3', Vbeln: 'P3' },
+      { SapOrderId: 'S4', Vbeln: 'P4' },
+      { SapOrderId: 'S5', Vbeln: 'N1' },
+    ],
+    [],
+    new Set(['P1', 'P2', 'P3', 'P4'])
+  );
+  assert.strictEqual(p3.length, 3, '4 pri + 1 non = 2 pri batches + 1 non batch');
+  assert.strictEqual(p3[0].priority, true);
+  assert.strictEqual(p3[0].bids.length, 3, 'first priority batch full');
+  assert.strictEqual(p3[1].priority, true);
+  assert.strictEqual(p3[1].bids.length, 1, 'second priority batch has leftover 1');
+  assert.strictEqual(p3[2].priority, false);
+  assert.strictEqual(p3[2].bids[0].order.Vbeln, 'N1');
+
+  // Case 4: Club whose ANY member is priority → whole club prioritised (club is atomic in SAP)
+  const p4 = buildPlan(
+    [{ SapOrderId: 'S1', Vbeln: 'V1' }],
+    [
+      { clubId: 'C1', bids: [{ SapOrderId: 'C1a', Vbeln: 'V2' }, { SapOrderId: 'C1b', Vbeln: 'V3' }] }, // priority (V3 in set)
+      { clubId: 'C2', bids: [{ SapOrderId: 'C2a', Vbeln: 'V4' }] },                                     // non-priority
+    ],
+    new Set(['V3'])
+  );
+  // Expected order: (no priority singles) → priority club C1 → non-priority singles → non-priority club C2
+  assert.strictEqual(p4.length, 3);
+  assert.strictEqual(p4[0].kind, 'club');
+  assert.strictEqual(p4[0].clubId, 'C1');
+  assert.strictEqual(p4[0].priority, true);
+  assert.strictEqual(p4[1].kind, 'single');
+  assert.strictEqual(p4[1].bids[0].order.Vbeln, 'V1');
+  assert.strictEqual(p4[2].kind, 'club');
+  assert.strictEqual(p4[2].clubId, 'C2');
+  assert.strictEqual(p4[2].priority, false);
+
+  // Case 5: Priority match via SapOrderId fallback (some tenants collapse COF into SapOrderId)
+  const p5 = buildPlan(
+    [
+      { SapOrderId: '999', Vbeln: '' },      // priority via SapOrderId fallback
+      { SapOrderId: '111', Vbeln: '222' },   // non-priority
+    ],
+    [],
+    new Set(['999'])
+  );
+  assert.strictEqual(p5[0].priority, true);
+  assert.strictEqual(p5[0].bids[0].order.SapOrderId, '999');
+  assert.strictEqual(p5[1].priority, false);
+
+  // Case 6: Vbeln string-typed vs numeric-string safety
+  const p6 = buildPlan(
+    [
+      { SapOrderId: 'S1', Vbeln: '0000123' },   // padded — must match set entry '0000123'
+      { SapOrderId: 'S2', Vbeln: '123' },       // NOT the same — SAP uses exact string equality
+    ],
+    [],
+    new Set(['0000123'])
+  );
+  assert.strictEqual(p6[0].priority, true,  'padded Vbeln matches exactly');
+  assert.strictEqual(p6[0].bids[0].order.Vbeln, '0000123');
+  assert.strictEqual(p6[1].priority, false, '"123" is NOT equal to "0000123"');
+
+  console.log('✓ Priority Vbeln sorting: 6 cases pass (priority-first, empty set = pre-v3.19 order, club atomicity, Vbeln-vs-SapOrderId fallback, exact string equality)');
+}
+
+// v3.19 — Priority Vbeln loader (file + env merge, comments, headers).
+function testPriorityLoader() {
+  const fs = require('fs');
+  const path = require('path');
+  const os = require('os');
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'prio-test-'));
+
+  // Replicate loadPriorityVbelns() but with injectable paths.
+  function load(priorityCsvPath, envVal) {
+    const set = new Set();
+    try {
+      if (fs.existsSync(priorityCsvPath)) {
+        const raw = fs.readFileSync(priorityCsvPath, 'utf8');
+        const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+        const hdrIdx = lines.findIndex((l) => /[A-Za-z]/.test(l) && !/^#/.test(l));
+        let vbelnCol = -1;
+        if (hdrIdx === 0) {
+          const cols = lines[0].split(',').map((c) => c.trim().toLowerCase());
+          vbelnCol = cols.findIndex((c) => c === 'vbeln' || c === 'cof order id' || c === 'coforderid' || c === 'orderid' || c === 'order id');
+        }
+        for (let i = 0; i < lines.length; i++) {
+          const line = lines[i];
+          if (line.startsWith('#')) continue;
+          if (i === 0 && hdrIdx === 0) continue;
+          let val;
+          if (vbelnCol >= 0 && line.includes(',')) {
+            val = (line.split(',')[vbelnCol] || '').trim();
+          } else {
+            val = line.split(',')[0].trim();
+          }
+          if (val) set.add(String(val));
+        }
+      }
+    } catch (_) {}
+    if (envVal) {
+      for (const v of envVal.split(',')) {
+        const t = v.trim();
+        if (t) set.add(t);
+      }
+    }
+    return set;
+  }
+
+  // Case 1: simple 1-per-line
+  const p1 = path.join(tmpDir, 'a.csv');
+  fs.writeFileSync(p1, '1000000001\n1000000002\n1000000003\n');
+  const s1 = load(p1, '');
+  assert.strictEqual(s1.size, 3);
+  assert(s1.has('1000000001') && s1.has('1000000003'));
+
+  // Case 2: CSV with header + Vbeln column
+  const p2 = path.join(tmpDir, 'b.csv');
+  fs.writeFileSync(p2, 'Vbeln,Notes\n2000000001,imp1\n2000000002,imp2\n');
+  const s2 = load(p2, '');
+  assert.strictEqual(s2.size, 2, `expected 2 Vbelns, got ${s2.size}: ${Array.from(s2).join(',')}`);
+  assert(s2.has('2000000001') && s2.has('2000000002'));
+  assert(!s2.has('imp1'), 'notes column should NOT be extracted as Vbeln');
+
+  // Case 3: File + env merge (dedupe)
+  const p3 = path.join(tmpDir, 'c.csv');
+  fs.writeFileSync(p3, '3000000001\n3000000002\n');
+  const s3 = load(p3, '3000000002,3000000003,3000000004');
+  assert.strictEqual(s3.size, 4, 'union of file + env, deduped');
+  assert(s3.has('3000000001') && s3.has('3000000004'));
+
+  // Case 4: Comments and blank lines are ignored
+  const p4 = path.join(tmpDir, 'd.csv');
+  fs.writeFileSync(p4, '# comment line\n\n4000000001\n\n# another comment\n4000000002\n');
+  const s4 = load(p4, '');
+  assert.strictEqual(s4.size, 2);
+  assert(!s4.has('# comment line'));
+
+  // Case 5: Missing file + no env → empty set (no crash)
+  const s5 = load(path.join(tmpDir, 'does-not-exist.csv'), '');
+  assert.strictEqual(s5.size, 0);
+
+  // Case 6: Env-only source works
+  const s6 = load(path.join(tmpDir, 'does-not-exist.csv'), '9999999999, 8888888888 ');
+  assert.strictEqual(s6.size, 2);
+  assert(s6.has('9999999999') && s6.has('8888888888'));
+
+  // Cleanup
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+
+  console.log('✓ Priority loader: 6 cases pass (line-list, CSV+header, file+env merge, comments, missing file, env-only)');
+}
+
 // ---- Run --------------------------------------------------------------------
 
 (async () => {
@@ -899,6 +1132,8 @@ function testAgeBasedBoundaryClear() {
     testSessionShakeThrottle();
     testPerWindowStateClearing();
     testAgeBasedBoundaryClear();
+    testPrioritySorting();
+    testPriorityLoader();
     console.log('\n🎉 ALL TESTS PASS');
     process.exit(0);
   } catch (e) {

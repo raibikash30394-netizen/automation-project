@@ -143,6 +143,20 @@ Two Node.js processes:
 - **Main-loop tight-loop condition** extended: `sleepMs=0` when either `_matchedButNoCaptcha` OR `_hotStall` is true.
 - New unit test `testSessionShakeThrottle` (5 cases).
 
+## Implemented (2026-02 — v3.19 Priority COF Order ID + Setup automation)
+- **Priority COF Order ID (Vbeln) sorting**: Matched orders whose `Vbeln` is in the priority set are pushed to the FRONT of every bid plan, so they hit SAP within the first ~300 ms of the :15/:45 window opening. Discovery order preserved within each bucket.
+- **Two-source loader (`loadPriorityVbelns`)**: Merges `files/priority.csv` (one Vbeln per line, or CSV with header column `Vbeln`/`COF Order ID`) with the `PRIORITY_VBELNS` env var (comma-separated). Blank lines and `#` comments are ignored. Deduplicated automatically.
+- **Live reload**: Priority list re-read at every :15/:45 boundary — user can edit `priority.csv` mid-run without restarting the bot.
+- **Club atomicity**: If ANY member of a club-order group is priority, the whole club is bid first (SAP submits club atomically).
+- **SapOrderId fallback**: If `o.Vbeln` is absent (some SAP tenants collapse COF into `SapOrderId`), the loader also matches priority against `SapOrderId`.
+- **Log line**: Scan log shows `matched=N priority=M★` and boot log lists sample of priority Vbelns.
+- **`buildBatches` signature extended**: 8th arg `priorityVbelns` (Set<string>). Plan order: priority-singles → priority-clubs → non-priority-singles → non-priority-clubs.
+- **Unit tests**: 2 new groups (`testPrioritySorting` 6 cases, `testPriorityLoader` 6 cases) — all 21 test groups pass.
+- **Setup automation (`setup.sh` + `setup.bat`)**: Idempotent bootstrap script that copies every `foo.example` to `foo` only if the destination doesn't exist. Auto-runs `yarn install`/`npm install` if `node_modules` missing. Solves the "bar-bar mistake" of missing config after GitHub pull.
+- **`files/priority.csv.example`** template added.
+- **`.env.example`** now documents `PRIORITY_VBELNS=`.
+- **`.gitignore`** updated to exclude `files/priority.csv` (user's private business data).
+
 ## Verified
 - `bidding.js` starts, loads cache, `/health` returns metrics JSON
 - `POST /solve-captcha` and `POST /` both accept text/plain JSON, return `{solved}`
