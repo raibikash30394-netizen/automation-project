@@ -205,6 +205,23 @@ function isHotWindow() {
   return false;
 }
 
+/**
+ * Format a human-friendly "how long until / how long past the :15/:45 boundary"
+ * message. Pre-warm phase (last 30 s before boundary) shows "Ns BEFORE next
+ * :15/:45 opens" so the user doesn't see a huge "1774s past" number that
+ * really refers to the PREVIOUS boundary.
+ */
+function boundaryStatusText() {
+  const untilNextSec = Math.round(msUntilNextWindow() / 1000);
+  const { minute, second } = getISTNow();
+  const inPreWarm = (minute === 14 || minute === 44) && second >= 30;
+  if (inPreWarm || untilNextSec < 60) {
+    return `~${untilNextSec}s BEFORE next :15/:45 window opens (pre-warm phase)`;
+  }
+  const secsPast = 30 * 60 - untilNextSec;
+  return `~${secsPast}s past :15/:45 boundary`;
+}
+
 // ---- Auth (cookie + CSRF token) --------------------------------------------
 
 /**
@@ -746,12 +763,7 @@ async function nextCaptcha(auth) {
   // exact moment so we can measure detection latency (window-open → detect).
   if (r.solved && !globalThis.__firstCaptchaAt) {
     globalThis.__firstCaptchaAt = Date.now();
-    const untilNext = msUntilNextWindow();
-    // Windows are 30 min apart. If we're inside a window (msUntilNextWindow
-    // is close to 30 min), we can approximate the actual window-open time
-    // and compute the gap in seconds/ms.
-    const secsPast = 30 * 60 - Math.round(untilNext / 1000);
-    log.info(`⚡ First non-empty captcha detected [${auth.id}] — window open! (~${secsPast}s past :15/:45 boundary)`);
+    log.info(`⚡ First non-empty captcha detected [${auth.id}] — window open! (${boundaryStatusText()})`);
   }
   // Attach the base64 image to the result so callers can invalidate the cache
   // entry later if SAP rejects the solve with "Wrong Captcha".
@@ -1084,8 +1096,7 @@ function makeWorkerPool(ctx) {
       const now = Date.now();
       if (isHotWindow() && (!globalThis.__lastWaitLog || now - globalThis.__lastWaitLog > 10_000)) {
         globalThis.__lastWaitLog = now;
-        const secsPast = 30 * 60 - Math.round(msUntilNextWindow() / 1000);
-        log.info(`[${workerId}] ⏳ waiting for SAP to unlock captcha… ~${secsPast}s past :15/:45 boundary (bot is polling, SAP is late — do NOT restart, will catch as soon as SAP responds)`);
+        log.info(`[${workerId}] ⏳ waiting for SAP to unlock captcha… ${boundaryStatusText()} (bot is polling, SAP is late — do NOT restart, will catch as soon as SAP responds)`);
       } else if (!isHotWindow() && ctx.scan % Math.max(1, Math.round(10_000 / Math.max(POLL_MS, 1))) === 0) {
         log.warn(`[${workerId}] SAP returned empty captcha (bid window likely closed) — polling next scan`);
       }
@@ -1473,8 +1484,7 @@ async function tick(ctx) {
         const now = Date.now();
         if (!globalThis.__lastWaitLog || now - globalThis.__lastWaitLog > 10_000) {
           globalThis.__lastWaitLog = now;
-          const secsPast = 30 * 60 - Math.round(msUntilNextWindow() / 1000);
-          log.info(`⏳ waiting for SAP to populate order list… ~${secsPast}s past :15/:45 boundary (bot is polling tight, SAP is late — do NOT restart)`);
+          log.info(`⏳ waiting for SAP to populate order list… ${boundaryStatusText()} (bot is polling tight, SAP is late — do NOT restart)`);
         }
         return;
       }
@@ -1513,9 +1523,8 @@ async function tick(ctx) {
         const now = Date.now();
         if (!globalThis.__lastWaitLog || now - globalThis.__lastWaitLog > 10_000) {
           globalThis.__lastWaitLog = now;
-          const secsPast = 30 * 60 - Math.round(msUntilNextWindow() / 1000);
           const alreadySubmitted = ctx.submitted.size;
-          log.info(`⏳ waiting for matched orders to appear (${stats.total} live: bl=${stats.blacklisted} no-rule=${stats.noRule} club-drop=${stats.clubDropped} cool=${stats.coolskip} sub-this-window=${alreadySubmitted} → 0 matched)… ~${secsPast}s past :15/:45 boundary (bot polling tight, session-shake active — do NOT restart)`);
+          log.info(`⏳ waiting for matched orders to appear (${stats.total} live: bl=${stats.blacklisted} no-rule=${stats.noRule} club-drop=${stats.clubDropped} cool=${stats.coolskip} sub-this-window=${alreadySubmitted} → 0 matched)… ${boundaryStatusText()} (bot polling tight, session-shake active — do NOT restart)`);
         }
         return;
       }
@@ -1634,8 +1643,7 @@ function maybeShakeSession(ctx, reason) {
   const now = Date.now();
   if (globalThis.__lastSessionShake && now - globalThis.__lastSessionShake < 15_000) return;
   globalThis.__lastSessionShake = now;
-  const secsPast = 30 * 60 - Math.round(msUntilNextWindow() / 1000);
-  log.info(`🔄 session-shake (${reason}) — refreshing CSRF on ${ctx.sessions.length} session(s) at ~${secsPast}s past boundary`);
+  log.info(`🔄 session-shake (${reason}) — refreshing CSRF on ${ctx.sessions.length} session(s) at ${boundaryStatusText()}`);
   Promise.all(ctx.sessions.map((s) => s.refreshToken().catch(() => {}))).catch(() => {});
 }
 
