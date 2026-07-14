@@ -48,7 +48,7 @@ const CAPTCHA_ORIGIN = new URL(CAPTCHA_URL).origin;
 const CAPTCHA_PATH   = new URL(CAPTCHA_URL).pathname || '/';
 const VENDOR_ID      = process.env.VENDOR_ID || '2207936';
 const PLANT_CODE     = process.env.PLANT_CODE || '6924';
-const POLL_MS        = parseInt(process.env.POLL_MS || '20', 10);
+const POLL_MS        = parseInt(process.env.POLL_MS || '5', 10);
 const BATCH_SIZE     = parseInt(process.env.BATCH_SIZE || '3', 10);
 const PARALLEL_BATCHES = parseInt(process.env.PARALLEL_BATCHES || '4', 10);
 

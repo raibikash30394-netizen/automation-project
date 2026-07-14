@@ -57,7 +57,27 @@ Two Node.js processes:
 - New unit test `testEmptyOrdersInHotWindow` (6 cases).
 - **Total tests: 16/16 pass**.
 
-## Implemented (2026-02 — v3.18 speed + DNS + verified cache)
+## Implemented (2026-02 — v3.19 GitHub setup templates + POLL_MS default)
+
+### Problem discovered from user's 07:44 IST log
+- User pulled fresh code from GitHub → boot log showed `Config: POLL_MS=20` (not the v3.18's `POLL_MS=5`) → user's local `.env` was stale (GitHub had old default too).
+- User complained: "GitHub se download kiya toh data file aur creds file missing hain" — because our security audit v3.16 correctly untracked `creds.json`, `data.json`, `cookie.txt` from git → they don't exist after a fresh clone.
+- Repeat cycle: user pulls → files missing → tries to run → fails → asks for fix.
+
+### Fix — 4 template files + code default + README
+- **`creds.json.example`** — placeholder JSON with `userid` + `apikey` fields.
+- **`cookie.txt.example`** — one-line placeholder for browser cookie.
+- **`data.json.example`** — empty array `[]` (cache seeds itself as bot runs).
+- **`.env.example`** — regenerated to match current `.env`: `POLL_MS=5`, `LOCAL_OCR_ENABLED=true`, `L1_UNDERCUT=true`, etc.
+- **Code default**: `parseInt(process.env.POLL_MS || '5', 10)` (was `'20'`) — even if user's local `.env` is stale, bot polls tight by default.
+- **README** — new "First-time setup (after cloning from GitHub)" section with 5-step guide: `cp .env.example .env` etc. Explains WHY these files are gitignored (security).
+
+### From log analysis (not a bug — informational)
+- `Config: POLL_MS=20 ... [metrics] uptime=300s | submits=0 | 15 live: bl=4 no-rule=11 club-drop=0 cool=0 sub-this-window=0 → 0 matched`
+- 15 live SAP orders, but ALL 15 were either blacklisted (4) or didn't match any of 224 CSV rules (11). Bot correctly did nothing.
+- **Not a code bug** — this was a genuine "SAP had no matched orders for user's rules in this window" situation. Bot's `sub-this-window=0` breakdown makes this clear.
+
+## Implemented (2026-02 — v3.18.4 revert cacheable-lookup)
 
 ### v3.18.1 — Verified cache completeness
 - User uploaded `data.json` + `cacheUploads.zip` for merging. Diff analysis:

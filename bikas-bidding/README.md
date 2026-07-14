@@ -29,7 +29,55 @@ Two Node.js processes:
 
 ---
 
-## Install
+## First-time setup (after cloning from GitHub)
+
+**Step 1 — Install dependencies:**
+```bash
+cd bikas-bidding
+yarn install
+```
+
+**Step 2 — Copy `.example` templates → real files:**
+```bash
+cp .env.example       .env
+cp creds.json.example creds.json
+cp cookie.txt.example cookie.txt
+cp data.json.example  data.json    # empty cache — fills up as bot runs
+```
+
+**Step 3 — Fill in your real values:**
+
+| File                    | What to put inside                                             |
+|-------------------------|----------------------------------------------------------------|
+| `creds.json`            | `{"userid":"your@email.com","apikey":"YOUR_TRUECAPTCHA_KEY"}` (get from https://apitruecaptcha.org/) |
+| `cookie.txt`            | Raw browser Cookie header from your logged-in SAP session (F12 → Network → any request → Request Headers → Cookie) |
+| `files/input2.csv`      | Your bidding rules — columns: `City Code Descriptio`, `Special Process Indi`, `BIDING AMMOUNT` |
+| `files/delete.csv`      | Customer blacklist — one column: `Customer` |
+| `.env`                  | Usually no changes needed. `VENDOR_ID` + `PLANT_CODE` if different from defaults. |
+
+**Step 4 — Optional: TrueCaptcha rotation.** If you're reusing an existing account, get a fresh API key from the TrueCaptcha dashboard and paste it into `creds.json` (the old key may have been leaked via prior git commits).
+
+**Step 5 — Run** (see below).
+
+### Files NOT tracked in git (security — you must supply/keep local)
+
+```
+.env             # your config
+creds.json       # TrueCaptcha secret
+cookie.txt       # SAP session token
+data.json        # captcha cache (grows over time)
+token.txt        # auto-managed CSRF token
+logs/            # daily-rotating logs
+tessdata/        # tesseract.js downloaded language model (~15MB)
+files/input2.csv # bidding rules (private business data)
+files/delete.csv # blacklist
+```
+
+`token.txt` is auto-created on first successful run — leave it out entirely.
+
+---
+
+## Install (legacy quick-start)
 
 ```bash
 cd /app/bikas-bidding
