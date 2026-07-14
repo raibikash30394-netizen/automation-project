@@ -222,6 +222,20 @@ function boundaryStatusText() {
   return `~${secsPast}s past :15/:45 boundary`;
 }
 
+/**
+ * Remove entries from a Map<key, timestampMs> whose value (timestamp) is
+ * older than `thresholdMs`. Returns the number of entries removed. Used at
+ * :15/:45 boundary crossover to age-out per-window state without wiping
+ * entries that were just added inside the boundary-crossing tick.
+ */
+function clearOlderThan(map, thresholdMs) {
+  let removed = 0;
+  for (const [k, ts] of map) {
+    if (ts < thresholdMs) { map.delete(k); removed++; }
+  }
+  return removed;
+}
+
 // ---- Auth (cookie + CSRF token) --------------------------------------------
 
 /**
@@ -1215,7 +1229,7 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
       : '';
     log.info(`[${workerId}] ✓ ACCEPTED (${item.kind}, ${bids.length}) in ${result.submitMs}ms: ${result.text || 'OK'}${rankStr}`);
     for (const b of item.bids) {
-      ctx.submitted.add(String(b.order.SapOrderId));
+      ctx.submitted.set(String(b.order.SapOrderId), Date.now());
       const hint = (result.rankHints || []).find((h) => h.sapOrderId === String(b.order.SapOrderId));
       const rankMsg = hint
         ? `rank=${hint.rank || '?'} L1=${hint.l1Amt || '?'} submitted=${hint.savedAmt || '?'} | ${result.text || 'OK'}`
@@ -1349,7 +1363,7 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
         `city="${b.city}" spi="${b.spi}" csv=${b.amount} ` +
         `(SAP floor ≥ ${minFloor}). Update input2.csv and re-run.`
       );
-      ctx.submitted.add(String(b.order.SapOrderId));
+      ctx.submitted.set(String(b.order.SapOrderId), Date.now());
       bidLogRow(b, 'RATE_TOO_LOW', `floor=${minFloor}`);
     }
     return { retry: false };
@@ -1365,7 +1379,7 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
           `city="${b.city}" spi="${b.spi}" csv=${b.amount} ` +
           `(SAP wants ≤ ${suggested}). Update input2.csv and re-run.`
         );
-        ctx.submitted.add(String(b.order.SapOrderId));
+        ctx.submitted.set(String(b.order.SapOrderId), Date.now());
         bidLogRow(b, 'RATE_HIGH', `reduce_by=${reduceBy}`);
       }
       return { retry: false };
@@ -1374,7 +1388,7 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
     const attempt = (ctx.adjustAttempts.get(key) || 0) + 1;
     if (attempt > MAX_ADJUST_RETRIES) {
       log.error(`[${workerId}] ✗ Gave up after ${MAX_ADJUST_RETRIES} auto-adjust retries`);
-      for (const b of item.bids) ctx.submitted.add(String(b.order.SapOrderId));
+      for (const b of item.bids) ctx.submitted.set(String(b.order.SapOrderId), Date.now());
       ctx.adjustAttempts.delete(key);
       return { retry: false };
     }
@@ -1406,7 +1420,7 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
     metrics.submitsOk++;
     log.info(`[${workerId}] ✓ ACCEPTED (${item.kind}, ${bids.length}) in ${result.submitMs}ms: HTTP ${result.statusCode} (empty confirmation = silent save)`);
     for (const b of item.bids) {
-      ctx.submitted.add(String(b.order.SapOrderId));
+      ctx.submitted.set(String(b.order.SapOrderId), Date.now());
       bidLog.write({
         session: workerId, sap_order_id: b.order.SapOrderId, city: b.city, spi: b.spi,
         csv_rate: b.amount, submit_ms: result.submitMs, status: 'ACCEPTED_EMPTY_201',
@@ -1426,7 +1440,7 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
     metrics.submitsRejected++;
     log.error(`[${workerId}] ✗ Rejected: ${result.text || '(no text)'}`);
     for (const b of item.bids) {
-      ctx.submitted.add(String(b.order.SapOrderId));
+      ctx.submitted.set(String(b.order.SapOrderId), Date.now());
       bidLogRow(b, 'REJECTED', result.text || '');
     }
     return { retry: false };
@@ -1435,7 +1449,7 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
   // Unknown → mark done to avoid hot-loop
   log.warn(`[${workerId}] Unknown response info='${result.info}' status=${result.statusCode} — marking done`);
   for (const b of item.bids) {
-    ctx.submitted.add(String(b.order.SapOrderId));
+    ctx.submitted.set(String(b.order.SapOrderId), Date.now());
     bidLogRow(b, 'UNKNOWN', `info=${result.info} status=${result.statusCode}`);
   }
   return { retry: false };
@@ -1675,7 +1689,9 @@ async function main() {
   const ctx = {
     sessions, rules, blacklist,
     scan: 0,
-    submitted: new Set(),
+    submitted: new Map(),  // Map<sapOrderId, submitTimestamp> — timestamp lets us
+                            // preserve pre-warm-window submissions when the delayed
+                            // boundary-clear tick runs a few seconds after boundary.
     inFlight:  new Set(),
     cooldown:  new Map(),
     adjustAttempts: new Map(),
@@ -1722,24 +1738,32 @@ async function main() {
     // hasn't unlocked yet — so they don't panic-restart.
     if (hot && untilNext > (29 * 60_000) && Date.now() - lastBoundaryLogAt > 60_000) {
       lastBoundaryLogAt = Date.now();
-      globalThis.__firstCaptchaAt = 0; // reset so first-captcha log fires per window
+      // Only reset __firstCaptchaAt if it happened LONG ago (previous window).
+      // If we already detected the first captcha within the last 30 s (i.e.
+      // during pre-warm of the just-opened window), keep it so we don't
+      // log "First non-empty captcha detected" twice for the same window.
+      if (!globalThis.__firstCaptchaAt || Date.now() - globalThis.__firstCaptchaAt > 30_000) {
+        globalThis.__firstCaptchaAt = 0;
+      }
       globalThis.__lastWaitLog = 0;    // reset waiting log timer
       globalThis.__lastSessionShake = 0; // allow immediate session-shake on new window
       globalThis.__postSaveVerified = false; // allow post-save verify per window
-      // *** v3.16 CRITICAL FIX ***
-      // Clear per-window state so orders that were successfully submitted in
-      // PREVIOUS windows become eligible again if SAP re-lists them for a
-      // fresh bidding round. Before this fix, ctx.submitted grew forever →
-      // repeat orders showed matched=0 in every subsequent window, and only
-      // a bot restart (which built a fresh in-memory Set) rescued them.
-      const clearedSub = ctx.submitted.size;
-      const clearedCd  = ctx.cooldown.size;
+      // *** v3.17 FIX for delayed-boundary race ***
+      // When the main loop is blocked inside a tick() (submitting a bid) as
+      // the clock crosses :15:00 / :45:00, the boundary block below fires a
+      // few seconds LATE. If we then `.clear()` submitted entries, we wipe
+      // the *just-submitted* order → next tick sees it as fresh → duplicate
+      // submit at same amount. Fix: only remove entries older than 30 s.
+      // Windows are 30 min apart, so any entry ≤30 s old must belong to the
+      // current (just-opened) window; anything older is from a previous one.
+      const RECENT_MS = 30_000;
+      const now = Date.now();
+      const clearedSub = clearOlderThan(ctx.submitted, now - RECENT_MS);
+      const clearedCd  = clearOlderThan(ctx.cooldown,  now - RECENT_MS);
       const clearedUc  = ctx.undercutAttempts.size;
-      ctx.submitted.clear();
-      ctx.cooldown.clear();
       ctx.undercutAttempts.clear();
       ctx._cachedOrders = null; // force fresh order fetch for new window
-      log.info(`🕒 :15/:45 window BOUNDARY reached — cleared per-window state (submitted=${clearedSub}, cooldown=${clearedCd}, undercut=${clearedUc}). Bot polling for SAP captcha unlock. SAP may take 1-60s to actually generate the captcha for this window.`);
+      log.info(`🕒 :15/:45 window BOUNDARY reached — cleared stale per-window state (submitted=${clearedSub}, cooldown=${clearedCd}, undercut=${clearedUc}, kept fresh=${ctx.submitted.size}). Bot polling for SAP captcha unlock.`);
     }
 
     await tick(ctx);

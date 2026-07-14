@@ -838,6 +838,45 @@ function testPerWindowStateClearing() {
   console.log('✓ Per-window state clearing: submitted+cooldown+undercut cleared at :15/:45 boundary — re-bid on repeated orders works without process restart');
 }
 
+// v3.17 — Age-based selective boundary clear (fixes duplicate-submit race).
+// When the main loop is blocked inside tick() during boundary crossover,
+// the boundary block fires a few seconds late. If .clear() were called it
+// would wipe entries that were JUST submitted for the new window → dup.
+// Fix: clearOlderThan(map, now - 30s) keeps recent entries.
+function testAgeBasedBoundaryClear() {
+  const RECENT_MS = 30_000;
+  function clearOlderThan(map, thresholdMs) {
+    let removed = 0;
+    for (const [k, ts] of map) {
+      if (ts < thresholdMs) { map.delete(k); removed++; }
+    }
+    return removed;
+  }
+
+  const now = 10_000_000;
+  const map = new Map([
+    ['prevWindow1',  now - 60_000],      // 60s old → PREVIOUS window
+    ['prevWindow2',  now - 45_000],      // 45s old → PREVIOUS window
+    ['thisWindow1',  now - 5_000],       // 5s old → CURRENT window (pre-warm submit)
+    ['thisWindow2',  now - 500],         // 0.5s old → CURRENT window (just submitted)
+  ]);
+
+  const removed = clearOlderThan(map, now - RECENT_MS);
+  assert.strictEqual(removed, 2, 'exactly 2 stale entries removed');
+  assert.strictEqual(map.size, 2, '2 fresh entries preserved');
+  assert.strictEqual(map.has('thisWindow1'), true, 'pre-warm submit preserved (no duplicate)');
+  assert.strictEqual(map.has('thisWindow2'), true, 'just-submitted preserved (no duplicate)');
+  assert.strictEqual(map.has('prevWindow1'), false, 'previous window entry cleared');
+  assert.strictEqual(map.has('prevWindow2'), false, 'previous window entry cleared');
+
+  // Edge case: exactly at threshold (30s old) is preserved (uses strict <).
+  const edgeMap = new Map([['edge', now - 30_000]]);
+  clearOlderThan(edgeMap, now - RECENT_MS);
+  assert.strictEqual(edgeMap.size, 1, 'entry exactly 30s old is preserved (uses strict <)');
+
+  console.log('✓ Age-based boundary clear: fresh (<30s) entries preserved → prevents duplicate submit race on delayed boundary tick');
+}
+
 // ---- Run --------------------------------------------------------------------
 
 (async () => {
@@ -859,6 +898,7 @@ function testPerWindowStateClearing() {
     testEmptyOrdersInHotWindow();
     testSessionShakeThrottle();
     testPerWindowStateClearing();
+    testAgeBasedBoundaryClear();
     console.log('\n🎉 ALL TESTS PASS');
     process.exit(0);
   } catch (e) {
