@@ -66,9 +66,11 @@ Two Node.js processes:
   - **Cache is already 100% populated for the recurring SAP captcha set.**
 - Live logs confirm: `HIT QTTDb`, `HIT fish`, `HIT TEXR4Q` — TrueCaptcha never called, credits safe.
 
-### v3.18.2 — DNS caching via `cacheable-lookup`
-- New dep: `cacheable-lookup@6.1.0` — plugged into every undici Pool + global Agent via `connect.lookup`.
-- SAP hostname resolves ONCE (up to 5min cached) → saves 20-100ms on every fresh connection when TCP pool refills mid-window.
+### v3.18.2 — DNS caching via `cacheable-lookup` [REVERTED in v3.18.4]
+- Attempted `cacheable-lookup@6.1.0` plugged into every undici Pool + global Agent via `connect.lookup`.
+- **REVERTED**: On Windows Node.js, `cacheable-lookup` triggered `queryA EDESTRUCTION rise.eye2serve.com` errors immediately on every DNS query (known Node.js DNS resolver internal bug with cacheable-lookup + Windows).
+- OS-level DNS caching + undici keep-alive pool already handles this well — first request pays ~10-50ms lookup, subsequent requests reuse the persistent connection with zero DNS overhead.
+- Package uninstalled; only a code comment remains as a reminder.
 
 ### v3.18.3 — Aggressive polling + triple pre-warm
 - `POLL_MS`: 20 → **5 ms** (4× tighter detection loop). At the moment SAP unlocks the captcha, bot detects within 5ms max.
