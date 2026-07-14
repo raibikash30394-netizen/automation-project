@@ -57,6 +57,27 @@ Two Node.js processes:
 - New unit test `testEmptyOrdersInHotWindow` (6 cases).
 - **Total tests: 16/16 pass**.
 
+## Implemented (2026-02 — v3.18 speed + DNS + verified cache)
+
+### v3.18.1 — Verified cache completeness
+- User uploaded `data.json` + `cacheUploads.zip` for merging. Diff analysis:
+  - Existing app cache: 162 entries. Uploaded JSON: 162 entries. **NEW entries: 0** (files were identical).
+  - 162/162 PNG files' base64-sha256 correctly match the JSON hashes → cache hashing is consistent.
+  - **Cache is already 100% populated for the recurring SAP captcha set.**
+- Live logs confirm: `HIT QTTDb`, `HIT fish`, `HIT TEXR4Q` — TrueCaptcha never called, credits safe.
+
+### v3.18.2 — DNS caching via `cacheable-lookup`
+- New dep: `cacheable-lookup@6.1.0` — plugged into every undici Pool + global Agent via `connect.lookup`.
+- SAP hostname resolves ONCE (up to 5min cached) → saves 20-100ms on every fresh connection when TCP pool refills mid-window.
+
+### v3.18.3 — Aggressive polling + triple pre-warm
+- `POLL_MS`: 20 → **5 ms** (4× tighter detection loop). At the moment SAP unlocks the captcha, bot detects within 5ms max.
+- **Triple pre-warm**: NEW early-warm at 60s before boundary (DNS + TLS priming), existing 30s warm (CSRF + TLS), plus the 3s hot keep-warm during active window. Total 3 warm-up stages.
+- Log: `⏱ Early pre-warm (~55s away) — priming DNS + TLS` at t-60s, `⏱ Pre-warming for next SAP bid-window (~26s away…)` at t-30s.
+- Expected impact: another 100-300ms shaved off first-submit latency. On a hot window with SAP unlocking exactly at :15:00, bot should now hit at :15:00.150-0.300 ms vs :15:00.500 ms before.
+
+**Total tests: 19/19 pass**. Boot smoke test OK (both services green, DNS cache active, OCR ready, cache=162).
+
 ## Implemented (2026-02 — v3.17 duplicate-submit race fix + Local OCR primary)
 
 ### v3.17.1 — Duplicate-submit race at delayed boundary tick

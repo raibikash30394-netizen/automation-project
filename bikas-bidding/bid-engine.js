@@ -83,11 +83,25 @@ const DELETE_CSV  = path.join(FILES_DIR, 'delete.csv');
 
 // Global dispatcher — everyone else in the process (default fetch etc.) will
 // also use these keep-alive connections.
+//
+// DNS caching (cacheable-lookup): SAP hostname is resolved ONCE and the IP is
+// cached for the process lifetime (up to TTL). Without this, undici would
+// call `dns.lookup()` on every fresh connection which can add 20-100ms per
+// request during pool refills. On a hot bid-window this can be the
+// difference between rank 1 and rank 3.
+const CacheableLookup = require('cacheable-lookup');
+const dnsCache = new CacheableLookup({
+  maxTtl: 300,           // cache DNS answers for up to 5 minutes
+  errorTtl: 5,           // retry NXDOMAIN quickly
+  lookup: false,         // do not fall back to c-ares system lookup — we want stable results
+});
+
 setGlobalDispatcher(new Agent({
   keepAliveTimeout: 30_000,
   keepAliveMaxTimeout: 60_000,
   connectTimeout: 5_000,
   connections: 32,
+  connect: { lookup: dnsCache.lookup.bind(dnsCache) },
 }));
 
 const sapPool = new Pool(SAP_ORIGIN, {
@@ -96,6 +110,7 @@ const sapPool = new Pool(SAP_ORIGIN, {
   keepAliveTimeout: 60_000,
   headersTimeout: 15_000,
   bodyTimeout: 15_000,
+  connect: { lookup: dnsCache.lookup.bind(dnsCache) },
   // Note: HTTP/2 (allowH2: true) was tried but SAP's Web Dispatcher does not
   // support ALPN "h2" cleanly on this tenant — every request timed out with
   // "HeadersTimeoutError". Sticking to HTTP/1.1 + keep-alive which is proven.
@@ -107,6 +122,7 @@ const solverPool = new Pool(CAPTCHA_ORIGIN, {
   keepAliveTimeout: 30_000,
   headersTimeout: 20_000,
   bodyTimeout: 25_000,
+  connect: { lookup: dnsCache.lookup.bind(dnsCache) },
 });
 
 // ---- WAF back-off (exponential) --------------------------------------------
@@ -1718,10 +1734,28 @@ async function main() {
   //   • Whenever orders match but captcha is empty → tight loop regardless
   //     of clock (window may already be open).
   let lastPreWarmAt = 0;
+  let lastEarlyWarmAt = 0;
   let lastBoundaryLogAt = 0;
   while (true) {
     const untilNext = msUntilNextWindow();
     const hot = isHotWindow();
+
+    // v3.18: TRIPLE pre-warm — 60s (early DNS+TLS), 30s (CSRF), and passive
+    // keep-warm every 3s during hot. Multiple warm-ups ensure that if any
+    // connection dies between warms, the next one revives it before the
+    // window opens.
+    if (untilNext < 60_000 && untilNext > 30_000 && Date.now() - lastEarlyWarmAt > 120_000) {
+      lastEarlyWarmAt = Date.now();
+      log.info(`⏱  Early pre-warm (~${Math.round(untilNext / 1000)}s away) — priming DNS + TLS`);
+      // Fire-and-forget: touch SessionSet on every session to hydrate DNS+TLS.
+      for (const s of ctx.sessions) {
+        sapPool.request({
+          path: `${SAP_PATH_PFX}/SessionSet('')`,
+          method: 'GET',
+          headers: s.headers({ 'x-csrf-token': 'Fetch' }),
+        }).then((r) => r.body.dump()).catch(() => {});
+      }
+    }
 
     // Pre-warm CSRF + TLS ~30s before each window. Runs once per window.
     if (untilNext < 30_000 && Date.now() - lastPreWarmAt > 60_000) {

@@ -13,6 +13,7 @@
     "dev:engine": "node bid-engine.js | pino-pretty -c -t 'SYS:HH:MM:ss'"
   },
   "dependencies": {
+    "cacheable-lookup": "6",
     "csv-parser": "^3.0.0",
     "dotenv": "^17.4.2",
     "express": "^4.19.2",
