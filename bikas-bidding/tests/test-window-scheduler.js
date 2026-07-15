@@ -1110,7 +1110,104 @@ function testPriorityLoader() {
   console.log('✓ Priority loader: 6 cases pass (line-list, CSV+header, file+env merge, comments, missing file, env-only)');
 }
 
-// v3.20 — Network-timeout retry (idempotent reads only).
+// v3.21 — Tie-rejection detection.
+// SAP returns Type='E' with Message="Saved Successfully" but Ev_Text reveals
+// another vendor already bid the same amount → bid NOT persisted (rank=0).
+// Prior code trusted Message and marked ACCEPTED → order added to submitted
+// set → never re-bid. Fix: check Ev_Text FIRST, override cosmetic Message.
+function testTieRejection() {
+  function classify(result) {
+    const textLower = (result.text || '').toString().toLowerCase();
+    const evText = (result.evText || '').toString();
+    const evTextLower = evText.toLowerCase();
+    const isTieRejected = /same\s+(avg\s+)?amount\s+has\s+been\s+bid\s+by\s+other\s+vendor/i.test(evTextLower);
+    const isSavedOk = /saved successfully|bid.*accepted|success/i.test(textLower);
+    const isRealSuccess = !isTieRejected && result.info !== 'E' && (
+      (result.info === 'S' && !/ended|closed|expired|invalid|error/i.test(textLower)) || isSavedOk
+    );
+    const isTimeEnded = /ended|closed|expired/i.test(textLower) && !isSavedOk;
+    const isWrongCaptcha = /captcha.*(fail|wrong|invalid)|worng\s*captcha/i.test(textLower);
+    if (isTieRejected) return 'REJECTED_TIE';
+    if (isRealSuccess) return 'ACCEPTED';
+    if (isWrongCaptcha) return 'WRONG_CAPTCHA';
+    if (isTimeEnded) return 'TIME_ENDED';
+    if ((result.statusCode === 200 || result.statusCode === 201) &&
+        !result.info && !result.text && !isTieRejected) return 'ACCEPTED_EMPTY_201';
+    if (result.info === 'I') return 'INFO_RETRY';
+    if (result.info === 'E') return 'REJECTED';
+    return 'UNKNOWN';
+  }
+
+  // Case 1: THE actual live-log case — info='E', Message="Saved" (misleading),
+  //         Ev_Text="Same amount has been bid...". Must classify as REJECTED_TIE.
+  assert.strictEqual(
+    classify({
+      statusCode: 201,
+      info: 'E',
+      text: 'Bidding Amount Saved Successfully.',
+      evText: 'Same amount has been bid by other vendor for order id : 5574818614 and posnr: 000101#',
+    }),
+    'REJECTED_TIE',
+    'info=E + tied Ev_Text must classify as REJECTED_TIE even when Message says "Saved"'
+  );
+
+  // Case 2: Club tie-rejection variant ("Same Avg amount has been bid...")
+  assert.strictEqual(
+    classify({
+      statusCode: 201,
+      info: 'E',
+      text: 'Bidding Amount Saved Successfully.',
+      evText: 'Same Avg amount has been bid by other vendor for Order : 5574771877 posnr : 000104#',
+    }),
+    'REJECTED_TIE',
+    'club-level tie ("Same Avg amount") also classifies as REJECTED_TIE'
+  );
+
+  // Case 3: Real success (info='S', empty Ev_Text) still classifies ACCEPTED
+  assert.strictEqual(
+    classify({
+      statusCode: 201,
+      info: 'S',
+      text: 'Bidding Amount Saved Successfully.',
+      evText: '',
+    }),
+    'ACCEPTED',
+    'genuine save (info=S, empty Ev_Text) still ACCEPTED'
+  );
+
+  // Case 4: Empty 201 (silent-save) unchanged
+  assert.strictEqual(
+    classify({ statusCode: 201, info: '', text: '', evText: '' }),
+    'ACCEPTED_EMPTY_201',
+    'empty 201 still classifies as silent save'
+  );
+
+  // Case 5: Wrong-captcha unchanged (info='I' + captcha text)
+  assert.strictEqual(
+    classify({
+      statusCode: 201,
+      info: 'I',
+      text: 'Captcha Validation Failed. Worng Captcha Value.',
+      evText: 'Captcha Validation Failed. Worng Captcha Value.',
+    }),
+    'WRONG_CAPTCHA',
+    'wrong-captcha detection still works (info=I, captcha text)'
+  );
+
+  // Case 6: Pure 'E' with a non-tie error message → generic REJECTED (unchanged path)
+  assert.strictEqual(
+    classify({
+      statusCode: 201,
+      info: 'E',
+      text: 'Rate should be reduced by Rs 50',
+      evText: 'Rate should be reduced by Rs 50',
+    }),
+    'REJECTED',
+    'non-tie E rejection still returns REJECTED'
+  );
+
+  console.log('✓ Tie-rejection detection: 6 cases pass (SAP\'s cosmetic "Saved" no longer masks Ev_Text real reject)');
+}
 // SAP's load-balancer silently closes idle keep-alive sockets after ~30s.
 // The next request on that socket bombs with HeadersTimeoutError / socket
 // hang up. sapRequest now retries idempotent reads (fetchLiveOrders,
@@ -1227,6 +1324,7 @@ async function testNetworkRetryOnIdempotent() {
     testAgeBasedBoundaryClear();
     testPrioritySorting();
     testPriorityLoader();
+    testTieRejection();
     await testNetworkRetryOnIdempotent();
     console.log('\n🎉 ALL TESTS PASS');
     process.exit(0);

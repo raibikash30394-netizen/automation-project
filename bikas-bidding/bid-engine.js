@@ -499,16 +499,24 @@ async function sapRequest(auth, { path: p, method = 'POST', body, timeoutMs = 50
       auth._deadCount = (auth._deadCount || 0) + 1;
       if (auth._deadCount >= AUTH_DEAD_THRESHOLD) {
         auth._deadUntil = Date.now() + AUTH_DEAD_COOLDOWN_MS;
-        log.error(
-          `🔒 COOKIE EXPIRED / SESSION KILLED for [${auth.id}] — SAP returns fresh CSRF but rejects every request.\n` +
-          `   → Log into SAP again in your browser, copy the FULL "Cookie" request header from DevTools → Network,\n` +
-          `   → Paste it into ${path.basename(auth.cookieFile)} (overwrite the whole file), delete ${path.basename(auth.tokenFile)},\n` +
-          `   → Then restart the bot (pm2 restart bid-engine).\n` +
-          `   ⏸  Pausing SAP requests for ${Math.round(AUTH_DEAD_COOLDOWN_MS / 1000)}s to avoid rate-limits.`
-        );
+        // v3.21 — Throttle the loud cookie-expired banner to once every 5 min.
+        // Prior to this, every 30s cooldown loop re-emitted the whole 4-line
+        // banner, flooding error.log with 100s of identical entries per hour.
+        const now = Date.now();
+        if (!auth._lastDeadWarnAt || (now - auth._lastDeadWarnAt) > 5 * 60_000) {
+          auth._lastDeadWarnAt = now;
+          log.error(
+            `🔒 COOKIE EXPIRED / SESSION KILLED for [${auth.id}] — SAP returns fresh CSRF but rejects every request.\n` +
+            `   → Log into SAP again in your browser, copy the FULL "Cookie" request header from DevTools → Network,\n` +
+            `   → Paste it into ${path.basename(auth.cookieFile)} (overwrite the whole file), delete ${path.basename(auth.tokenFile)},\n` +
+            `   → Then restart the bot (pm2 restart bid-engine).\n` +
+            `   ⏸  Pausing SAP requests for ${Math.round(AUTH_DEAD_COOLDOWN_MS / 1000)}s to avoid rate-limits. (This warning throttled — next in ≥5 min if still dead.)`
+          );
+        }
       }
     } else {
       auth._deadCount = 0; // recovered
+      auth._lastDeadWarnAt = 0; // reset so we banner again next time it dies
     }
   } else if (r.statusCode >= 200 && r.statusCode < 400) {
     auth._deadCount = 0; // any success clears the dead counter
@@ -1332,9 +1340,30 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
 
   const textLower = (result.text || '').toString().toLowerCase();
   const evText    = (result.raw?.d?.Ev_Text || '').toString();
+  const evTextLower = evText.toLowerCase();
+
+  // v3.21 CRITICAL FIX — Tie-rejection detection.
+  //
+  // SAP has a nasty pattern: when your bid ties with (or is beaten by) another
+  // vendor's already-submitted amount, it returns:
+  //     NavEBiddingMessage.Type    = "E"
+  //     NavEBiddingMessage.Message = "Bidding Amount Saved Successfully."   ← misleading!
+  //     Ev_Text                    = "Same amount has been bid by other vendor
+  //                                    for order id : X and posnr : Y"
+  //     BiddingRank in track hint  = "0"                                     ← not saved
+  //
+  // Previously we saw "Saved Successfully" in Message → marked ACCEPTED →
+  // added to submitted set → order was NEVER re-bid → "beech beech me save
+  // nahi le raha" (user's report). Now: check Ev_Text FIRST for the real
+  // rejection signal, override any misleading Message.
+  const isTieRejected = /same\s+(avg\s+)?amount\s+has\s+been\s+bid\s+by\s+other\s+vendor/i.test(evTextLower);
 
   const isSavedOk      = /saved successfully|bid.*accepted|success/i.test(textLower);
-  const isRealSuccess  = (result.info === 'S' && !/ended|closed|expired|invalid|error/i.test(textLower)) || isSavedOk;
+  // isRealSuccess must NOT trigger when SAP flags Type='E' with a tie-reject
+  // Ev_Text — even if Message cosmetically says "Saved Successfully".
+  const isRealSuccess  = !isTieRejected && result.info !== 'E' && (
+    (result.info === 'S' && !/ended|closed|expired|invalid|error/i.test(textLower)) || isSavedOk
+  );
   const isTimeEnded    = /ended|closed|expired/i.test(textLower) && !isSavedOk;
   const isWrongCaptcha = /captcha.*(fail|wrong|invalid)|worng\s*captcha/i.test(textLower);
   const reduceBy       = parseReduceAmount(evText || result.text);
@@ -1559,6 +1588,52 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
     log.warn(`[${workerId}] ↻ Info-level rejection: ${result.text} — retry next scan`);
     for (const b of item.bids) bidLogRow(b, 'INFO_RETRY', result.text || '');
     return { retry: true };
+  }
+
+  // v3.21 — Tie-rejection: SAP says "Saved" cosmetically but Ev_Text reveals
+  // another vendor bid the same amount first. Bid is NOT persisted.
+  // Strategy: do NOT add to `submitted` (so next scan re-picks the order),
+  // apply a short 3s cooldown to avoid burst-retry, and — if L1_UNDERCUT is
+  // enabled — pre-seed an undercut attempt so the next submit uses a lower
+  // amount instead of the same colliding value.
+  if (isTieRejected) {
+    metrics.submitsRejected++;
+    // Parse the specific order IDs SAP mentions in Ev_Text so user sees which
+    // ones tied (rest of the batch may still have persisted — but SAP's atomic
+    // batch semantics say the whole submit is either accepted or not, so we
+    // treat the entire batch as rejected).
+    const tiedIds = (evText.match(/order\s*(?:id)?\s*:\s*(\d+)/gi) || [])
+      .map((m) => m.replace(/[^\d]/g, ''))
+      .join(', ') || item.bids.map((b) => b.order.SapOrderId).join(', ');
+    const cd = 3_000;
+    const retryAt = Date.now() + cd;
+    log.warn(
+      `[${workerId}] ✗ TIE-REJECTED (${item.kind}, ${bids.length}) — another vendor bid same amount first. ` +
+      `SAP said "Saved" cosmetically but Ev_Text = "${evText.trim()}" (BiddingRank=0 confirms not saved). ` +
+      `Tied orders: [${tiedIds}]. Will retry with lower amount in ${cd}ms.`
+    );
+    for (const b of item.bids) {
+      // DO NOT add to submitted — the next scan should re-pick this order.
+      ctx.cooldown.set(String(b.order.SapOrderId), retryAt);
+      // Pre-seed undercut counter so if L1_UNDERCUT flow runs, it knows
+      // the base amount was already "L1" (same as ours) and undercuts by
+      // L1_UNDERCUT_STEP on the next submit.
+      if (L1_UNDERCUT) {
+        const prev = ctx.undercutAttempts.get(String(b.order.SapOrderId)) || 0;
+        // Only bump if we haven't already crossed max — this preserves the
+        // existing max-attempts safety without over-bidding.
+        if (prev < L1_UNDERCUT_MAX_ATTEMPTS) {
+          // Reduce the amount immediately for the next scan's re-bid.
+          const newAmount = +(b.amount - L1_UNDERCUT_STEP).toFixed(2);
+          if (newAmount > 0) {
+            b.amount = newAmount; // mutate the reusable bid entry (harmless — order re-matched next scan)
+          }
+          ctx.undercutAttempts.set(String(b.order.SapOrderId), prev + 1);
+        }
+      }
+      bidLogRow(b, 'REJECTED_TIE', evText.trim() || 'Same amount already bid by other vendor');
+    }
+    return { retry: false };
   }
 
   if (result.info === 'E') {

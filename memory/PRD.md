@@ -165,6 +165,23 @@ User's live log showed sporadic `HeadersTimeoutError` between windows (SAP LB si
 - **Tick-level log improved**: throttled to once per 10s (was every 20th scan — could suppress error bursts entirely). Log line now shows `X tick-fails, Y silent auto-retries so far` so user can see the health at a glance.
 - **New unit test `testNetworkRetryOnIdempotent`** (4 cases): retry recovers, retry disabled honours flag, both-fail propagates, non-network errors are NEVER retried. All 22 test groups pass.
 
+## Implemented (2026-02 — v3.21 CRITICAL: Tie-rejection detection)
+Root cause identified from user's `submit-responses.jsonl` — SAP's misleading response protocol was causing rejected bids to be marked ACCEPTED:
+```
+Ev_Text: "Same amount has been bid by other vendor for order id: 5574818614 ..."
+NavEBiddingMessage.Type    = "E"     ← real signal: rejected
+NavEBiddingMessage.Message = "Bidding Amount Saved Successfully."   ← misleading!
+BiddingRank (track hint)   = "0"     ← confirms not saved
+```
+Prior code trusted the cosmetic "Saved Successfully" text, marked the bid as ACCEPTED, and added the order to `submitted` set → order was **never re-bid** in that window. This was the mysterious "beech beech me save nahi le raha" user was seeing.
+
+- **`isTieRejected`** detection: regex-matches `Ev_Text` for `"same (avg )?amount has been bid by other vendor"` — the two live-log rejection patterns (single-order and club-order variants).
+- **`isRealSuccess`** now requires `!isTieRejected && info !== 'E'` in addition to the message text check. Prevents cosmetic "Saved" from masking real Ev_Text reject.
+- **New REJECTED_TIE handler**: does NOT add order to `submitted` (so next scan re-picks), sets 3s cooldown, and — if `L1_UNDERCUT` is enabled — decrements the bid amount by `L1_UNDERCUT_STEP` and increments the undercut counter so the next submit uses a lower value. Logs the tied Vbeln IDs parsed from Ev_Text.
+- **Cookie-expired log throttled** to once every 5 min per session (was flooding error.log with 100+ identical banners per hour when cookie was dead).
+- **New unit test `testTieRejection`** (6 cases) covering the actual live-log Ev_Text patterns.
+- **All 23 test groups pass** ✅.
+
 ## Verified
 - `bidding.js` starts, loads cache, `/health` returns metrics JSON
 - `POST /solve-captcha` and `POST /` both accept text/plain JSON, return `{solved}`
