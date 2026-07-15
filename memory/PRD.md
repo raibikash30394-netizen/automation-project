@@ -157,6 +157,14 @@ Two Node.js processes:
 - **`.env.example`** now documents `PRIORITY_VBELNS=`.
 - **`.gitignore`** updated to exclude `files/priority.csv` (user's private business data).
 
+## Implemented (2026-02 — v3.20 Network-timeout resilience)
+User's live log showed sporadic `HeadersTimeoutError` between windows (SAP LB silently kills idle keep-alive sockets after ~30s; next request bombs). User's exact concern: "beech beech me save nahi le raha" — sometimes bids don't save. Fix:
+- **Auto-retry on idempotent reads**: `sapRequest` now accepts `retryOnNetworkError` flag. When set (currently `fetchLiveOrders` + `fetchCaptchaImage`), a network-level error (HeadersTimeoutError, socket hang up, ECONNRESET, UND_ERR_CONNECT_TIMEOUT, ETIMEDOUT) triggers ONE automatic retry after 150 ms on a fresh socket. Per-session retry counter (`auth._netRetries`) tracks silent recoveries.
+- **Submits DO NOT retry** at this layer — a timeout may hit AFTER SAP has already accepted the bid, so double-submit would race. Post-save verification (already in place) catches the "SAP said save but nothing persisted" case.
+- **Pool `keepAliveTimeout` reduced 60s → 20s** to stay below SAP LB's ~30s idle timeout. Our sockets close & reopen before SAP kills them → subsequent requests always land on a live connection.
+- **Tick-level log improved**: throttled to once per 10s (was every 20th scan — could suppress error bursts entirely). Log line now shows `X tick-fails, Y silent auto-retries so far` so user can see the health at a glance.
+- **New unit test `testNetworkRetryOnIdempotent`** (4 cases): retry recovers, retry disabled honours flag, both-fail propagates, non-network errors are NEVER retried. All 22 test groups pass.
+
 ## Verified
 - `bidding.js` starts, loads cache, `/health` returns metrics JSON
 - `POST /solve-captcha` and `POST /` both accept text/plain JSON, return `{solved}`

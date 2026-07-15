@@ -109,7 +109,12 @@ setGlobalDispatcher(new Agent({
 const sapPool = new Pool(SAP_ORIGIN, {
   connections: 32,
   pipelining: 1,
-  keepAliveTimeout: 60_000,
+  // keepAliveTimeout must be LOWER than SAP's LB idle timeout (~30s observed),
+  // otherwise we send on a socket that SAP already killed and get
+  // "HeadersTimeoutError" or "socket hang up" (v3.20 root cause). Setting to
+  // 20s gives us a safety margin: our socket is closed & reopened before SAP's
+  // LB timeout fires, so subsequent requests always land on a live connection.
+  keepAliveTimeout: 20_000,
   headersTimeout: 15_000,
   bodyTimeout: 15_000,
   // Note: HTTP/2 (allowH2: true) was tried but SAP's Web Dispatcher does not
@@ -450,7 +455,7 @@ const bidLog = (() => {
 const AUTH_DEAD_THRESHOLD = parseInt(process.env.AUTH_DEAD_THRESHOLD || '3', 10);
 const AUTH_DEAD_COOLDOWN_MS = parseInt(process.env.AUTH_DEAD_COOLDOWN_MS || '30000', 10);
 
-async function sapRequest(auth, { path: p, method = 'POST', body, timeoutMs = 5000 }) {
+async function sapRequest(auth, { path: p, method = 'POST', body, timeoutMs = 5000, retryOnNetworkError = false }) {
   const doOnce = () => sapPool.request({
     path: p,
     method,
@@ -459,17 +464,34 @@ async function sapRequest(auth, { path: p, method = 'POST', body, timeoutMs = 50
     headersTimeout: timeoutMs,
     bodyTimeout: timeoutMs,
   });
+  // Network-level retry wrapper. Only enabled for idempotent reads
+  // (BidOrderListSet, EbiddingCaptchaSet) — DO NOT retry submits at this
+  // layer since a HeadersTimeout may hit AFTER SAP already accepted the bid
+  // (post-save verification handles that case separately).
+  const NETWORK_ERR_RE = /HeadersTimeoutError|Headers Timeout|UND_ERR_CONNECT_TIMEOUT|UND_ERR_SOCKET|ETIMEDOUT|ECONNRESET|socket hang up|other side closed/i;
+  const doWithNetRetry = async () => {
+    try {
+      return await doOnce();
+    } catch (e) {
+      const msg = (e && e.message) || String(e);
+      if (!retryOnNetworkError || !NETWORK_ERR_RE.test(msg)) throw e;
+      // Brief backoff so the flaky socket has time to drop from the pool.
+      await new Promise((r) => setTimeout(r, 150));
+      auth._netRetries = (auth._netRetries || 0) + 1;
+      return await doOnce(); // second attempt on a fresh socket
+    }
+  };
   // If auth is currently marked dead, refuse to send until cool-off passes.
   if (auth._deadUntil && Date.now() < auth._deadUntil) {
     return { statusCode: 401, headers: {}, data: { _cookieDead: true, remainingMs: auth._deadUntil - Date.now() } };
   }
   if (!auth.token) await auth.refreshToken();
-  let r = await doOnce();
+  let r = await doWithNetRetry();
   const csrfHdr = (r.headers['x-csrf-token'] || '').toString().toLowerCase();
   if (r.statusCode === 403 && csrfHdr === 'required') {
     log.warn('CSRF rejected — refreshing token and retrying once.');
     await auth.refreshToken();
-    r = await doOnce();
+    r = await doWithNetRetry();
 
     // If retry ALSO comes back 403, the cookie itself is dead (not the token).
     // Track consecutive dead-cookie failures per auth.
@@ -730,6 +752,7 @@ async function fetchLiveOrders(auth) {
     method: 'POST',
     body: payload,
     timeoutMs: 5000,
+    retryOnNetworkError: true,  // idempotent read — safe to retry on socket timeout
   });
 
   if (res.statusCode !== 200 && res.statusCode !== 201) {
@@ -760,7 +783,7 @@ let _firstCaptchaDumped = false;
 async function fetchCaptchaImage(auth) {
   if (wafActive()) return { img: null, reason: 'waf' };
   const p = `${SAP_PATH_PFX}/EbiddingCaptchaSet(Vendor='${VENDOR_ID}',Plant='${PLANT_CODE}')`;
-  const res = await sapRequest(auth, { path: p, method: 'GET', timeoutMs: 4000 });
+  const res = await sapRequest(auth, { path: p, method: 'GET', timeoutMs: 4000, retryOnNetworkError: true });
   if (res.statusCode === 406 || (typeof res.data === 'string' && /Not Acceptable|<!DOCTYPE html>/i.test(res.data.slice(0, 200)))) {
     markWaf('EbiddingCaptchaSet HTTP 406');
     return { img: null, reason: 'waf-406' };
@@ -1682,11 +1705,21 @@ async function tick(ctx) {
     }
   } catch (e) {
     // Transient network timeouts (HeadersTimeoutError / UND_ERR_CONNECT_TIMEOUT)
-    // are common during long idle windows and are self-healing on the next
-    // scan — log as warn, not error, so log noise stays low.
+    // are common during long idle periods when SAP's LB kills our idle keep-alive
+    // socket. Since v3.20 sapRequest already retries these ONCE automatically for
+    // idempotent reads (fetchLiveOrders / fetchCaptchaImage) — so if the exception
+    // STILL bubbles up here, both attempts failed. Throttle logs to once per 10s
+    // and include how many auto-retries happened so user can see the health.
     const msg = e && e.message ? e.message : String(e);
-    if (/HeadersTimeoutError|Headers Timeout|UND_ERR_CONNECT_TIMEOUT|ETIMEDOUT|ECONNRESET|socket hang up/i.test(msg)) {
-      if (ctx.scan % 20 === 0) log.warn(`tick #${ctx.scan}: transient network error (${msg}) — will retry`);
+    const NETWORK_ERR_RE = /HeadersTimeoutError|Headers Timeout|UND_ERR_CONNECT_TIMEOUT|UND_ERR_SOCKET|ETIMEDOUT|ECONNRESET|socket hang up|other side closed/i;
+    if (NETWORK_ERR_RE.test(msg)) {
+      const now = Date.now();
+      ctx._netErrCount = (ctx._netErrCount || 0) + 1;
+      if (!ctx._netErrLastLog || (now - ctx._netErrLastLog) > 10_000) {
+        const totalRetries = ctx.sessions.reduce((a, s) => a + (s._netRetries || 0), 0);
+        log.warn(`tick #${ctx.scan}: network timeout (${msg}) — auto-retried but failed both times. Total: ${ctx._netErrCount} tick-fails, ${totalRetries} silent auto-retries so far.`);
+        ctx._netErrLastLog = now;
+      }
     } else {
       log.error({ err: msg, stack: e.stack }, 'tick failed');
     }

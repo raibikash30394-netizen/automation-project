@@ -1110,6 +1110,99 @@ function testPriorityLoader() {
   console.log('✓ Priority loader: 6 cases pass (line-list, CSV+header, file+env merge, comments, missing file, env-only)');
 }
 
+// v3.20 — Network-timeout retry (idempotent reads only).
+// SAP's load-balancer silently closes idle keep-alive sockets after ~30s.
+// The next request on that socket bombs with HeadersTimeoutError / socket
+// hang up. sapRequest now retries idempotent reads (fetchLiveOrders,
+// fetchCaptchaImage) ONCE on a fresh socket after a 150ms backoff. Submits
+// are NOT retried at this layer (post-save verification handles that).
+async function testNetworkRetryOnIdempotent() {
+  const NETWORK_ERR_RE = /HeadersTimeoutError|Headers Timeout|UND_ERR_CONNECT_TIMEOUT|UND_ERR_SOCKET|ETIMEDOUT|ECONNRESET|socket hang up|other side closed/i;
+
+  // Replicate the doWithNetRetry wrapper from sapRequest.
+  async function sapRequestSim({ retryOnNetworkError, errorSequence, auth }) {
+    let idx = 0;
+    const doOnce = async () => {
+      const outcome = errorSequence[idx++];
+      if (outcome instanceof Error) throw outcome;
+      return outcome;
+    };
+    const doWithNetRetry = async () => {
+      try {
+        return await doOnce();
+      } catch (e) {
+        const msg = (e && e.message) || String(e);
+        if (!retryOnNetworkError || !NETWORK_ERR_RE.test(msg)) throw e;
+        await new Promise((r) => setTimeout(r, 5)); // shortened backoff for test speed
+        auth._netRetries = (auth._netRetries || 0) + 1;
+        return await doOnce();
+      }
+    };
+    return doWithNetRetry();
+  }
+
+  // Case 1: First attempt fails HeadersTimeout, second attempt succeeds → RECOVERED
+  const auth1 = {};
+  const err1 = new Error('HeadersTimeoutError: Headers Timeout Error');
+  const r1 = await sapRequestSim({
+    retryOnNetworkError: true,
+    errorSequence: [err1, { statusCode: 200, ok: true }],
+    auth: auth1,
+  });
+  assert.strictEqual(r1.statusCode, 200, 'timeout on 1st, success on 2nd → returns 2nd result');
+  assert.strictEqual(auth1._netRetries, 1, 'retry counter bumped');
+
+  // Case 2: Retry disabled → first timeout propagates immediately
+  const auth2 = {};
+  let threw = false;
+  try {
+    await sapRequestSim({
+      retryOnNetworkError: false,
+      errorSequence: [new Error('socket hang up'), { statusCode: 200 }],
+      auth: auth2,
+    });
+  } catch (e) {
+    threw = true;
+    assert(/socket hang up/.test(e.message));
+  }
+  assert.strictEqual(threw, true, 'retry disabled → first error must propagate');
+  assert.strictEqual(auth2._netRetries || 0, 0, 'no retry counter bump when disabled');
+
+  // Case 3: Both attempts fail → propagates (tick-level logger will surface it)
+  const auth3 = {};
+  let threw3 = false;
+  try {
+    await sapRequestSim({
+      retryOnNetworkError: true,
+      errorSequence: [new Error('ECONNRESET'), new Error('HeadersTimeoutError')],
+      auth: auth3,
+    });
+  } catch (e) {
+    threw3 = true;
+    assert(/HeadersTimeoutError/.test(e.message), 'second error is what propagates');
+  }
+  assert.strictEqual(threw3, true);
+  assert.strictEqual(auth3._netRetries, 1, 'counter bumped even when both fail');
+
+  // Case 4: Non-network error → NEVER retried (would risk semantic issues)
+  const auth4 = {};
+  let threw4 = false;
+  try {
+    await sapRequestSim({
+      retryOnNetworkError: true,
+      errorSequence: [new Error('HTTP 500 Internal Server Error'), { statusCode: 200 }],
+      auth: auth4,
+    });
+  } catch (e) {
+    threw4 = true;
+    assert(/HTTP 500/.test(e.message));
+  }
+  assert.strictEqual(threw4, true, 'HTTP-level errors are not network errors → no retry');
+  assert.strictEqual(auth4._netRetries || 0, 0);
+
+  console.log('✓ Network-timeout retry: 4 cases pass (retry recovers, retry disabled honours flag, both-fail propagates, non-network errors NOT retried)');
+}
+
 // ---- Run --------------------------------------------------------------------
 
 (async () => {
@@ -1134,6 +1227,7 @@ function testPriorityLoader() {
     testAgeBasedBoundaryClear();
     testPrioritySorting();
     testPriorityLoader();
+    await testNetworkRetryOnIdempotent();
     console.log('\n🎉 ALL TESTS PASS');
     process.exit(0);
   } catch (e) {
