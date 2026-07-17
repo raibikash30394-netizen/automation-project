@@ -201,6 +201,26 @@ Both were timing out on BOTH the initial attempt AND the v3.20 retry. Fix:
 - **`.env.example`** documents all three knobs so user can tune based on their ISP/SAP latency profile
 - No behaviour change during hot windows — this only affects idle polling patience
 
+## Implemented (2026-02 — v3.24 CRITICAL: Ghost-save detection)
+Second silent-fail pattern discovered from user's 2026-07-17 15:45 window log. SAP returned:
+```
+Type: "S", Message: "Bidding Amount Saved Successfully.", Ev_Text: ""
+NavEBiddingTrackHis[0].ChangeNo   = "AAAAAAAAAAAAAAAAAAAAAA=="   ← empty base64 GUID
+NavEBiddingTrackHis[0].CreatedOn  = null                          ← no save timestamp
+NavEBiddingTrackHis[0].CreatedAt  = "PT00H00M00S"                 ← zero duration
+```
+Bot logged ACCEPTED + POST-SAVE OK (post-save refetch showed the optimistic amount echo), but the browser showed nothing — SAP's master DB never committed. User's "abhi browser me save nahi hua" report.
+
+- **`isGhostRecord`** per-hint flag computed at rankHints extraction:
+  - `changeNoEmpty = !changeNo || /^A+={0,2}$/.test(changeNo)`
+  - `timestampsGhost = createdOn === null && /^PT0+H0+M0+S$/i.test(createdAt)`
+- **`isGhostSaved`** (all-hints-ghost) added to classify logic — takes precedence over `isRealSuccess`.
+- **New REJECTED_GHOST branch**: does NOT mark `submitted`, sets 500ms cooldown, returns `retry: true` so the next scan re-picks and re-submits (before window closes).
+- **Log line** clearly states the diagnostic: `"SAP said 'Saved' (Type=S) but response contains ghost persistence markers: ChangeNo=empty, CreatedOn=null, CreatedAt=PT0S. No actual DB commit — browser will show nothing."`
+- **Partial-ghost safety**: If SOME hints are ghost and OTHERS aren't (mixed), we treat as ACCEPTED to avoid duplicate re-submits of the ones that did save. Only 100%-ghost responses trigger retry.
+- **Tie-rejection has priority**: If Ev_Text says "Same amount..." AND ghost markers present, still classify as REJECTED_TIE (Ev_Text is the strongest signal).
+- **New unit test `testGhostSaveDetection`** (6 cases). **All 24 test groups pass** ✅
+
 ## Verified
 - `bidding.js` starts, loads cache, `/health` returns metrics JSON
 - `POST /solve-captcha` and `POST /` both accept text/plain JSON, return `{solved}`

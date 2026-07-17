@@ -1208,6 +1208,139 @@ function testTieRejection() {
 
   console.log('✓ Tie-rejection detection: 6 cases pass (SAP\'s cosmetic "Saved" no longer masks Ev_Text real reject)');
 }
+
+// v3.24 — Ghost-save detection.
+// SAP occasionally returns Type=S "Saved Successfully" with empty Ev_Text,
+// but NavEBiddingTrackHis[] entries contain "ghost" persistence markers:
+//   ChangeNo   = "AAAAAAAAAAAAAAAAAAAAAA=="  (empty base64 GUID)
+//   CreatedOn  = null                         (no save timestamp)
+//   CreatedAt  = "PT00H00M00S"                (zero duration)
+// The API is lying — no DB commit occurred. Browser won't show the bid.
+// This is the "abhi browser me save nahi hua" case from user's live logs.
+function testGhostSaveDetection() {
+  function classify(result) {
+    const textLower = (result.text || '').toString().toLowerCase();
+    const evText = (result.evText || '').toString();
+    const evTextLower = evText.toLowerCase();
+    const isTieRejected = /same\s+(avg\s+)?amount\s+has\s+been\s+bid\s+by\s+other\s+vendor/i.test(evTextLower);
+    const ghostHints = (result.rankHints || []).filter((h) => h.isGhostRecord);
+    const isGhostSaved = ghostHints.length > 0 && ghostHints.length === (result.rankHints || []).length;
+    const isSavedOk = /saved successfully|bid.*accepted|success/i.test(textLower);
+    const isRealSuccess = !isTieRejected && !isGhostSaved && result.info !== 'E' && (
+      (result.info === 'S' && !/ended|closed|expired|invalid|error/i.test(textLower)) || isSavedOk
+    );
+    if (isTieRejected) return 'REJECTED_TIE';
+    if (isGhostSaved) return 'REJECTED_GHOST';
+    if (isRealSuccess) return 'ACCEPTED';
+    return 'UNKNOWN';
+  }
+
+  // Helper: build a rankHint with realistic fields.
+  function hint({ ghost, sapOrderId = '1153641429' }) {
+    if (ghost) {
+      return {
+        sapOrderId, rank: '0', savedAmt: '643.000', l1Amt: '', avgAmt: '643.000',
+        changeNo: 'AAAAAAAAAAAAAAAAAAAAAA==',
+        createdOn: null,
+        createdAt: 'PT00H00M00S',
+        isGhostRecord: true,
+      };
+    }
+    return {
+      sapOrderId, rank: '1', savedAmt: '643.000', l1Amt: '643.000', avgAmt: '643.000',
+      changeNo: 'x7Pf2K3H9j4L8N5M2R6V==',   // real base64 GUID
+      createdOn: '/Date(1784282700000)/',
+      createdAt: 'PT00H00M02S',
+      isGhostRecord: false,
+    };
+  }
+
+  // Case 1: THE actual live-log case — Type=S, empty Ev_Text, ChangeNo empty
+  // + CreatedOn null + CreatedAt PT0S → REJECTED_GHOST
+  assert.strictEqual(
+    classify({
+      statusCode: 201,
+      info: 'S',
+      text: 'Bidding Amount Saved Successfully.',
+      evText: '',
+      rankHints: [hint({ ghost: true })],
+    }),
+    'REJECTED_GHOST',
+    'ghost persistence markers must classify as REJECTED_GHOST despite Type=S'
+  );
+
+  // Case 2: Real successful save — non-empty ChangeNo + timestamps → ACCEPTED
+  assert.strictEqual(
+    classify({
+      statusCode: 201,
+      info: 'S',
+      text: 'Bidding Amount Saved Successfully.',
+      evText: '',
+      rankHints: [hint({ ghost: false })],
+    }),
+    'ACCEPTED',
+    'genuine save (real ChangeNo + timestamps) still ACCEPTED'
+  );
+
+  // Case 3: Mixed — some ghost, some real → NOT REJECTED_GHOST (partial saves
+  // rare but possible; err on the side of ACCEPTED so real ones aren\'t retried
+  // and duplicated).
+  assert.strictEqual(
+    classify({
+      statusCode: 201,
+      info: 'S',
+      text: 'Bidding Amount Saved Successfully.',
+      evText: '',
+      rankHints: [hint({ ghost: true, sapOrderId: 'A' }), hint({ ghost: false, sapOrderId: 'B' })],
+    }),
+    'ACCEPTED',
+    'partial ghost (some entries persist) → still ACCEPTED to avoid duplicate submit'
+  );
+
+  // Case 4: Empty rankHints (no track-his echoed) → NOT ghost (unknown, treat as ACCEPTED via prior logic)
+  assert.strictEqual(
+    classify({
+      statusCode: 201,
+      info: 'S',
+      text: 'Bidding Amount Saved Successfully.',
+      evText: '',
+      rankHints: [],
+    }),
+    'ACCEPTED',
+    'no rankHints (SAP didn\'t echo track-his) → still ACCEPTED (empty hints ≠ ghost)'
+  );
+
+  // Case 5: Tie-rejection takes precedence over ghost check
+  assert.strictEqual(
+    classify({
+      statusCode: 201,
+      info: 'E',
+      text: 'Bidding Amount Saved Successfully.',
+      evText: 'Same amount has been bid by other vendor for order id : 5574818614',
+      rankHints: [hint({ ghost: true })],
+    }),
+    'REJECTED_TIE',
+    'tie-rejection wins over ghost (Ev_Text is the strongest signal)'
+  );
+
+  // Case 6: Alternative empty ChangeNo variants (all-A padding differs by GUID length)
+  // Ensure regex catches 22-A, 22-A + "=", 22-A + "==", or purely empty.
+  const emptyChangeVariants = ['AAAAAAAAAAAAAAAAAAAAAA', 'AAAAAAAAAAAAAAAAAAAAAA=', 'AAAAAAAAAAAAAAAAAAAAAA==', ''];
+  for (const cn of emptyChangeVariants) {
+    const rh = hint({ ghost: false });
+    rh.changeNo = cn;
+    rh.createdOn = null;
+    rh.createdAt = 'PT00H00M00S';
+    rh.isGhostRecord = (!cn || /^A+={0,2}$/.test(cn)) && rh.createdOn === null && /^PT0+H0+M0+S$/i.test(rh.createdAt);
+    assert.strictEqual(
+      classify({ statusCode: 201, info: 'S', text: 'Bidding Amount Saved Successfully.', evText: '', rankHints: [rh] }),
+      'REJECTED_GHOST',
+      `variant ChangeNo="${cn}" should be detected as ghost`
+    );
+  }
+
+  console.log('✓ Ghost-save detection: 6 cases pass (ChangeNo/CreatedOn/CreatedAt ghost markers correctly flagged despite Type=S "Saved" text)');
+}
 // SAP's load-balancer silently closes idle keep-alive sockets after ~30s.
 // The next request on that socket bombs with HeadersTimeoutError / socket
 // hang up. sapRequest now retries idempotent reads (fetchLiveOrders,
@@ -1325,6 +1458,7 @@ async function testNetworkRetryOnIdempotent() {
     testPrioritySorting();
     testPriorityLoader();
     testTieRejection();
+    testGhostSaveDetection();
     await testNetworkRetryOnIdempotent();
     console.log('\n🎉 ALL TESTS PASS');
     process.exit(0);

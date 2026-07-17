@@ -1029,16 +1029,35 @@ async function submitBid(auth, bids, solvedCaptcha) {
 
   // Extract rank + L1 hints from the response if SAP echoed them back.
   // Different SAP tenants echo different keys — check the common ones.
+  // v3.24 — Also capture persistence signals (ChangeNo, CreatedOn, CreatedAt).
+  // A saved bid has: ChangeNo = real base64 GUID, CreatedOn = timestamp,
+  // CreatedAt = non-zero duration. A "silent-fail" bid has:
+  //   ChangeNo  = "AAAAAAAAAAAAAAAAAAAAAA=="  (empty base64, 22 A's + "==")
+  //   CreatedOn = null
+  //   CreatedAt = "PT00H00M00S"                (zero-duration ISO 8601)
+  // When SAP responds Type=S with these ghost markers, the write didn't
+  // actually commit to the master DB — order won't appear in the browser
+  // even though the API said "Saved Successfully".
   const rankHints = [];
   const trackHis = d?.NavEBiddingTrackHis?.results || [];
   if (Array.isArray(trackHis) && trackHis.length) {
     for (const t of trackHis) {
+      const changeNo   = (t.ChangeNo || '').toString();
+      const createdOn  = t.CreatedOn; // may be null, a "/Date(...)/" string, or a timestamp
+      const createdAt  = (t.CreatedAt || '').toString();
+      // ChangeNo = all-A's base64 (or empty) = no GUID assigned = no write.
+      const changeNoEmpty = !changeNo || /^A+={0,2}$/.test(changeNo);
+      // CreatedOn null AND CreatedAt = zero-duration = ghost record.
+      const timestampsGhost = (createdOn === null || createdOn === undefined) && /^PT0+H0+M0+S$/i.test(createdAt);
+      const isGhostRecord = changeNoEmpty && timestampsGhost;
       rankHints.push({
         sapOrderId: (t.SapOrderId || '').toString(),
         rank      : (t.BiddingRank || '').toString(),
         savedAmt  : (t.BiddingAmount || '').toString(),
         l1Amt     : (t.L1BidAmount || '').toString(),
         avgAmt    : (t.AvgWtBidAmount || '').toString(),
+        changeNo, createdOn, createdAt,
+        isGhostRecord,   // v3.24 silent-fail marker
       });
     }
   }
@@ -1366,10 +1385,30 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
   // rejection signal, override any misleading Message.
   const isTieRejected = /same\s+(avg\s+)?amount\s+has\s+been\s+bid\s+by\s+other\s+vendor/i.test(evTextLower);
 
+  // v3.24 CRITICAL FIX — Ghost-record detection.
+  //
+  // Second silent-fail pattern discovered from user's live logs (2026-07-17):
+  //     SAP responded Type=S, Message="Saved Successfully.", Ev_Text=""
+  //     ...but NavEBiddingTrackHis[0] had:
+  //       ChangeNo   = "AAAAAAAAAAAAAAAAAAAAAA=="  (empty base64, no GUID)
+  //       CreatedOn  = null                         (no timestamp)
+  //       CreatedAt  = "PT00H00M00S"                (zero duration)
+  //     Result: browser showed no bid ("browser me save nahi hua"), even
+  //     though bot logged ACCEPTED + POST-SAVE OK.
+  //
+  // A genuinely-saved bid has: ChangeNo = a real base64 GUID (~24 chars,
+  // NOT all A's), CreatedOn = a "/Date(<ms>)/" timestamp string, and
+  // CreatedAt = a non-zero ISO-8601 duration. When ALL persistence markers
+  // are ghosts, the write did NOT commit — treat as silent rejection so
+  // the bot re-submits next scan.
+  const ghostHints = (result.rankHints || []).filter((h) => h.isGhostRecord);
+  const isGhostSaved = ghostHints.length > 0 && ghostHints.length === (result.rankHints || []).length;
+
   const isSavedOk      = /saved successfully|bid.*accepted|success/i.test(textLower);
   // isRealSuccess must NOT trigger when SAP flags Type='E' with a tie-reject
-  // Ev_Text — even if Message cosmetically says "Saved Successfully".
-  const isRealSuccess  = !isTieRejected && result.info !== 'E' && (
+  // Ev_Text — even if Message cosmetically says "Saved Successfully" — OR when
+  // the response only contains ghost persistence markers (v3.24).
+  const isRealSuccess  = !isTieRejected && !isGhostSaved && result.info !== 'E' && (
     (result.info === 'S' && !/ended|closed|expired|invalid|error/i.test(textLower)) || isSavedOk
   );
   const isTimeEnded    = /ended|closed|expired/i.test(textLower) && !isSavedOk;
@@ -1628,6 +1667,28 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
       bidLogRow(b, 'REJECTED_TIE', evText.trim() || 'Same amount already bid by other vendor');
     }
     return { retry: false };
+  }
+
+  // v3.24 — Ghost-save: SAP said "Saved Successfully" with Type=S, but every
+  // NavEBiddingTrackHis entry has empty ChangeNo + null CreatedOn + zero
+  // CreatedAt → no actual DB commit. Browser won't show the bid. Retry now
+  // (before window closes) so a real save may catch on the next scan.
+  if (isGhostSaved) {
+    metrics.submitsRejected++;
+    const ghostIds = ghostHints.map((h) => h.sapOrderId).join(', ');
+    log.warn(
+      `[${workerId}] ✗ GHOST-SAVED (${item.kind}, ${bids.length}) — SAP said "Saved" (Type=S) but response contains ghost persistence markers: ` +
+      `ChangeNo=empty, CreatedOn=null, CreatedAt=PT0S. No actual DB commit — browser will show nothing. ` +
+      `Orders: [${ghostIds}]. Will retry on next scan (do NOT mark submitted).`
+    );
+    for (const b of item.bids) {
+      // DO NOT add to submitted — the next scan should re-pick and re-bid
+      // this order. Short 500ms cooldown to avoid an immediate burst-retry
+      // on the same still-broken SAP endpoint.
+      ctx.cooldown.set(String(b.order.SapOrderId), Date.now() + 500);
+      bidLogRow(b, 'REJECTED_GHOST', 'SAP claimed saved but response had ghost persistence markers (ChangeNo/CreatedOn/CreatedAt empty)');
+    }
+    return { retry: true };
   }
 
   if (result.info === 'E') {
