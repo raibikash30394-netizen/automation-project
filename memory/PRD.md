@@ -182,6 +182,13 @@ Prior code trusted the cosmetic "Saved Successfully" text, marked the bid as ACC
 - **New unit test `testTieRejection`** (6 cases) covering the actual live-log Ev_Text patterns.
 - **All 23 test groups pass** ✅.
 
+## Updated (2026-02 — v3.22 Tie-rejection: no undercut, mark done)
+User feedback: **SAP does NOT allow bids below L1** — trying to undercut by ₹1 would hit SAP's floor validation and reject anyway. The ONLY winning strategy for a tied slot is **SPEED**: being first (by ms) to submit at that amount. Reverted the automatic amount decrement in TIE_REJECTED handler:
+- Removed the `L1_UNDERCUT_STEP` decrement (would violate SAP's floor rule).
+- Removed the 3-second cooldown/retry loop (retrying at the same amount just ties again).
+- Order is now marked `submitted` for this window (bot doesn't burn cycles re-submitting a losing bid).
+- Log message updated: `"Cannot undercut (SAP doesn't allow < L1). Bid LOST for this window. Speed is the only way to win next window — consider AWS ap-south-1 hosting to shave ~40ms latency."`
+
 ## Verified
 - `bidding.js` starts, loads cache, `/health` returns metrics JSON
 - `POST /solve-captcha` and `POST /` both accept text/plain JSON, return `{solved}`

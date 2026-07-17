@@ -1591,46 +1591,32 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
   }
 
   // v3.21 — Tie-rejection: SAP says "Saved" cosmetically but Ev_Text reveals
-  // another vendor bid the same amount first. Bid is NOT persisted.
-  // Strategy: do NOT add to `submitted` (so next scan re-picks the order),
-  // apply a short 3s cooldown to avoid burst-retry, and — if L1_UNDERCUT is
-  // enabled — pre-seed an undercut attempt so the next submit uses a lower
-  // amount instead of the same colliding value.
+  // another vendor bid the same amount FIRST. Bid is NOT persisted.
+  //
+  // v3.22 UPDATE (per user feedback): SAP does NOT allow bids below the
+  // effective L1 (floor rejection). Trying to undercut by ₹1 would just get
+  // rejected with a floor error. The ONLY way to win a tied slot is SPEED —
+  // being first to submit at that amount. So on tie-rejection we:
+  //   • Mark the order as done for THIS window (add to submitted) — retrying
+  //     at the same amount will just tie again; retrying lower will hit floor.
+  //   • Log clearly that speed is the winning factor for next window.
+  //   • Do NOT decrement the amount.
   if (isTieRejected) {
     metrics.submitsRejected++;
-    // Parse the specific order IDs SAP mentions in Ev_Text so user sees which
-    // ones tied (rest of the batch may still have persisted — but SAP's atomic
-    // batch semantics say the whole submit is either accepted or not, so we
-    // treat the entire batch as rejected).
     const tiedIds = (evText.match(/order\s*(?:id)?\s*:\s*(\d+)/gi) || [])
       .map((m) => m.replace(/[^\d]/g, ''))
       .join(', ') || item.bids.map((b) => b.order.SapOrderId).join(', ');
-    const cd = 3_000;
-    const retryAt = Date.now() + cd;
     log.warn(
-      `[${workerId}] ✗ TIE-REJECTED (${item.kind}, ${bids.length}) — another vendor bid same amount first. ` +
+      `[${workerId}] ✗ TIE-REJECTED (${item.kind}, ${bids.length}) — another vendor bid the same amount FIRST (~ms earlier). ` +
       `SAP said "Saved" cosmetically but Ev_Text = "${evText.trim()}" (BiddingRank=0 confirms not saved). ` +
-      `Tied orders: [${tiedIds}]. Will retry with lower amount in ${cd}ms.`
+      `Tied orders: [${tiedIds}]. Cannot undercut (SAP doesn't allow < L1). ` +
+      `→ Bid LOST for this window. Speed is the only way to win next window — consider AWS ap-south-1 hosting to shave ~40ms latency.`
     );
     for (const b of item.bids) {
-      // DO NOT add to submitted — the next scan should re-pick this order.
-      ctx.cooldown.set(String(b.order.SapOrderId), retryAt);
-      // Pre-seed undercut counter so if L1_UNDERCUT flow runs, it knows
-      // the base amount was already "L1" (same as ours) and undercuts by
-      // L1_UNDERCUT_STEP on the next submit.
-      if (L1_UNDERCUT) {
-        const prev = ctx.undercutAttempts.get(String(b.order.SapOrderId)) || 0;
-        // Only bump if we haven't already crossed max — this preserves the
-        // existing max-attempts safety without over-bidding.
-        if (prev < L1_UNDERCUT_MAX_ATTEMPTS) {
-          // Reduce the amount immediately for the next scan's re-bid.
-          const newAmount = +(b.amount - L1_UNDERCUT_STEP).toFixed(2);
-          if (newAmount > 0) {
-            b.amount = newAmount; // mutate the reusable bid entry (harmless — order re-matched next scan)
-          }
-          ctx.undercutAttempts.set(String(b.order.SapOrderId), prev + 1);
-        }
-      }
+      // Mark done for this window so bot doesn't burn cycles re-submitting
+      // the same losing bid. Order is naturally cleared at :15/:45 boundary
+      // for the next window.
+      ctx.submitted.set(String(b.order.SapOrderId), Date.now());
       bidLogRow(b, 'REJECTED_TIE', evText.trim() || 'Same amount already bid by other vendor');
     }
     return { retry: false };
