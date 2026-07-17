@@ -54,6 +54,14 @@ const PARALLEL_BATCHES = parseInt(process.env.PARALLEL_BATCHES || '4', 10);
 
 const TIME_ENDED_COOLDOWN_MS = parseInt(process.env.TIME_ENDED_COOLDOWN_MS || '30000', 10);
 
+// v3.23 — Configurable SAP request timeouts. Bumped from 4-5s → 6-10s so the
+// bot is more patient with slow SAP responses (especially during peak or when
+// user's ISP has latency spikes). Lower values = faster fail-and-retry;
+// higher values = more patient (fewer "tick failed" logs).
+const FETCH_ORDERS_TIMEOUT_MS  = parseInt(process.env.FETCH_ORDERS_TIMEOUT_MS  || '10000', 10);
+const FETCH_CAPTCHA_TIMEOUT_MS = parseInt(process.env.FETCH_CAPTCHA_TIMEOUT_MS || '6000', 10);
+const SUBMIT_TIMEOUT_MS        = parseInt(process.env.SUBMIT_TIMEOUT_MS        || '5000', 10);
+
 // L1 auto-undercut settings — after each save, re-refetch the Order List and
 // if we're not rank 1 (someone else tied our amount and came first), auto
 // re-bid at (L1BidAmount - L1_UNDERCUT_STEP) to secure rank 1.
@@ -759,7 +767,7 @@ async function fetchLiveOrders(auth) {
     path: `${SAP_PATH_PFX}/BidOrderListSet`,
     method: 'POST',
     body: payload,
-    timeoutMs: 5000,
+    timeoutMs: FETCH_ORDERS_TIMEOUT_MS,   // v3.23: env-tunable, default 10s
     retryOnNetworkError: true,  // idempotent read — safe to retry on socket timeout
   });
 
@@ -791,7 +799,7 @@ let _firstCaptchaDumped = false;
 async function fetchCaptchaImage(auth) {
   if (wafActive()) return { img: null, reason: 'waf' };
   const p = `${SAP_PATH_PFX}/EbiddingCaptchaSet(Vendor='${VENDOR_ID}',Plant='${PLANT_CODE}')`;
-  const res = await sapRequest(auth, { path: p, method: 'GET', timeoutMs: 4000, retryOnNetworkError: true });
+  const res = await sapRequest(auth, { path: p, method: 'GET', timeoutMs: FETCH_CAPTCHA_TIMEOUT_MS, retryOnNetworkError: true });
   if (res.statusCode === 406 || (typeof res.data === 'string' && /Not Acceptable|<!DOCTYPE html>/i.test(res.data.slice(0, 200)))) {
     markWaf('EbiddingCaptchaSet HTTP 406');
     return { img: null, reason: 'waf-406' };
@@ -980,7 +988,7 @@ async function submitBid(auth, bids, solvedCaptcha) {
     path: `${SAP_PATH_PFX}/EBiddingSaveSet`,
     method: 'POST',
     body: payload,
-    timeoutMs: 5000,
+    timeoutMs: SUBMIT_TIMEOUT_MS,
   });
   const submitMs = Date.now() - t0;
 

@@ -189,6 +189,18 @@ User feedback: **SAP does NOT allow bids below L1** — trying to undercut by �
 - Order is now marked `submitted` for this window (bot doesn't burn cycles re-submitting a losing bid).
 - Log message updated: `"Cannot undercut (SAP doesn't allow < L1). Bid LOST for this window. Speed is the only way to win next window — consider AWS ap-south-1 hosting to shave ~40ms latency."`
 
+## Updated (2026-02 — v3.23 Timeout tuning)
+User reported repeated `tick failed: network timeout (Headers Timeout Error)` on idle scans. Root cause: SAP occasionally takes 6-12s to respond during peak, but our timeouts were:
+- `BidOrderListSet` fetch: 5s (too tight)
+- `EbiddingCaptchaSet` fetch: 4s (too tight)
+
+Both were timing out on BOTH the initial attempt AND the v3.20 retry. Fix:
+- **`BidOrderListSet` timeout**: 5s → **10s** (default, env-tunable via `FETCH_ORDERS_TIMEOUT_MS`)
+- **`EbiddingCaptchaSet` timeout**: 4s → **6s** (env-tunable via `FETCH_CAPTCHA_TIMEOUT_MS`)
+- **`EBiddingSaveSet` submit timeout**: unchanged at 5s (env-tunable via `SUBMIT_TIMEOUT_MS`) — during hot window we want fast fail-and-retry, not patient waiting
+- **`.env.example`** documents all three knobs so user can tune based on their ISP/SAP latency profile
+- No behaviour change during hot windows — this only affects idle polling patience
+
 ## Verified
 - `bidding.js` starts, loads cache, `/health` returns metrics JSON
 - `POST /solve-captcha` and `POST /` both accept text/plain JSON, return `{solved}`
