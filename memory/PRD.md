@@ -237,6 +237,15 @@ Fixes:
 - **New `ctx.ghostRetries` Map**: per-window state, cleared at each `:15`/`:45` boundary along with cooldown/undercut/submitted.
 - **All 24 unit tests pass** ✅ (existing ghost test still valid — new logic is additive).
 
+## Updated (2026-02 — v3.26 Tie is SUCCESS, not rejection)
+User's 2026-07-18 browser screenshot revealed a critical semantic error in v3.21/v3.22: **tied bids ARE saved** (at rank 6-7 depending on how many vendors bid the same amount first), they are NOT rejected outright. The Ev_Text `"Same amount has been bid by other vendor..."` is an INFO message ("you tied, N vendors were faster"), not a failure signal. Bot was scaring the user with "TIE-REJECTED — Bid LOST" warnings when the bids were actually persisted at a non-1 rank.
+
+- **`REJECTED_TIE` → `SAVED_TIED` semantic rename**: log level changed from `warn` (scary red) to `info` (green tick).
+- **`metrics.submitsOk++`** instead of `submitsRejected++` — throughput counter now reflects the real save rate visible in browser.
+- **Log message rewritten** to be constructive: `"✓ SAVED-TIED — bid saved but at non-1 rank. SAP says other vendor(s) bid the same amount FIRST. → To improve rank, try a slightly different amount next window (₹1-2 below the ties)."`
+- **Behaviour unchanged**: order still added to `submitted` set (no wasted retries), `bidLogRow` writes `SAVED_TIED` status (was `REJECTED_TIE`) for CSV analytics.
+- **Unit test `testTieRejection` unchanged** — still validates the `isTieRejected` classifier, which is correct. Only the runtime handler mapping changed (tie → save at non-1 rank instead of tie → reject).
+
 ## Verified
 - `bidding.js` starts, loads cache, `/health` returns metrics JSON
 - `POST /solve-captcha` and `POST /` both accept text/plain JSON, return `{solved}`

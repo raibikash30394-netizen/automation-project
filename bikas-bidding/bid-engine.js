@@ -1645,36 +1645,38 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
     return { retry: true };
   }
 
-  // v3.21 — Tie-rejection: SAP says "Saved" cosmetically but Ev_Text reveals
-  // another vendor bid the same amount FIRST. Bid is NOT persisted.
+  // v3.21 — Tie: SAP responded Type=E with Message="Saved" + Ev_Text = "Same
+  //         amount has been bid by other vendor..." — this signals that we
+  //         tied with an earlier submission.
   //
-  // v3.22 UPDATE (per user feedback): SAP does NOT allow bids below the
-  // effective L1 (floor rejection). Trying to undercut by ₹1 would just get
-  // rejected with a floor error. The ONLY way to win a tied slot is SPEED —
-  // being first to submit at that amount. So on tie-rejection we:
-  //   • Mark the order as done for THIS window (add to submitted) — retrying
-  //     at the same amount will just tie again; retrying lower will hit floor.
-  //   • Log clearly that speed is the winning factor for next window.
-  //   • Do NOT decrement the amount.
+  // v3.22 — Do NOT undercut (SAP floor rule).
+  //
+  // v3.26 UPDATE (per user browser observation): tied bids ARE saved at the
+  // "tied" rank (rank 6-7 in current data), they are NOT rejected outright.
+  // The Ev_Text is an INFO message ("you tied, N vendors were faster"),
+  // not a failure. Rename REJECTED_TIE → SAVED_TIED so:
+  //   • Log reads as INFO not scary WARN
+  //   • Metrics count as OK (bid IS on the order in browser view)
+  //   • User can review ranks and decide to bid unique amounts next window
   if (isTieRejected) {
-    metrics.submitsRejected++;
+    metrics.submitsOk++;   // v3.26: tied bids ARE saved (per user's browser)
     const tiedIds = (evText.match(/order\s*(?:id)?\s*:\s*(\d+)/gi) || [])
       .map((m) => m.replace(/[^\d]/g, ''))
       .join(', ') || item.bids.map((b) => b.order.SapOrderId).join(', ');
-    log.warn(
-      `[${workerId}] ✗ TIE-REJECTED (${item.kind}, ${bids.length}) — another vendor bid the same amount FIRST (~ms earlier). ` +
-      `SAP said "Saved" cosmetically but Ev_Text = "${evText.trim()}" (BiddingRank=0 confirms not saved). ` +
-      `Tied orders: [${tiedIds}]. Cannot undercut (SAP doesn't allow < L1). ` +
-      `→ Bid LOST for this window. Speed is the only way to win next window — consider AWS ap-south-1 hosting to shave ~40ms latency.`
+    log.info(
+      `[${workerId}] ✓ SAVED-TIED (${item.kind}, ${bids.length}) in ${result.submitMs}ms — bid saved but at non-1 rank. ` +
+      `SAP says other vendor(s) bid the same amount FIRST. Tied orders: [${tiedIds}]. ` +
+      `→ To improve rank, try a slightly different amount next window (₹1-2 below the ties).`
     );
     for (const b of item.bids) {
-      // Mark done for this window so bot doesn't burn cycles re-submitting
-      // the same losing bid. Order is naturally cleared at :15/:45 boundary
-      // for the next window.
       ctx.submitted.set(String(b.order.SapOrderId), Date.now());
-      bidLogRow(b, 'REJECTED_TIE', evText.trim() || 'Same amount already bid by other vendor');
+      bidLog.write({
+        session: workerId, sap_order_id: b.order.SapOrderId, city: b.city, spi: b.spi,
+        csv_rate: b.amount, submit_ms: result.submitMs, status: 'SAVED_TIED',
+        message: evText.trim() || 'Tied with other vendor(s) — saved at non-1 rank',
+      });
     }
-    return { retry: false };
+    return { ok: true };
   }
 
   // v3.24 — Ghost-save: SAP said "Saved Successfully" with Type=S OR returned
