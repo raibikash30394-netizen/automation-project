@@ -1616,8 +1616,16 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
   // multi-cookie parallel submits, NOT by SAP itself. In single-session mode
   // an empty 201 IS a real save. Treat it as ACCEPTED so we don't skip the
   // "add to submitted" bookkeeping (which caused endless re-submits).
+  //
+  // v3.25 EXCEPTION — Ghost markers override silent-save. If NavEBiddingTrackHis
+  // still contains ghost markers (empty ChangeNo + null CreatedOn + zero
+  // CreatedAt) even when NavEBiddingMessage is null, the retry ALSO failed to
+  // commit — user's 2026-07-18 logs show the retry response has identical
+  // ghost markers as the first attempt. Fall through to the ghost-save handler
+  // (below) which will re-queue for another retry in the same window.
   if ((result.statusCode === 200 || result.statusCode === 201) &&
-      !result.info && !result.text && !isTimeEnded && !isWrongCaptcha && reduceBy === null && minFloor === null) {
+      !result.info && !result.text && !isTimeEnded && !isWrongCaptcha && reduceBy === null && minFloor === null &&
+      !isGhostSaved) {
     metrics.submitsOk++;
     log.info(`[${workerId}] ✓ ACCEPTED (${item.kind}, ${bids.length}) in ${result.submitMs}ms: HTTP ${result.statusCode} (empty confirmation = silent save)`);
     for (const b of item.bids) {
@@ -1669,26 +1677,42 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
     return { retry: false };
   }
 
-  // v3.24 — Ghost-save: SAP said "Saved Successfully" with Type=S, but every
-  // NavEBiddingTrackHis entry has empty ChangeNo + null CreatedOn + zero
-  // CreatedAt → no actual DB commit. Browser won't show the bid. Retry now
-  // (before window closes) so a real save may catch on the next scan.
+  // v3.24 — Ghost-save: SAP said "Saved Successfully" with Type=S OR returned
+  // empty 201, but every NavEBiddingTrackHis entry has empty ChangeNo + null
+  // CreatedOn + zero CreatedAt → no actual DB commit. Browser won't show the
+  // bid. Retry now (before window closes) so a real save may catch on the
+  // next scan.
+  //
+  // v3.25 — Retry cap: max 3 ghost-retries per order per window. After that,
+  // give up on this order (further attempts will hit the same SAP anti-fraud
+  // branch — burning cycles just delays other orders in the plan).
   if (isGhostSaved) {
     metrics.submitsRejected++;
     const ghostIds = ghostHints.map((h) => h.sapOrderId).join(', ');
-    log.warn(
-      `[${workerId}] ✗ GHOST-SAVED (${item.kind}, ${bids.length}) — SAP said "Saved" (Type=S) but response contains ghost persistence markers: ` +
-      `ChangeNo=empty, CreatedOn=null, CreatedAt=PT0S. No actual DB commit — browser will show nothing. ` +
-      `Orders: [${ghostIds}]. Will retry on next scan (do NOT mark submitted).`
-    );
+    const MAX_GHOST_RETRIES = 3;
+    let anyGaveUp = false;
     for (const b of item.bids) {
-      // DO NOT add to submitted — the next scan should re-pick and re-bid
-      // this order. Short 500ms cooldown to avoid an immediate burst-retry
-      // on the same still-broken SAP endpoint.
-      ctx.cooldown.set(String(b.order.SapOrderId), Date.now() + 500);
-      bidLogRow(b, 'REJECTED_GHOST', 'SAP claimed saved but response had ghost persistence markers (ChangeNo/CreatedOn/CreatedAt empty)');
+      const key = String(b.order.SapOrderId);
+      const prevCount = ctx.ghostRetries.get(key) || 0;
+      ctx.ghostRetries.set(key, prevCount + 1);
+      if (prevCount + 1 >= MAX_GHOST_RETRIES) {
+        // Give up on this order for THIS window.
+        ctx.submitted.set(key, Date.now());
+        anyGaveUp = true;
+        bidLogRow(b, 'REJECTED_GHOST_MAX', `SAP kept ghost-saving after ${MAX_GHOST_RETRIES} attempts — giving up for this window`);
+      } else {
+        // Short 300 ms cooldown to avoid burst re-submit on same broken path.
+        ctx.cooldown.set(key, Date.now() + 300);
+        bidLogRow(b, 'REJECTED_GHOST', `Ghost save (attempt ${prevCount + 1}/${MAX_GHOST_RETRIES})`);
+      }
     }
-    return { retry: true };
+    const attemptTag = anyGaveUp ? `GAVE UP after ${MAX_GHOST_RETRIES} ghost attempts` : `will retry on next scan`;
+    log.warn(
+      `[${workerId}] ✗ GHOST-SAVED (${item.kind}, ${bids.length}) — SAP said "Saved" but response contains ghost persistence markers ` +
+      `(ChangeNo=empty, CreatedOn=null, CreatedAt=PT0S). No actual DB commit — browser will show nothing. ` +
+      `Orders: [${ghostIds}]. ${attemptTag}.`
+    );
+    return { retry: !anyGaveUp };
   }
 
   if (result.info === 'E') {
@@ -1970,6 +1994,7 @@ async function main() {
     cooldown:  new Map(),
     adjustAttempts: new Map(),
     undercutAttempts: new Map(), // sapOrderId → attempt count (max L1_UNDERCUT_MAX_ATTEMPTS per window)
+    ghostRetries: new Map(),     // v3.25: sapOrderId → ghost-save retry count (max 3 per window)
     windowStartAt: Date.now(),   // reset at each new bid window (below)
   };
 
@@ -2054,6 +2079,7 @@ async function main() {
       const clearedCd  = clearOlderThan(ctx.cooldown,  now - RECENT_MS);
       const clearedUc  = ctx.undercutAttempts.size;
       ctx.undercutAttempts.clear();
+      ctx.ghostRetries.clear();  // v3.25: reset per-window ghost-retry counters
       ctx._cachedOrders = null; // force fresh order fetch for new window
       // Reload priority Vbelns so user can edit files/priority.csv mid-run
       // without restarting the bot. Only diff-log if it changed.
@@ -2066,6 +2092,29 @@ async function main() {
         log.info(`⭐ PRIORITY reloaded: ${beforeSize}→${ctx.priorityVbelns.size} Vbelns (sample: ${sample || 'none'})`);
       }
       log.info(`🕒 :15/:45 window BOUNDARY reached — cleared stale per-window state (submitted=${clearedSub}, cooldown=${clearedCd}, undercut=${clearedUc}, kept fresh=${ctx.submitted.size}). Bot polling for SAP captcha unlock.`);
+
+      // v3.25 CRITICAL FIX — Boundary CSRF re-issue for FIRST submit.
+      //
+      // From live-log analysis (2026-07-18 logs across 3 windows), EVERY first
+      // submit of a window was ghost-saved (Type=S "Saved" but ChangeNo empty +
+      // CreatedOn null → no actual DB commit). The retry ~3-4 s later —
+      // triggered by session-shake CSRF refresh — always succeeded. Pattern:
+      //   1. Pre-warm CSRF fetched ~30 s BEFORE boundary → SAP flags this token
+      //      as "pre-window" and any submit with it lands in a no-commit branch.
+      //   2. Session-shake refreshes CSRF ~4 s AFTER boundary → new token is
+      //      "post-boundary" → next submit actually writes to DB.
+      //
+      // Fix: at every :15/:45 boundary, immediately fire a background CSRF
+      // refresh on all sessions so the token used by the first submit was
+      // minted AFTER the boundary. This is non-blocking — we don't hold up
+      // the tick loop (SAP takes 150-400 ms for CSRF); by the time the first
+      // captcha is detected (~1-2 s after boundary), the fresh token is ready.
+      for (const s of ctx.sessions) {
+        Promise.resolve().then(() => s.refreshToken()).catch((e) => {
+          log.warn(`[${s.id}] boundary CSRF refresh failed: ${e.message} — will retry on next tick`);
+        });
+      }
+      log.info(`🔑 Boundary CSRF re-issue triggered on ${ctx.sessions.length} session(s) — first submit will use post-boundary token to avoid SAP "pre-window" ghost-save.`);
     }
 
     await tick(ctx);

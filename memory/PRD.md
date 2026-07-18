@@ -221,6 +221,22 @@ Bot logged ACCEPTED + POST-SAVE OK (post-save refetch showed the optimistic amou
 - **Tie-rejection has priority**: If Ev_Text says "Same amount..." AND ghost markers present, still classify as REJECTED_TIE (Ev_Text is the strongest signal).
 - **New unit test `testGhostSaveDetection`** (6 cases). **All 24 test groups pass** ✅
 
+## Implemented (2026-02 — v3.25 CRITICAL: Boundary CSRF re-issue + empty-201 ghost check)
+User's 2026-07-18 logs revealed the ROOT CAUSE of ghost-save: **pre-warm CSRF token is flagged by SAP as "pre-window" and any submit with it lands in a no-commit code path**. Across 3 different windows, the pattern was identical:
+1. `~30s before boundary`: Pre-warm CSRF refresh
+2. `~1s past boundary`: First captcha detected + submit fired with **pre-warm CSRF** → GHOST (`ChangeNo=empty`, `CreatedOn=null`)
+3. `~4s past boundary`: Session-shake refreshes CSRF (fresh **post-boundary** token)
+4. `~5s past boundary`: Retry with fresh CSRF → SUCCESS (empty 201)
+
+Also discovered a related bug: the retry's empty-201 response STILL contained ghost markers in `NavEBiddingTrackHis`, but the empty-201 handler fired BEFORE the ghost check → wrongly marked ACCEPTED. User's browser confirmed no save.
+
+Fixes:
+- **Boundary CSRF re-issue**: At every `:15`/`:45` boundary, all sessions fire a background CSRF refresh (non-blocking). By the time the first captcha lands (~1-2s past boundary), the token is post-boundary → submit lands in the commit code path.
+- **Empty-201 handler now checks ghost markers**: `!isGhostSaved` added to the empty-201 acceptance condition. If ghost markers present, falls through to REJECTED_GHOST handler.
+- **Ghost retry cap** (`MAX_GHOST_RETRIES = 3`): per-order counter tracks ghost retries within a window; after 3 attempts, gives up on that order (prevents infinite retry loops on SAP anti-fraud paths).
+- **New `ctx.ghostRetries` Map**: per-window state, cleared at each `:15`/`:45` boundary along with cooldown/undercut/submitted.
+- **All 24 unit tests pass** ✅ (existing ghost test still valid — new logic is additive).
+
 ## Verified
 - `bidding.js` starts, loads cache, `/health` returns metrics JSON
 - `POST /solve-captcha` and `POST /` both accept text/plain JSON, return `{solved}`
