@@ -256,6 +256,16 @@ Discovery from SAP's own browser controller (`EBidding-dbg.controller.js` → `o
 - Impact: for plants/vendors where SAP doesn't require captcha, submit latency drops from **~3000 ms past boundary** (captcha unlock delay) to **~200 ms** (network RTT only) — a 15× improvement for those windows. This is the single biggest speed win possible without geographic relocation.
 - **All 24 unit tests pass** ✅.
 
+## Implemented (2026-02 — v3.28 AWS Mumbai deployment toolkit)
+User asked for AWS `ap-south-1` (Mumbai) deployment on Ubuntu + SSH + PM2 so the bot runs from the same region as SAP's datacenter (40-60 ms latency saved → 2-3× better rank-1 probability). Created a complete self-service toolkit:
+
+- **`deploy/DEPLOY-AWS-MUMBAI.md`** — full step-by-step guide (EC2 setup, security group, Elastic IP, SSH keys, install, config, PM2 startup, cookie refresh workflow, expected speed improvements, troubleshooting, cost optimization)
+- **`deploy/install-server.sh`** — one-shot Ubuntu 22/24.04 bootstrap script (Node 20 + Yarn + PM2 + Tesseract + deps + `.example`→real config seeding + unit test verification + PM2 startup-on-boot)
+- **`deploy/refresh-cookie.ps1`** — Windows PowerShell helper to upload fresh `cookie.txt` + delete stale `token.txt` + restart bot on server via SSH+SCP in one command
+- **`deploy/README.md`** — quick-start index for the deploy/ directory
+- **`ecosystem.config.cjs`** at repo root — PM2 config for both `bidding.js` (captcha solver) and `bid-engine.js` (SAP bot). Fork mode, auto-restart, memory limits (350M solver, 400M engine), per-day log rotation, PM2-managed timestamps
+- Recommended instance: **`t3.small`** in `ap-south-1` (Mumbai) with 20 GB gp3 SSD — ~₹1,200-1,500/month burstable, right-sized for bot's ~150 MB RAM + captcha OCR spikes
+
 ## Verified
 - `bidding.js` starts, loads cache, `/health` returns metrics JSON
 - `POST /solve-captcha` and `POST /` both accept text/plain JSON, return `{solved}`
