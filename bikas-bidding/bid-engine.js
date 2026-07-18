@@ -789,8 +789,15 @@ async function fetchLiveOrders(auth) {
   const d = res.data?.d || {};
   const orders    = d.NavBidSchVendors?.results || d.results || (Array.isArray(d) ? d : []);
   const plantConf = d.NavBidPlntConf?.results?.[0] || null;
-  auth._lastPlantConf = plantConf;
-  return { orders, plantConf };
+  // v3.27 — Read EvCaptchaFlag from response. Per SAP's own browser controller
+  // (EBidding-dbg.controller.js `onEBiddingSave`), when this flag is NOT 'X',
+  // captcha input is NOT required and the browser fires save directly. In that
+  // mode we can submit at :15/:45 boundary WITHOUT the 2-3s captcha unlock
+  // wait, giving the fastest possible submission (Rank-1 friendly).
+  const captchaFlag = (d.EvCaptchaFlag || '').toString();
+  auth._lastPlantConf  = plantConf;
+  auth._lastCaptchaFlag = captchaFlag; // 'X' = captcha required, '' = fast-path
+  return { orders, plantConf, captchaFlag };
 }
 
 // Global counter for one-time debug dump of the first captcha response.
@@ -976,13 +983,19 @@ async function submitBid(auth, bids, solvedCaptcha) {
     };
   });
 
+  // v3.27 — captcha-free fast-path: when solveCaptcha() returned the sentinel
+  // '__NO_CAPTCHA_REQUIRED__' (meaning EvCaptchaFlag !== 'X'), omit the
+  // IvCaptchaValue field entirely — matches what the browser controller does
+  // in `onEBiddingSave` when captcha isn't required.
   const payload = {
     Flag              : '1',
     Ev_Text           : '',
-    IvCaptchaValue    : solvedCaptcha,
     NavEBiddingMessage: {},
     NavEBiddingTrackHis,
   };
+  if (solvedCaptcha !== '__NO_CAPTCHA_REQUIRED__') {
+    payload.IvCaptchaValue = solvedCaptcha;
+  }
 
   const res = await sapRequest(auth, {
     path: `${SAP_PATH_PFX}/EBiddingSaveSet`,
@@ -1248,6 +1261,22 @@ function makeWorkerPool(ctx) {
   let cursor = 0;
 
   async function fetchFreshCaptcha(auth, workerId) {
+    // v3.27 — Fast-path: if the last BidOrderListSet response reported
+    // EvCaptchaFlag !== 'X', SAP does NOT require a captcha for this session
+    // (mirrors the browser's onEBiddingSave logic in EBidding-dbg.controller.js).
+    // Return the sentinel '' from the captcha path and let the submit code
+    // skip IvCaptchaValue entirely — this saves the 2-3 s captcha unlock wait
+    // and enables submitting at :15/:45 boundary within the first 100 ms.
+    if (auth._lastCaptchaFlag === '' || auth._lastCaptchaFlag === undefined) {
+      // Log the fast-path activation once per window (use boundary time as key).
+      const winKey = Math.floor(Date.now() / 60_000);
+      if (auth._lastCaptchaFlag === '' && auth._captchaFastPathLogged !== winKey) {
+        auth._captchaFastPathLogged = winKey;
+        log.info(`[${workerId}] ⚡ CAPTCHA-FREE fast-path enabled (EvCaptchaFlag='' from BidOrderListSet) — skipping captcha wait, submit will fire immediately at boundary.`);
+      }
+      if (auth._lastCaptchaFlag === '') return '__NO_CAPTCHA_REQUIRED__';
+    }
+
     // Use parallel probing when we know the window is about to open (matched
     // orders exist + no captcha yet). Otherwise single probe is enough.
     const useParallel = ctx._matchedButNoCaptcha || isHotWindow();

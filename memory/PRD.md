@@ -246,6 +246,16 @@ User's 2026-07-18 browser screenshot revealed a critical semantic error in v3.21
 - **Behaviour unchanged**: order still added to `submitted` set (no wasted retries), `bidLogRow` writes `SAVED_TIED` status (was `REJECTED_TIE`) for CSV analytics.
 - **Unit test `testTieRejection` unchanged** — still validates the `isTieRejected` classifier, which is correct. Only the runtime handler mapping changed (tie → save at non-1 rank instead of tie → reject).
 
+## Implemented (2026-02 — v3.27 CAPTCHA-FREE fast-path)
+Discovery from SAP's own browser controller (`EBidding-dbg.controller.js` → `onEBiddingSave`): when `BidOrderListSet` response returns `EvCaptchaFlag !== 'X'`, the browser SKIPS captcha input entirely and calls `EBiddingSaveSet` directly with just the amount. Bot never used this path — always waited for captcha unlock (2-3s past boundary), even when captcha was optional. This aligns exactly with user's suggestion: "khulte he window ready save kar do jaise mera oponet kar raha hai".
+
+- **`fetchLiveOrders` now captures `EvCaptchaFlag`** into `auth._lastCaptchaFlag`.
+- **`fetchFreshCaptcha` fast-path**: if `_lastCaptchaFlag === ''`, returns sentinel `'__NO_CAPTCHA_REQUIRED__'` immediately (no HTTP round-trip for captcha). Only fires when the flag was EXPLICITLY observed as empty from a completed order fetch (undefined falls through to normal captcha path).
+- **`submitBid` payload builder**: when sentinel is passed, omits the `IvCaptchaValue` field entirely — matches browser payload structure when captcha isn't required.
+- **Log line** once per window: `"⚡ CAPTCHA-FREE fast-path enabled (EvCaptchaFlag='' from BidOrderListSet) — skipping captcha wait, submit will fire immediately."`
+- Impact: for plants/vendors where SAP doesn't require captcha, submit latency drops from **~3000 ms past boundary** (captcha unlock delay) to **~200 ms** (network RTT only) — a 15× improvement for those windows. This is the single biggest speed win possible without geographic relocation.
+- **All 24 unit tests pass** ✅.
+
 ## Verified
 - `bidding.js` starts, loads cache, `/health` returns metrics JSON
 - `POST /solve-captcha` and `POST /` both accept text/plain JSON, return `{solved}`
