@@ -100,6 +100,49 @@ files/delete.csv    CSV with a Customer column (blacklist)
 
 ## Run
 
+### Windows (LOCAL TEST FIRST — recommended before AWS/PM2 deploy)
+
+**One-click launch:**
+```cmd
+setup.bat        REM first-time only (installs deps, seeds .env / cookie.txt)
+test.bat         REM run 28-test unit suite (no SAP calls, safe anytime)
+start.bat        REM opens 2 windows: captcha solver + bid engine
+stop.bat         REM kills both processes
+```
+
+`start.bat` will:
+1. Run `w32tm /resync /force` to sync Windows clock (⚠ **critical for v3.30 EARLY DROP** — clock drift >100ms will miss the boundary)
+2. Print your current `EARLY_DROP_MS` value from `.env`
+3. Open **two separate cmd windows** — one for `bidding.js`, one for `bid-engine.js`
+4. Both windows use UTF-8 codepage (65001) so `pino-pretty` emojis (🚀 🎯) render correctly
+
+**What to watch in the "Bikas Bid Engine" window near :15 / :45 IST:**
+```
+[…] ⏱  Pre-warming for next SAP bid-window (~30s away, IST-aligned)
+[…] 🚀 EARLY-DROP CSRF refresh (~1500ms to boundary, target fire T-500ms) — minting post-pre-window token
+[…] 🎯 EARLY-DROP FIRE @ T-499ms (target: boundary open) — dispatching tick() speculatively
+[…] ✓ ACCEPTED (single, 3) in 245ms — Bidding Amount Saved Successfully.
+```
+
+**If clock sync fails** (non-admin), open cmd **once as Administrator** and run:
+```cmd
+net start w32time
+w32tm /config /update /manualpeerlist:"time.google.com,time.windows.com" /syncfromflags:manual
+w32tm /resync
+```
+Then normal-user `start.bat` will work.
+
+**Tuning `EARLY_DROP_MS`** (in `.env`):
+| Network location            | Recommended | Rationale                          |
+|-----------------------------|-------------|------------------------------------|
+| AWS Mumbai / fast VPS       | `300`       | Low 30-80ms RTT to SAP             |
+| Home ISP (India, decent)    | `500`       | Default — safe 100-400ms RTT       |
+| Home ISP (India, congested) | `700`       | Higher RTT during peak hours       |
+| International               | `1000`      | Cross-region latency               |
+| Disable early-drop          | `0`         | Revert to strict-at-boundary       |
+
+### Linux / macOS / Docker
+
 Two terminals (or `pm2` / `screen`):
 
 ```bash
@@ -118,6 +161,15 @@ Health probe for the solver:
 ```bash
 curl -s http://localhost:3000/health | jq
 # → { ok:true, cache:812, hits:0, misses:0, apiErrors:0, ... }
+```
+
+### AWS Mumbai / PM2 (production)
+
+See `deploy/DEPLOY-AWS-MUMBAI.md` for full walkthrough. Quick version:
+```bash
+cd deploy && bash install-server.sh
+pm2 start ecosystem.config.cjs
+pm2 logs
 ```
 
 ---

@@ -287,7 +287,17 @@ User feedback ("mai UI me 1 sec pehele chor deta hu... 50% mera rank 1 hota") re
 - **3 new unit tests** in `test-window-scheduler.js`: `testEarlyDropWindow` (8 cases), `testEarlyDropOnceSemantics` (3-window verification), `testEarlyDropAndBoundaryComplementary` (temporal ordering with v3.25 boundary block)
 - **Set `EARLY_DROP_MS=0` to disable** and revert to strict-at-boundary behaviour
 
-Testing status: 28 unit tests pass (including 3 new early-drop tests). Live SAP verification pending user's next window trial (user prefers to test on production SAP directly).
+## Implemented (2026-02 — v3.30 Windows-first local test workflow)
+User request ("windows me chalne layak banao pehele windows me test kare tab sab pm2 me chore ge") — added Windows-native launchers so v3.30 can be validated on the user's local Windows machine BEFORE deploying to AWS Mumbai / PM2:
+- **`start.bat`**: One-click launcher that (a) syncs Windows clock via `w32tm /resync` (critical: v3.30 fires at `T-500ms`, so >100ms clock drift misses the boundary), (b) sets UTF-8 codepage `chcp 65001` so pino-pretty emojis render, (c) opens two separate cmd windows — captcha solver + bid engine, (d) prints the current `EARLY_DROP_MS` from `.env` for visibility
+- **`stop.bat`**: Kills both node processes by window-title match + fallback port-3000 kill
+- **`test.bat`**: Runs the 28-unit-test suite without any SAP calls (safe anytime)
+- **README updated** with Windows section: run order, expected log output, RTT-based `EARLY_DROP_MS` tuning table, one-time admin cmd to enable `w32time` service
+- **`bid-engine.js` is already cross-platform** (uses `path.join`, no shell hooks, no Linux-only paths) — verified via `grep child_process|exec|spawn|/dev/|/tmp/|bash` returning no matches. `undici`, `pino`, `tesseract.js` all have Windows binaries.
+
+Workflow now: `setup.bat` (once) → `test.bat` (green) → `start.bat` (test 1-2 live windows) → verify Rank 1 in browser → deploy to AWS via `deploy/install-server.sh` + PM2.
+
+Testing status: 28 unit tests pass. Live SAP verification pending user's next Windows local run.
 
 
 ## Verified
