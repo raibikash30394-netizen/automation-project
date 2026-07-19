@@ -287,7 +287,20 @@ User feedback ("mai UI me 1 sec pehele chor deta hu... 50% mera rank 1 hota") re
 - **3 new unit tests** in `test-window-scheduler.js`: `testEarlyDropWindow` (8 cases), `testEarlyDropOnceSemantics` (3-window verification), `testEarlyDropAndBoundaryComplementary` (temporal ordering with v3.25 boundary block)
 - **Set `EARLY_DROP_MS=0` to disable** and revert to strict-at-boundary behaviour
 
-## Implemented (2026-02 — v3.30 Windows-first local test workflow)
+## Implemented (2026-02 — v3.31 PRECISION EARLY-DROP + fastpath visibility)
+User's live 2026-07-19 10:15 IST run revealed v3.30 bug: FIRE trigger NEVER fired (verified via `grep "EARLY-DROP FIRE" engine.log` returned nothing). CSRF refresh fired at T-1236ms but next log was boundary-crossed at T+1013ms — main loop jumped from T-1236 to T+1013 (~2.25s tick), skipping the T-300 to T-0 window entirely. Root cause: `while(true)` loop each iteration includes `await tick()` which takes 200-500ms during pre-boundary SAP polling.
+
+Additionally, all 3 submits at T+3.6s / +6.0s / +8.5s were GHOST-SAVED (SAP responded `Rank=0`, `ChangeNo="AAAAAAAA=="`, `CreatedOn=null`, `BiddingDate=/Date(1784419200000)/` = July 14, 5 days old). Captcha `"KiLL"` was solved and accepted. Ghost cause unclear — likely SAP duplicate-detection on already-bid orders, OR tie-lose silent-reject.
+
+Fixes in v3.31:
+- **Precision setTimeout scheduler**: When we first enter `untilNext <= 5s` and `untilNext > EARLY_DROP_MS` (i.e. the ~5s runway), schedule TWO setTimeouts:
+  - CSRF refresh at `untilNext - (EARLY_DROP_MS + CSRF_LEAD_MS)` — decouples from tick loop
+  - FIRE at `untilNext - EARLY_DROP_MS` — dispatches submit directly from `ctx._cachedOrders`, bypassing `tick()`/`fetchLiveOrders`/`makeWorkerPool`
+- **FIRE directly submits**: uses cached matched-bids + `buildBatches()` + `makeWorkerPool()` inline. If `_lastCaptchaFlag === 'X'`, skips (logs warning) since fastpath is required for pre-boundary submit
+- **EvCaptchaFlag transition log**: on every `fetchLiveOrders`, if `EvCaptchaFlag` changes, log `⚡ CAPTCHA-FREE fastpath ENABLED` or `🔒 captcha REQUIRED` — user immediately sees per-window fastpath status
+- **`earlyDropScheduledWinKey`** replaces the two separate v3.30 keys — one scheduling event per window
+
+
 User request ("windows me chalne layak banao pehele windows me test kare tab sab pm2 me chore ge") — added Windows-native launchers so v3.30 can be validated on the user's local Windows machine BEFORE deploying to AWS Mumbai / PM2:
 - **`start.bat`**: One-click launcher that (a) syncs Windows clock via `w32tm /resync` (critical: v3.30 fires at `T-500ms`, so >100ms clock drift misses the boundary), (b) sets UTF-8 codepage `chcp 65001` so pino-pretty emojis render, (c) opens two separate cmd windows — captcha solver + bid engine, (d) prints the current `EARLY_DROP_MS` from `.env` for visibility
 - **`stop.bat`**: Kills both node processes by window-title match + fallback port-3000 kill

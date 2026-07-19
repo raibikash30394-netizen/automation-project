@@ -3,6 +3,16 @@
 /**
  * bid-engine.js — Bikas Bidding v2 main bot
  *
+ * v3.31 — PRECISION EARLY-DROP (fixes v3.30 setTimeout skipping):
+ *   v3.30 tried to fire from the main tick loop, but each tick() call takes
+ *   200-500ms during pre-boundary (SAP is slow). Loop jumped from T-1200ms
+ *   straight to T+1000ms, SKIPPING the T-300 to T-0 window entirely.
+ *   Fix: schedule BOTH the CSRF refresh AND the FIRE via `setTimeout` at
+ *   precise target timestamps when we first enter the ~5s runway. FIRE now
+ *   ALSO directly dispatches a submit from `ctx._cachedOrders` bypassing
+ *   tick() so timing is guaranteed. Also added EvCaptchaFlag transition
+ *   logging so user can see fastpath availability per window.
+ *
  * v3.30 — EARLY DROP ("1 sec pehle" trick):
  *   Bot now fires EBiddingSaveSet EARLY_DROP_MS ms (default 500) BEFORE the
  *   :15/:45 boundary so the request lands on SAP AT boundary open — beating
@@ -832,6 +842,17 @@ async function fetchLiveOrders(auth) {
   // wait, giving the fastest possible submission (Rank-1 friendly).
   const captchaFlag = (d.EvCaptchaFlag || '').toString();
   auth._lastPlantConf  = plantConf;
+  // v3.31 — Log when EvCaptchaFlag transitions so user immediately sees if
+  // fastpath is available for the coming window. Early-drop only works when
+  // fastpath is enabled (else SAP requires captcha which unlocks post-boundary).
+  const prevFlag = auth._lastCaptchaFlag;
+  if (prevFlag !== captchaFlag) {
+    if (captchaFlag === '') {
+      log.info(`[${auth.id}] ⚡ EvCaptchaFlag='' — CAPTCHA-FREE fastpath ENABLED (early-drop can submit pre-boundary)`);
+    } else {
+      log.info(`[${auth.id}] 🔒 EvCaptchaFlag='${captchaFlag}' — captcha REQUIRED (early-drop will skip; must wait for post-boundary captcha unlock)`);
+    }
+  }
   auth._lastCaptchaFlag = captchaFlag; // 'X' = captcha required, '' = fast-path
   return { orders, plantConf, captchaFlag };
 }
@@ -2122,8 +2143,7 @@ async function main() {
   let lastPreWarmAt = 0;
   let lastEarlyWarmAt = 0;
   let lastBoundaryLogAt = 0;
-  let earlyDropCsrfWinKey = 0;   // v3.30 — CSRF freshly minted for the current early-drop
-  let earlyDropFiredWinKey = 0;  // v3.30 — early-drop tick already invoked for this window
+  let earlyDropScheduledWinKey = 0;  // v3.31 — both CSRF & FIRE scheduled via setTimeout once per window
   while (true) {
     const untilNext = msUntilNextWindow();
     const hot = isHotWindow();
@@ -2153,45 +2173,80 @@ async function main() {
       Promise.all(ctx.sessions.map((s) => s.refreshToken().catch(() => {})));
     }
 
-    // v3.30 — EARLY-DROP CSRF refresh.
+    // v3.31 — PRECISION EARLY-DROP scheduler.
     //
-    // Refresh CSRF EARLY_DROP_CSRF_LEAD_MS BEFORE the early-drop fire moment
-    // (i.e. ~1s before we submit). This gives us a token that is:
-    //   • fresh enough that SAP does not flag it as "pre-window stale"
-    //   • not-so-fresh that it hasn't propagated through SAP's cluster yet
-    // Runs at most once per window (keyed by nextBoundaryKey).
+    // v3.30 tried to fire from the main tick loop, but each tick() call takes
+    // 200-500ms during pre-boundary (SAP is slow). That made the loop jump
+    // from T-1200ms straight to T+1000ms, SKIPPING the T-300 to T-0 window
+    // entirely (verified from live log 2026-07-19: CSRF fired at T-1236ms
+    // but no FIRE log ever appeared).
+    //
+    // FIX: schedule BOTH the CSRF refresh AND the FIRE with `setTimeout` at
+    // the moment we first enter the pre-boundary window (~5s before). This
+    // guarantees they fire at the exact target timestamps regardless of
+    // how slow the tick loop is.
     const nextBoundaryKey = Math.floor((Date.now() + untilNext) / 60_000);
     if (
       EARLY_DROP_MS > 0 &&
-      untilNext <= (EARLY_DROP_MS + EARLY_DROP_CSRF_LEAD_MS) &&
-      untilNext >  EARLY_DROP_MS &&
-      earlyDropCsrfWinKey !== nextBoundaryKey
+      untilNext <= 5_000 &&
+      untilNext > EARLY_DROP_MS &&
+      earlyDropScheduledWinKey !== nextBoundaryKey
     ) {
-      earlyDropCsrfWinKey = nextBoundaryKey;
-      log.info(`🚀 EARLY-DROP CSRF refresh (~${untilNext}ms to boundary, target fire T-${EARLY_DROP_MS}ms) — minting post-pre-window token for speculative submit`);
-      Promise.all(ctx.sessions.map((s) => s.refreshToken().catch((e) => {
-        log.warn(`[${s.id}] early-drop CSRF refresh failed: ${e.message}`);
-      })));
+      earlyDropScheduledWinKey = nextBoundaryKey;
+      const csrfDelay = Math.max(0, untilNext - (EARLY_DROP_MS + EARLY_DROP_CSRF_LEAD_MS));
+      const fireDelay = Math.max(0, untilNext - EARLY_DROP_MS);
+      log.info(`⏰ EARLY-DROP scheduled: CSRF@T-${EARLY_DROP_MS + EARLY_DROP_CSRF_LEAD_MS}ms (in ${csrfDelay}ms), FIRE@T-${EARLY_DROP_MS}ms (in ${fireDelay}ms)`);
+
+      // CSRF refresh — precise setTimeout so it never gets skipped by slow ticks.
+      setTimeout(() => {
+        log.info(`🚀 EARLY-DROP CSRF refresh @ T-${msUntilNextWindow()}ms — minting post-pre-window token`);
+        Promise.all(ctx.sessions.map((s) => s.refreshToken().catch((e) => {
+          log.warn(`[${s.id}] early-drop CSRF refresh failed: ${e.message}`);
+        })));
+      }, csrfDelay);
+
+      // FIRE — precise setTimeout that IMMEDIATELY dispatches a submit if we
+      // have cached matched bids. Bypasses the tick loop entirely so timing
+      // is guaranteed regardless of how slow SAP is responding.
+      setTimeout(async () => {
+        const now = msUntilNextWindow();
+        log.info(`🎯 EARLY-DROP FIRE @ T-${now}ms — attempting direct speculative submit`);
+
+        // Set stall flag so main tick loop keeps tight-polling captcha too.
+        ctx._hotStall = true;
+
+        // Try direct submit from cached orders (if any). This bypasses
+        // fetchLiveOrders (which returns 0 during pre-boundary) and dispatches
+        // straight to submitBid using the cached matched-bids from the last
+        // successful scan. Only viable when EvCaptchaFlag='' (fastpath).
+        try {
+          if (!ctx._cachedOrders || !ctx._cachedOrders.length) {
+            log.warn(`🎯 EARLY-DROP FIRE: no cached orders yet — cannot speculatively submit. Will rely on post-boundary tick() path.`);
+            return;
+          }
+          const primary = ctx.sessions[0];
+          if (primary._lastCaptchaFlag === 'X') {
+            log.warn(`🎯 EARLY-DROP FIRE: SAP requires captcha (EvCaptchaFlag='X') — cannot fire pre-boundary without captcha unlock. Skipping speculative submit; falling back to normal post-boundary path.`);
+            return;
+          }
+          const { plan, stats } = buildBatches(
+            ctx._cachedOrders, ctx.rules, ctx.blacklist, ctx.submitted, ctx.inFlight, ctx.cooldown,
+            ctx.sessions.length, ctx.priorityVbelns
+          );
+          if (!plan.length) {
+            log.warn(`🎯 EARLY-DROP FIRE: no matched bids in cache (matched=${stats.matched}). Falling back.`);
+            return;
+          }
+          log.info(`🎯 EARLY-DROP FIRE: dispatching ${plan.length} batch(es), ${stats.matched} matched from cache (fastpath EvCaptchaFlag='')`);
+          const workerCtx = { ...ctx, plan };
+          const workers = makeWorkerPool(workerCtx);
+          await Promise.all(workers).catch(() => {});
+        } catch (e) {
+          log.warn(`🎯 EARLY-DROP FIRE crashed: ${e.message} — falling back to post-boundary path`);
+        }
+      }, fireDelay);
     }
 
-    // v3.30 — EARLY-DROP FIRE (mirrors user's manual "1 sec pehle" UI click).
-    //
-    // When we're `EARLY_DROP_MS` ms before the :15/:45 boundary, invoke tick()
-    // IMMEDIATELY without any sleep. This lets the bot fire EBiddingSaveSet
-    // so it lands on SAP servers AT (or microseconds before) boundary open,
-    // instead of the normal `boundary + network-RTT` arrival that competitors
-    // are stuck with. Runs at most once per window (keyed by nextBoundaryKey).
-    if (
-      EARLY_DROP_MS > 0 &&
-      untilNext <= EARLY_DROP_MS &&
-      untilNext > 0 &&
-      earlyDropFiredWinKey !== nextBoundaryKey
-    ) {
-      earlyDropFiredWinKey = nextBoundaryKey;
-      log.info(`🎯 EARLY-DROP FIRE @ T-${untilNext}ms (target: boundary open) — dispatching tick() speculatively; SAP should receive at boundary given RTT`);
-      // Set the hot-stall flag so tick() knows to tight-poll captcha/orders.
-      ctx._hotStall = true;
-    }
 
     // Precise "window boundary reached" log — fires once per window when the
     // clock hits :15:00 or :45:00. Distinct from the "first captcha detected"
