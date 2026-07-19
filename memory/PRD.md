@@ -287,7 +287,21 @@ User feedback ("mai UI me 1 sec pehele chor deta hu... 50% mera rank 1 hota") re
 - **3 new unit tests** in `test-window-scheduler.js`: `testEarlyDropWindow` (8 cases), `testEarlyDropOnceSemantics` (3-window verification), `testEarlyDropAndBoundaryComplementary` (temporal ordering with v3.25 boundary block)
 - **Set `EARLY_DROP_MS=0` to disable** and revert to strict-at-boundary behaviour
 
-## Implemented (2026-02 — v3.31 PRECISION EARLY-DROP + fastpath visibility)
+## Implemented (2026-02 — v3.32 READY-TO-USE per user directive 2026-07-19)
+User's July 19 10:15 test showed:
+- Ghost saves persist even with fresh CSRF (`Rank=0`, `BiddingDate=/Date(1784419200000)/` = 5 days old → likely SAP duplicate/tie silent-reject)
+- EARLY_DROP FIRE never fired (v3.31 setTimeout fix ready but not yet re-tested)
+- User directive: "waisa he kar do jaise 45:00 me detect kar k save kar rha tha Rank 2 aa raha tha", "yaha destination din me 1000 bar bid hota, purana bid ho gaya to next order aa hi sakta hai", "ek log laga jisme captcha kab detect hota SAP kab deta record kare", "ghost problem tik karo", "ready to use do abhi"
+
+Changes:
+- **EARLY_DROP disabled by default** (`EARLY_DROP_MS=0` in `.env` and `.env.example`). Reverts to the proven post-boundary "detect captcha → save immediately" flow that previously achieved Rank 2. All v3.30/v3.31 setTimeout scheduler code stays in place — re-enable by setting `EARLY_DROP_MS=500` for future experiments on fastpath windows.
+- **Captcha-timing CSV telemetry**: new `captchaTimingLog` writer creates `logs/captcha-timing-YYYY-MM-DD.csv` with columns `ts, window_boundary, boundary_ms, first_captcha_ms, latency_ms, session, captcha_flag, sample`. Hooked into `nextCaptcha()` on first non-empty solve per window. `globalThis.__lastBoundaryMs` recorded at :15/:45 boundary crossing block. Console log shows `↳ CAPTCHA UNLOCK LATENCY = 3200ms (boundary→detect)` inline for quick visibility.
+- **Ghost-save log clarified**: message now explicitly states "GAVE UP after 3 ghost attempts (this window only — retries automatically in NEXT window if Vbeln reappears, or on ANY new Vbeln for same destination)". Confirms no permanent blacklist — matches user's real-world where destinations get 1000 bids/day across different Vbelns.
+- **Header comment**: v3.32 changelog documenting these three directives and rationale.
+
+No breaking changes. `bid-engine.js` compiles clean, 28/28 unit tests pass. Ready to run on user's Windows via `test.bat` → `start.bat`. Captcha timing CSV will accumulate data across runs — after 2-3 windows, user can send `logs/captcha-timing-*.csv` for analysis.
+
+
 User's live 2026-07-19 10:15 IST run revealed v3.30 bug: FIRE trigger NEVER fired (verified via `grep "EARLY-DROP FIRE" engine.log` returned nothing). CSRF refresh fired at T-1236ms but next log was boundary-crossed at T+1013ms — main loop jumped from T-1236 to T+1013 (~2.25s tick), skipping the T-300 to T-0 window entirely. Root cause: `while(true)` loop each iteration includes `await tick()` which takes 200-500ms during pre-boundary SAP polling.
 
 Additionally, all 3 submits at T+3.6s / +6.0s / +8.5s were GHOST-SAVED (SAP responded `Rank=0`, `ChangeNo="AAAAAAAA=="`, `CreatedOn=null`, `BiddingDate=/Date(1784419200000)/` = July 14, 5 days old). Captcha `"KiLL"` was solved and accepted. Ghost cause unclear — likely SAP duplicate-detection on already-bid orders, OR tie-lose silent-reject.

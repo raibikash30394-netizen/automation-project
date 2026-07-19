@@ -3,6 +3,20 @@
 /**
  * bid-engine.js — Bikas Bidding v2 main bot
  *
+ * v3.32 — READY-TO-USE (user directive 2026-07-19):
+ *   • EARLY_DROP disabled by default (`EARLY_DROP_MS=0` in .env). The
+ *     July 19 log proved early-drop only works on fastpath windows and
+ *     wasn't firing due to tick-loop timing. Reverts to the proven
+ *     "detect captcha post-boundary → save immediately" flow that
+ *     previously achieved Rank 2. Can be re-enabled via .env for testing.
+ *   • Captcha-timing CSV telemetry — new `logs/captcha-timing-YYYY-MM-DD.csv`
+ *     records per-window (boundary_ms, first_captcha_ms, latency_ms,
+ *     session, captcha_flag, sample). Answers "SAP captcha kab dega, hum
+ *     kab detect karte hai" quantitatively.
+ *   • Ghost-save log clarified — Vbelns given up in THIS window will retry
+ *     in NEXT window AND on ANY new Vbeln for same destination (never
+ *     permanent blacklist — destinations get bid 1000×/day, per user).
+ *
  * v3.31 — PRECISION EARLY-DROP (fixes v3.30 setTimeout skipping):
  *   v3.30 tried to fire from the main tick loop, but each tick() call takes
  *   200-500ms during pre-boundary (SAP is slow). Loop jumped from T-1200ms
@@ -495,6 +509,71 @@ const bidLog = (() => {
   };
 })();
 
+/**
+ * v3.32 — Captcha-timing telemetry.
+ *
+ * User asked (2026-07-19): "ek log laga jisme captcha kab detect hota hai
+ * sap kab deta wo bhi record jare" — log when we detect captcha and when
+ * SAP unlocks it, so we can quantify per-window captcha unlock latency.
+ *
+ * Writes one CSV row per window at the moment `nextCaptcha()` first returns
+ * a non-empty solved captcha. Columns:
+ *   • ts                — ISO timestamp of first detect
+ *   • window_boundary   — IST HH:MM of the :15/:45 boundary this row belongs to
+ *   • boundary_ms       — Date.now() at that boundary (recorded when the
+ *                         :15/:45 crossing block fires, else best-guess)
+ *   • first_captcha_ms  — Date.now() at first non-empty captcha
+ *   • latency_ms        — first_captcha_ms - boundary_ms (positive = post-
+ *                         boundary unlock, which is normal SAP behaviour)
+ *   • session           — session id (s1, s2, ...)
+ *   • captcha_flag      — EvCaptchaFlag as reported by SAP ('X' or '')
+ *   • sample            — first 5 chars of solved captcha (for debugging)
+ *
+ * Rotated daily (`logs/captcha-timing-YYYY-MM-DD.csv`).
+ */
+const captchaTimingLog = (() => {
+  const dir = path.join(ROOT, 'logs');
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  let currentDate = '';
+  let stream = null;
+  const HEADER = 'ts,window_boundary,boundary_ms,first_captcha_ms,latency_ms,session,captcha_flag,sample\n';
+  function open() {
+    const today = new Date().toISOString().slice(0, 10);
+    if (today === currentDate && stream) return stream;
+    if (stream) { try { stream.end(); } catch (_) { /* ignore */ } }
+    currentDate = today;
+    const file = path.join(dir, `captcha-timing-${today}.csv`);
+    const exists = fs.existsSync(file);
+    stream = fs.createWriteStream(file, { flags: 'a' });
+    if (!exists) stream.write(HEADER);
+    return stream;
+  }
+  function esc(v) {
+    const s = String(v == null ? '' : v);
+    if (s.includes(',') || s.includes('"') || s.includes('\n')) {
+      return '"' + s.replace(/"/g, '""') + '"';
+    }
+    return s;
+  }
+  return {
+    write(row) {
+      try {
+        const s = open();
+        s.write([
+          row.ts || new Date().toISOString(),
+          row.window_boundary || '',
+          row.boundary_ms ?? '',
+          row.first_captcha_ms ?? '',
+          row.latency_ms ?? '',
+          row.session || '',
+          row.captcha_flag || '',
+          row.sample || '',
+        ].map(esc).join(',') + '\n');
+      } catch (_) { /* never let logging break bidding */ }
+    },
+  };
+})();
+
 // ---- Small SAP request helper (with 403 CSRF-refresh once) ----------------
 //
 // If the SAP cookie itself has expired/been invalidated (different browser
@@ -948,6 +1027,31 @@ async function nextCaptcha(auth) {
   if (r.solved && !globalThis.__firstCaptchaAt) {
     globalThis.__firstCaptchaAt = Date.now();
     log.info(`⚡ First non-empty captcha detected [${auth.id}] — window open! (${boundaryStatusText()})`);
+    // v3.32 — Persist per-window captcha unlock latency to CSV for post-mortem.
+    // Uses `globalThis.__lastBoundaryMs` set by the :15/:45 boundary block
+    // (see main scheduler). Latency = first_captcha_ms - boundary_ms;
+    // positive value = normal post-boundary unlock (typical 1-3s for SAP).
+    try {
+      const now = Date.now();
+      const boundaryMs = globalThis.__lastBoundaryMs || (now - msUntilNextWindow(new Date(now)) - 30 * 60_000);
+      const latency = boundaryMs > 0 ? now - boundaryMs : null;
+      const ist = new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: false,
+      }).format(new Date(boundaryMs > 0 ? boundaryMs : now));
+      captchaTimingLog.write({
+        ts: new Date(now).toISOString(),
+        window_boundary: ist,
+        boundary_ms: boundaryMs > 0 ? boundaryMs : '',
+        first_captcha_ms: now,
+        latency_ms: latency,
+        session: auth.id,
+        captcha_flag: auth._lastCaptchaFlag || '',
+        sample: (r.solved || '').slice(0, 5),
+      });
+      if (latency != null) {
+        log.info(`   ↳ CAPTCHA UNLOCK LATENCY = ${latency}ms (boundary→detect). Recorded to logs/captcha-timing-*.csv`);
+      }
+    } catch (_) { /* never let logging break bidding */ }
   }
   // Attach the base64 image to the result so callers can invalidate the cache
   // entry later if SAP rejects the solve with "Wrong Captcha".
@@ -1830,7 +1934,7 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
         bidLogRow(b, 'REJECTED_GHOST', `Ghost save (attempt ${prevCount + 1}/${MAX_GHOST_RETRIES})`);
       }
     }
-    const attemptTag = anyGaveUp ? `GAVE UP after ${MAX_GHOST_RETRIES} ghost attempts` : `will retry on next scan`;
+    const attemptTag = anyGaveUp ? `GAVE UP after ${MAX_GHOST_RETRIES} ghost attempts (this window only — retries automatically in NEXT window if Vbeln reappears, or on ANY new Vbeln for same destination)` : `will retry on next scan`;
     log.warn(
       `[${workerId}] ✗ GHOST-SAVED (${item.kind}, ${bids.length}) — SAP said "Saved" but response contains ghost persistence markers ` +
       `(ChangeNo=empty, CreatedOn=null, CreatedAt=PT0S). No actual DB commit — browser will show nothing. ` +
@@ -2281,6 +2385,9 @@ async function main() {
       ctx.undercutAttempts.clear();
       ctx.ghostRetries.clear();  // v3.25: reset per-window ghost-retry counters
       ctx._cachedOrders = null; // force fresh order fetch for new window
+      // v3.32 — Record boundary timestamp for captcha-timing telemetry (used
+      // by nextCaptcha() to compute per-window unlock latency).
+      globalThis.__lastBoundaryMs = Date.now();
       // Reload priority Vbelns so user can edit files/priority.csv mid-run
       // without restarting the bot. Only diff-log if it changed.
       const beforeSize = ctx.priorityVbelns ? ctx.priorityVbelns.size : 0;
