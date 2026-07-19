@@ -1705,6 +1705,42 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
         message: evText.trim() || 'Tied with other vendor(s) — saved at non-1 rank',
       });
     }
+    // v3.29 — Fire-and-forget POST-SAVE VERIFY for TIE case.
+    // SAP's tie behaviour is inconsistent: sometimes ties DO persist at non-1
+    // rank (browser shows the bid with rank 6-7), sometimes they don't save
+    // at all. User cannot distinguish from bot's log alone. So we schedule an
+    // explicit refetch 3.5 s later and log whether the bids actually appear
+    // in SAP's order list. This gives objective proof of the browser state.
+    const submittedIds = new Set(item.bids.map((b) => String(b.order.SapOrderId)));
+    const expectedAmounts = Object.fromEntries(item.bids.map((b) => [String(b.order.SapOrderId), b.amount]));
+    setTimeout(async () => {
+      try {
+        const check = await fetchLiveOrders(auth);
+        const foundTied = [];
+        const missingTied = [];
+        for (const o of check.orders || []) {
+          const oid = String(o.SapOrderId || '');
+          if (!submittedIds.has(oid)) continue;
+          const amt  = parseFloat(o.BiddingAmount || 0);
+          const rank = parseInt(o.BiddingRank || 0, 10);
+          const l1   = parseFloat(o.L1BidAmount || 0);
+          if (amt > 0) foundTied.push(`${oid}@${amt}(rank=${rank || '?'}, L1=${l1 || '?'})`);
+          else missingTied.push(`${oid}(expected ${expectedAmounts[oid]})`);
+        }
+        if (missingTied.length && !foundTied.length) {
+          log.error(
+            `🚨 TIE-SAVE VERIFICATION FAILED: SAP said SAVED-TIED but NONE of the ${submittedIds.size} bids appear in the order list 3.5s later. ` +
+            `Missing: ${missingTied.join(', ')}. → Browser will show NOTHING. SAP's tie logic silently dropped these bids.`
+          );
+        } else if (missingTied.length && foundTied.length) {
+          log.warn(`⚠  TIE-SAVE PARTIAL: ${foundTied.length}/${submittedIds.size} bids persisted. Persisted: ${foundTied.join(', ')} | Dropped: ${missingTied.join(', ')}.`);
+        } else if (foundTied.length) {
+          log.info(`✅ TIE-SAVE VERIFIED: ${foundTied.length} tied bid(s) actually persisted in browser (${foundTied.join(', ')}). Rank low but visible.`);
+        }
+      } catch (e) {
+        log.warn(`TIE-SAVE verify failed: ${e.message}`);
+      }
+    }, 3500);
     return { ok: true };
   }
 

@@ -266,6 +266,15 @@ User asked for AWS `ap-south-1` (Mumbai) deployment on Ubuntu + SSH + PM2 so the
 - **`ecosystem.config.cjs`** at repo root — PM2 config for both `bidding.js` (captcha solver) and `bid-engine.js` (SAP bot). Fork mode, auto-restart, memory limits (350M solver, 400M engine), per-day log rotation, PM2-managed timestamps
 - Recommended instance: **`t3.small`** in `ap-south-1` (Mumbai) with 20 GB gp3 SSD — ~₹1,200-1,500/month burstable, right-sized for bot's ~150 MB RAM + captcha OCR spikes
 
+## Updated (2026-02 — v3.29 TIE-SAVE post-verify)
+User's 2026-07-19 Rampurhat window revealed SAP's tie behaviour is inconsistent: sometimes ties save at non-1 rank (July 18 rank 6-7), sometimes silently drop (July 19 nothing in browser). Bot's log couldn't distinguish these cases. Fix:
+- **Fire-and-forget POST-SAVE VERIFY for TIE branch**: 3.5s after every `SAVED-TIED` response, bot refetches `BidOrderListSet` and logs:
+  - ✅ `TIE-SAVE VERIFIED: N tied bid(s) actually persisted in browser (rank low but visible)` — good outcome
+  - 🚨 `TIE-SAVE VERIFICATION FAILED: SAP said SAVED-TIED but NONE of the N bids appear... Browser will show NOTHING.` — bad outcome (user's July 19 case)
+  - ⚠  `TIE-SAVE PARTIAL: X/N bids persisted...` — mixed outcome
+- Provides **objective evidence** of whether a tie truly saved or not — user no longer needs to check browser manually to know the outcome
+- Non-blocking (setTimeout+fetchLiveOrders) — does not delay the main scan loop
+
 ## Verified
 - `bidding.js` starts, loads cache, `/health` returns metrics JSON
 - `POST /solve-captcha` and `POST /` both accept text/plain JSON, return `{solved}`
