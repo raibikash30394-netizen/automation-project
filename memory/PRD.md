@@ -275,6 +275,21 @@ User's 2026-07-19 Rampurhat window revealed SAP's tie behaviour is inconsistent:
 - Provides **objective evidence** of whether a tie truly saved or not — user no longer needs to check browser manually to know the outcome
 - Non-blocking (setTimeout+fetchLiveOrders) — does not delay the main scan loop
 
+
+## Implemented (2026-02 — v3.30 EARLY DROP "1 sec pehle" trick)
+User feedback ("mai UI me 1 sec pehele chor deta hu... 50% mera rank 1 hota") revealed that submitting ~1 second BEFORE the :15/:45 boundary bypasses the network-RTT penalty that competitors face. Fix:
+- **New config**: `EARLY_DROP_MS` (default `500`) and `EARLY_DROP_CSRF_LEAD_MS` (default `1000`) in `.env` / `.env.example`
+- **New scheduler helper**: `isEarlyDropWindow()` returns true within `EARLY_DROP_MS` of next boundary
+- **Early-drop CSRF refresh**: fires exactly ONCE per window at `T-(EARLY_DROP_MS + LEAD_MS)` — mints a token that is fresh enough to not be flagged pre-window stale, propagated enough to be accepted by SAP
+- **Early-drop FIRE**: fires exactly ONCE per window at `T-EARLY_DROP_MS`, sets `ctx._hotStall = true` so `tick()` tight-polls captcha + orders — request lands on SAP AT boundary open given 100-400ms RTT
+- **Tight-poll runway**: final 2s before early-drop fire uses `sleepMs = 0` so we never sleep past the target moment
+- **Once-per-window semantics**: both triggers use `nextBoundaryKey = Math.floor((Date.now() + untilNext) / 60_000)` to prevent duplicate fires across tight polls
+- **3 new unit tests** in `test-window-scheduler.js`: `testEarlyDropWindow` (8 cases), `testEarlyDropOnceSemantics` (3-window verification), `testEarlyDropAndBoundaryComplementary` (temporal ordering with v3.25 boundary block)
+- **Set `EARLY_DROP_MS=0` to disable** and revert to strict-at-boundary behaviour
+
+Testing status: 28 unit tests pass (including 3 new early-drop tests). Live SAP verification pending user's next window trial (user prefers to test on production SAP directly).
+
+
 ## Verified
 - `bidding.js` starts, loads cache, `/health` returns metrics JSON
 - `POST /solve-captcha` and `POST /` both accept text/plain JSON, return `{solved}`

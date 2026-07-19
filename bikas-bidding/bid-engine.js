@@ -3,6 +3,14 @@
 /**
  * bid-engine.js — Bikas Bidding v2 main bot
  *
+ * v3.30 — EARLY DROP ("1 sec pehle" trick):
+ *   Bot now fires EBiddingSaveSet EARLY_DROP_MS ms (default 500) BEFORE the
+ *   :15/:45 boundary so the request lands on SAP AT boundary open — beating
+ *   competitors whose submits fire AT boundary + network-RTT. Replicates the
+ *   user's manual UI behaviour ("mai UI me 1 sec pehle chor deta hu") which
+ *   was achieving ~50% Rank 1. CSRF is freshly minted 1s before the fire so
+ *   SAP doesn't flag it as pre-window stale.
+ *
  * Improvements over v1:
  *   • undici Pool per host (SAP main, local captcha solver) → faster than axios,
  *     persistent HTTP/1.1 keep-alive across the whole process.
@@ -79,6 +87,24 @@ const WAF_MAX_MS   = parseInt(process.env.WAF_BACKOFF_MAX_MS || '120000', 10);
 const WAF_RESET_MS = parseInt(process.env.WAF_RESET_AFTER_MS || '300000', 10);
 
 const METRICS_MS   = parseInt(process.env.METRICS_INTERVAL_MS || '30000', 10);
+
+// v3.30 — EARLY DROP (a.k.a. "1-second-early trick"). Replicates the user's
+// manual UI behaviour: click Save ~1s BEFORE the :15/:45 boundary. SAP appears
+// to accept these pre-boundary saves and processes them AT boundary open,
+// giving Rank 1 with ~50% success in manual tests.
+//
+// The bot fires the submit `EARLY_DROP_MS` ms BEFORE the clock boundary so the
+// request lands on SAP servers at (or microseconds before) the boundary open —
+// beating competitors whose requests fire AT boundary + network RTT (100-400ms).
+//
+// Set to 0 to disable and revert to strict-at-boundary behaviour.
+// Recommended: 300-700ms (network-RTT-dependent). Default 500ms.
+const EARLY_DROP_MS = parseInt(process.env.EARLY_DROP_MS || '500', 10);
+
+// How long BEFORE the early-drop moment to freshly mint CSRF. SAP flags
+// too-old ("pre-window") CSRF tokens as stale, so we mint the token ~1s before
+// the actual pre-boundary submit fire.
+const EARLY_DROP_CSRF_LEAD_MS = parseInt(process.env.EARLY_DROP_CSRF_LEAD_MS || '1000', 10);
 
 const ROOT       = __dirname;
 const COOKIE_FILE = path.join(ROOT, 'cookie.txt');
@@ -232,6 +258,16 @@ function isHotWindow() {
   if (minute >= 15 && minute < 20) return true;
   if (minute >= 45 && minute < 50) return true;
   return false;
+}
+
+// v3.30 — Are we inside the EARLY-DROP fire window?
+//   Returns true when we're within `EARLY_DROP_MS` ms BEFORE the next :15/:45
+//   boundary AND EARLY_DROP is enabled. During this phase the bot fires
+//   `EBiddingSaveSet` speculatively so the request lands on SAP AT boundary
+//   open (mirrors the user's manual "1 sec pehle" UI click).
+function isEarlyDropWindow() {
+  if (EARLY_DROP_MS <= 0) return false;
+  return msUntilNextWindow() <= EARLY_DROP_MS;
 }
 
 /**
@@ -2086,6 +2122,8 @@ async function main() {
   let lastPreWarmAt = 0;
   let lastEarlyWarmAt = 0;
   let lastBoundaryLogAt = 0;
+  let earlyDropCsrfWinKey = 0;   // v3.30 — CSRF freshly minted for the current early-drop
+  let earlyDropFiredWinKey = 0;  // v3.30 — early-drop tick already invoked for this window
   while (true) {
     const untilNext = msUntilNextWindow();
     const hot = isHotWindow();
@@ -2113,6 +2151,46 @@ async function main() {
       log.info(`⏱  Pre-warming for next SAP bid-window (~${Math.round(untilNext / 1000)}s away, IST-aligned)`);
       // Fire-and-forget: refresh CSRF + touch SessionSet in parallel for all sessions.
       Promise.all(ctx.sessions.map((s) => s.refreshToken().catch(() => {})));
+    }
+
+    // v3.30 — EARLY-DROP CSRF refresh.
+    //
+    // Refresh CSRF EARLY_DROP_CSRF_LEAD_MS BEFORE the early-drop fire moment
+    // (i.e. ~1s before we submit). This gives us a token that is:
+    //   • fresh enough that SAP does not flag it as "pre-window stale"
+    //   • not-so-fresh that it hasn't propagated through SAP's cluster yet
+    // Runs at most once per window (keyed by nextBoundaryKey).
+    const nextBoundaryKey = Math.floor((Date.now() + untilNext) / 60_000);
+    if (
+      EARLY_DROP_MS > 0 &&
+      untilNext <= (EARLY_DROP_MS + EARLY_DROP_CSRF_LEAD_MS) &&
+      untilNext >  EARLY_DROP_MS &&
+      earlyDropCsrfWinKey !== nextBoundaryKey
+    ) {
+      earlyDropCsrfWinKey = nextBoundaryKey;
+      log.info(`🚀 EARLY-DROP CSRF refresh (~${untilNext}ms to boundary, target fire T-${EARLY_DROP_MS}ms) — minting post-pre-window token for speculative submit`);
+      Promise.all(ctx.sessions.map((s) => s.refreshToken().catch((e) => {
+        log.warn(`[${s.id}] early-drop CSRF refresh failed: ${e.message}`);
+      })));
+    }
+
+    // v3.30 — EARLY-DROP FIRE (mirrors user's manual "1 sec pehle" UI click).
+    //
+    // When we're `EARLY_DROP_MS` ms before the :15/:45 boundary, invoke tick()
+    // IMMEDIATELY without any sleep. This lets the bot fire EBiddingSaveSet
+    // so it lands on SAP servers AT (or microseconds before) boundary open,
+    // instead of the normal `boundary + network-RTT` arrival that competitors
+    // are stuck with. Runs at most once per window (keyed by nextBoundaryKey).
+    if (
+      EARLY_DROP_MS > 0 &&
+      untilNext <= EARLY_DROP_MS &&
+      untilNext > 0 &&
+      earlyDropFiredWinKey !== nextBoundaryKey
+    ) {
+      earlyDropFiredWinKey = nextBoundaryKey;
+      log.info(`🎯 EARLY-DROP FIRE @ T-${untilNext}ms (target: boundary open) — dispatching tick() speculatively; SAP should receive at boundary given RTT`);
+      // Set the hot-stall flag so tick() knows to tight-poll captcha/orders.
+      ctx._hotStall = true;
     }
 
     // Precise "window boundary reached" log — fires once per window when the
@@ -2189,6 +2267,10 @@ async function main() {
     let sleepMs;
     if (ctx._matchedButNoCaptcha || ctx._hotStall) {
       sleepMs = 0; // tight loop — window is opening/open OR waiting for orders/matches to appear
+    } else if (EARLY_DROP_MS > 0 && untilNext <= EARLY_DROP_MS + 2000) {
+      // v3.30 — In the final ~2s runway before early-drop fire, poll tightly
+      // so we do not sleep past our target `boundary - EARLY_DROP_MS` moment.
+      sleepMs = 0;
     } else if (hot) {
       sleepMs = POLL_MS; // inside 5-min active window (or 30s pre-warm) — user-tunable
     } else if (untilNext < 10_000) {

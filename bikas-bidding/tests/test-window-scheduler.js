@@ -55,6 +55,15 @@ function isHotWindow(now = new Date()) {
   return false;
 }
 
+// v3.30 — Early-drop window: TRUE when we're within EARLY_DROP_MS of the
+// next :15/:45 boundary and EARLY_DROP is enabled. Mirrors the user's
+// manual "1 sec pehle" UI click behaviour so the submit lands on SAP AT
+// boundary open (not `boundary + network-RTT` later).
+function isEarlyDropWindow(now = new Date(), earlyDropMs = 500) {
+  if (earlyDropMs <= 0) return false;
+  return msUntilNextWindow(now) <= earlyDropMs;
+}
+
 // ---- Test IST helpers using synthetic clock -------------------------------
 
 // Helper: create a Date whose IST representation is (h, m, s).
@@ -1433,12 +1442,178 @@ async function testNetworkRetryOnIdempotent() {
   console.log('✓ Network-timeout retry: 4 cases pass (retry recovers, retry disabled honours flag, both-fail propagates, non-network errors NOT retried)');
 }
 
-// ---- Run --------------------------------------------------------------------
+// v3.30 — EARLY-DROP: replicates the user's "1 sec pehle" manual UI click.
+// The bot fires EBiddingSaveSet EARLY_DROP_MS ms BEFORE the :15/:45 boundary
+// so the request lands on SAP servers AT (or microseconds before) the
+// boundary open, given typical 100-400ms network RTT to SAP. This claims
+// Rank 1 vs. competitors whose submits fire AT boundary + RTT.
+function testEarlyDropWindow() {
+  // Case 1: 501ms before boundary → NOT yet in early-drop window
+  const t1 = istDate(14, 44, 59);   // exactly 1000ms to 14:45:00
+  // But msUntilNextWindow rounds to ~1000ms; let's use 14:44:59.499
+  const d1 = new Date(istDate(14, 44, 59).getTime() + 499);  // 501ms to 14:45:00
+  assert.strictEqual(isEarlyDropWindow(d1, 500), false, '501ms before boundary: not in early-drop');
+
+  // Case 2: 500ms before boundary → IN early-drop window
+  const d2 = new Date(istDate(14, 44, 59).getTime() + 500);  // exactly 500ms to 14:45:00
+  assert.strictEqual(isEarlyDropWindow(d2, 500), true, '500ms before: in early-drop');
+
+  // Case 3: 100ms before boundary → still in early-drop
+  const d3 = new Date(istDate(14, 44, 59).getTime() + 900);  // 100ms to 14:45:00
+  assert.strictEqual(isEarlyDropWindow(d3, 500), true, '100ms before: in early-drop');
+
+  // Case 4: At boundary → NOT in early-drop window (we've moved to NEXT window)
+  //   At 14:45:00, msUntilNextWindow returns the time until 15:15:00 (~30 min).
+  //   So early-drop for THIS boundary is already past.
+  const d4 = istDate(14, 45, 0);
+  assert.strictEqual(isEarlyDropWindow(d4, 500), false, 'at boundary: window rolled over to next boundary');
+
+  // Case 5: 5 seconds before boundary → NOT in early-drop (only last 500ms)
+  const d5 = istDate(14, 44, 55);
+  assert.strictEqual(isEarlyDropWindow(d5, 500), false, '5s before: not in early-drop');
+
+  // Case 6: 1000ms early-drop config → 800ms before boundary IS in window
+  const d6 = new Date(istDate(14, 44, 59).getTime() + 200);  // 800ms to 14:45:00
+  assert.strictEqual(isEarlyDropWindow(d6, 1000), true, '800ms before with 1000ms config: in early-drop');
+
+  // Case 7: EARLY_DROP_MS=0 → disabled, never in window
+  assert.strictEqual(isEarlyDropWindow(d2, 0), false, 'EARLY_DROP_MS=0: feature disabled');
+
+  // Case 8: 30-minute-away sanity — never trigger far from boundary
+  const d8 = istDate(14, 30, 0); // 15 minutes to 14:45
+  assert.strictEqual(isEarlyDropWindow(d8, 500), false, '15min before: not in early-drop');
+
+  console.log('✓ Early-drop window: 8 cases pass (fires only in last EARLY_DROP_MS before boundary)');
+}
+
+// v3.30 — Once-per-window semantics for CSRF refresh + fire trigger.
+// Both `earlyDropCsrfWinKey` and `earlyDropFiredWinKey` use `nextBoundaryKey =
+// Math.floor((Date.now() + untilNext) / 60_000)`. Because the boundary
+// timestamp is stable across an entire ~30-minute pre-boundary phase, this
+// guarantees exactly ONE CSRF refresh + ONE fire per window.
+function testEarlyDropOnceSemantics() {
+  // Simulate 3 consecutive polls approaching the boundary — CSRF should fire
+  // exactly once, and the fire trigger should also fire exactly once.
+  const EARLY_DROP_MS = 500;
+  const LEAD_MS = 1000;
+  let csrfWinKey = 0;
+  let fireWinKey = 0;
+  let csrfFireCount = 0;
+  let fireCount = 0;
+
+  function poll(nowMs, boundaryMs) {
+    const untilNext = boundaryMs - nowMs;
+    // Same formula as bid-engine.js:
+    //   nextBoundaryKey = Math.floor((Date.now() + untilNext) / 60_000)
+    const nextBoundaryKey = Math.floor((nowMs + untilNext) / 60_000);
+
+    // CSRF refresh trigger (T-1500 → T-500 ms window)
+    if (
+      EARLY_DROP_MS > 0 &&
+      untilNext <= (EARLY_DROP_MS + LEAD_MS) &&
+      untilNext >  EARLY_DROP_MS &&
+      csrfWinKey !== nextBoundaryKey
+    ) {
+      csrfWinKey = nextBoundaryKey;
+      csrfFireCount++;
+    }
+
+    // Fire trigger (T-EARLY_DROP_MS or closer)
+    if (
+      EARLY_DROP_MS > 0 &&
+      untilNext <= EARLY_DROP_MS &&
+      untilNext > 0 &&
+      fireWinKey !== nextBoundaryKey
+    ) {
+      fireWinKey = nextBoundaryKey;
+      fireCount++;
+    }
+  }
+
+  // Assume boundary at t=60_000 (start of a fictional minute)
+  const boundary = 60_000;
+  // Poll every 100ms from T-2500 to T-100 (25 poll ticks)
+  for (let now = boundary - 2500; now <= boundary - 100; now += 100) {
+    poll(now, boundary);
+  }
+  assert.strictEqual(csrfFireCount, 1, 'CSRF refresh fires exactly ONCE per window');
+  assert.strictEqual(fireCount, 1, 'Fire trigger fires exactly ONCE per window');
+
+  // Simulate the NEXT window — window keys should differ, both fire again
+  const boundary2 = boundary + 30 * 60_000; // 30 min later
+  for (let now = boundary2 - 2500; now <= boundary2 - 100; now += 100) {
+    poll(now, boundary2);
+  }
+  assert.strictEqual(csrfFireCount, 2, 'CSRF refresh fires ONCE more in next window');
+  assert.strictEqual(fireCount, 2, 'Fire trigger fires ONCE more in next window');
+
+  // Simulate tight-loop polling every 5ms in final 100ms — still ONCE only
+  const boundary3 = boundary2 + 30 * 60_000;
+  for (let now = boundary3 - 100; now <= boundary3 - 5; now += 5) {
+    poll(now, boundary3);
+  }
+  assert.strictEqual(fireCount, 3, 'Fire trigger fires ONCE even under tight polling');
+
+  console.log('✓ Early-drop once-semantics: CSRF refresh + fire trigger each dispatch EXACTLY ONCE per :15/:45 window (3 windows verified)');
+}
+
+// v3.30 — Early-drop DOES NOT collide with existing boundary-block/pre-warm.
+// The v3.25 boundary CSRF (fires AFTER :15:00 / :45:00 crossover) and v3.30
+// early-drop CSRF (fires ~1s BEFORE) are complementary — both should run,
+// but on separate poll ticks. This test verifies the temporal ordering.
+function testEarlyDropAndBoundaryComplementary() {
+  const events = [];
+  const EARLY_DROP_MS = 500;
+  const LEAD_MS = 1000;
+  let earlyCsrfKey = 0;
+  let boundaryLoggedKey = 0;
+
+  function poll(nowMs, boundaryMs) {
+    const untilNext = Math.max(0, boundaryMs - nowMs);
+    const nextBoundaryKey = Math.floor((nowMs + untilNext) / 60_000);
+
+    // Early-drop CSRF (T-1500 to T-500 pre-boundary)
+    if (
+      untilNext <= (EARLY_DROP_MS + LEAD_MS) &&
+      untilNext >  EARLY_DROP_MS &&
+      earlyCsrfKey !== nextBoundaryKey
+    ) {
+      earlyCsrfKey = nextBoundaryKey;
+      events.push({ event: 'EARLY_DROP_CSRF', at: nowMs, untilNext });
+    }
+
+    // Boundary log (once, when we're INSIDE the 30-min post-boundary window
+    // — simulated here by a "just crossed" detection: untilNext > 29 min).
+    // (Simplification: real code detects `hot && untilNext > 29*60_000`.)
+    if (nowMs >= boundaryMs && (nowMs - boundaryMs) < 100 && boundaryLoggedKey !== nextBoundaryKey - 30) {
+      boundaryLoggedKey = nextBoundaryKey - 30;
+      events.push({ event: 'BOUNDARY_CROSSED', at: nowMs, sincedBoundary: nowMs - boundaryMs });
+    }
+  }
+
+  const boundary = 60_000;
+  for (let now = boundary - 3000; now <= boundary + 500; now += 100) {
+    poll(now, boundary);
+  }
+
+  const earlyDropEv = events.find((e) => e.event === 'EARLY_DROP_CSRF');
+  const boundaryEv = events.find((e) => e.event === 'BOUNDARY_CROSSED');
+  assert(earlyDropEv, 'early-drop CSRF must have fired');
+  assert(boundaryEv, 'boundary crossing must have been detected');
+  assert(earlyDropEv.at < boundaryEv.at, 'early-drop CSRF fires BEFORE boundary crossing');
+  assert(earlyDropEv.untilNext > 0, 'early-drop CSRF fires while still BEFORE boundary (untilNext>0)');
+  assert(earlyDropEv.untilNext <= EARLY_DROP_MS + LEAD_MS, `early-drop CSRF fires in the lead window (${earlyDropEv.untilNext}ms remaining)`);
+
+  console.log('✓ Early-drop + boundary CSRF: temporal ordering correct — early-drop fires ~1s before, boundary block fires just after :15/:45');
+}
 
 (async () => {
   try {
     testMsUntilNextWindow();
     testIsHotWindow();
+    testEarlyDropWindow();
+    testEarlyDropOnceSemantics();
+    testEarlyDropAndBoundaryComplementary();
     await testGlobalMutexSerialises();
     await testSequentialFallback();
     testBatchingLogic();
