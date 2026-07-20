@@ -3,6 +3,29 @@
 /**
  * bid-engine.js — Bikas Bidding v2 main bot
  *
+ * v3.33 — INDEPENDENT CAPTCHA POLLER + extended pre-scan (user directive 2026-07-19):
+ *   "ek scanner laga do jo bid window k khulne se pehele he scan karne lage
+ *    or jaise window khule submit kar de captcha dikhte he" —
+ *   Add a scanner that starts before the window opens, and submits the
+ *   instant captcha appears.
+ *
+ *   Changes:
+ *   • Extended pre-scan: `isHotWindow()` returns true for the ENTIRE minute
+ *     :14 or :44 (60s pre-warm, was 30s) so BidOrderListSet scanner and
+ *     captcha poller both have more runway to warm up.
+ *   • Independent captcha poller: new 50ms `setInterval` loop that runs
+ *     out-of-band from tick(). Starts polling 90s before each boundary
+ *     (or immediately when isHotWindow). The moment SAP unlocks captcha,
+ *     solves via local server and caches on `ctx._preCaptcha[sessionId]`.
+ *   • Instant-dispatch hook: `resolveCaptcha()` checks the pre-cache FIRST
+ *     and uses the pre-solved captcha if fresh (<3s). Shaves 100-300ms
+ *     off the boundary→submit latency (captcha fetch was previously
+ *     sequential inside tick, blocking the 200-500ms fetchOrders call).
+ *   • Config: `CAPTCHA_POLLER_MS=50` (interval), `CAPTCHA_POLLER_LEAD_MS=90000`
+ *     (activation lead time). Set POLLER_MS=0 to disable.
+ *   • Mirrors the SAP browser controller (`EBidding-dbg.controller.js`)
+ *     which uses `getCaptcha(...poll=true, interval=50)` to auto-fire save.
+ *
  * v3.32 — READY-TO-USE (user directive 2026-07-19):
  *   • EARLY_DROP disabled by default (`EARLY_DROP_MS=0` in .env). The
  *     July 19 log proved early-drop only works on fastpath windows and
@@ -271,13 +294,15 @@ function msUntilNextWindow() {
 }
 
 // Are we in an active/soon bid-window window?
-//   pre-warm : 30 s BEFORE :15 / :45  → true (aggressive polling starts)
+//   pre-warm : 60 s BEFORE :15 / :45  → true (aggressive polling starts,
+//              extended from 30s in v3.33 so the independent captcha poller
+//              and BidOrderListSet scanner have more runway to warm caches)
 //   active   : first 5 min AFTER      → true (window is open, keep tight)
 //   idle     : otherwise              → false
 function isHotWindow() {
   const { minute, second } = getISTNow();
-  // Pre-warm: last 30 s of minute :14 or :44
-  if ((minute === 14 || minute === 44) && second >= 30) return true;
+  // Pre-warm: entire minute :14 or :44 (60s before boundary — v3.33)
+  if ((minute === 14 || minute === 44)) return true;
   // Active window: :15–:19 and :45–:49 (first 5 min after open)
   if (minute >= 15 && minute < 20) return true;
   if (minute >= 45 && minute < 50) return true;
@@ -1438,6 +1463,23 @@ function makeWorkerPool(ctx) {
       if (auth._lastCaptchaFlag === '') return '__NO_CAPTCHA_REQUIRED__';
     }
 
+    // v3.33 — INSTANT DISPATCH: If the independent captcha poller (started
+    // at pre-warm, polls every 50 ms independent of tick loop) has already
+    // solved a fresh captcha for this session, use it directly. This skips
+    // the fetchCaptcha + solve round-trip entirely and can shave 100-300 ms
+    // off the boundary→submit latency, mirroring the browser's model of
+    // "captcha polling in background, save fires the instant it appears".
+    if (ctx._preCaptcha && ctx._preCaptcha[auth.id]) {
+      const pc = ctx._preCaptcha[auth.id];
+      const ageMs = Date.now() - pc.ts;
+      if (pc.solved && ageMs < 3_000 && !pc.consumed) {
+        pc.consumed = true; // one-shot use; poller will keep refreshing
+        auth._lastCaptchaImg = pc.img;
+        log.info(`[${workerId}] ⚡ INSTANT-DISPATCH: using pre-solved captcha from independent poller (age ${ageMs}ms) — skipping in-tick captcha fetch`);
+        return pc.solved;
+      }
+    }
+
     // Use parallel probing when we know the window is about to open (matched
     // orders exist + no captcha yet). Otherwise single probe is enough.
     const useParallel = ctx._matchedButNoCaptcha || isHotWindow();
@@ -2233,6 +2275,94 @@ async function main() {
   process.on('SIGTERM', () => { log.info('SIGTERM — bye'); process.exit(0); });
 
   if (METRICS_MS > 0) setInterval(metricsDump, METRICS_MS).unref();
+
+  // v3.33 — INDEPENDENT CAPTCHA POLLER.
+  //
+  // User asked (2026-07-19): "ek scanner laga do jo bid window ke khulne se
+  // pehele he scan karne lage or jaise window khule submit kar de captcha
+  // dikhte he" — a scanner that starts BEFORE the window opens, and submits
+  // the moment captcha appears.
+  //
+  // Mirrors the SAP browser controller (EBidding-dbg.controller.js), which
+  // starts a 50 ms setInterval captcha poll at boundary-500ms and auto-fires
+  // save the moment SAP unlocks captcha. The main tick() loop is SEQUENTIAL
+  // (fetchOrders 200ms → captcha 100ms → build → submit); if SAP unlocks
+  // captcha while fetchOrders is in-flight, we miss the moment.
+  //
+  // This poller runs OUT-OF-BAND at 50 ms interval when we are within 90 s
+  // of the next :15/:45 boundary (or already inside a hot window). When SAP
+  // returns a non-empty captcha, it solves via the local server and caches
+  // the result on `ctx._preCaptcha[sessionId]`. The `resolveCaptcha()` path
+  // (called from tick) checks this cache FIRST and returns the pre-solved
+  // captcha instantly, skipping the round-trip.
+  ctx._preCaptcha = {};
+  const CAPTCHA_POLLER_INTERVAL = parseInt(process.env.CAPTCHA_POLLER_MS || '50', 10);
+  const CAPTCHA_POLLER_LEAD_MS  = parseInt(process.env.CAPTCHA_POLLER_LEAD_MS || '90000', 10);
+  if (CAPTCHA_POLLER_INTERVAL <= 0) {
+    log.info(`🔍 Independent captcha poller DISABLED (CAPTCHA_POLLER_MS=0) — tick loop only`);
+  } else {
+    let capPollerBusy = false;
+  const capPollerHandle = setInterval(async () => {
+    if (capPollerBusy) return;
+    // Only run when close to (or inside) a hot window — otherwise idle to save CPU.
+    const untilN = msUntilNextWindow();
+    if (untilN > CAPTCHA_POLLER_LEAD_MS && !isHotWindow()) return;
+    if (wafActive()) return;
+    capPollerBusy = true;
+    try {
+      const primary = ctx.sessions[0];
+      if (!primary || !primary.cookie) return;
+      // If SAP told us fastpath is active for this window, skip captcha work.
+      if (primary._lastCaptchaFlag === '') return;
+      const winKey = Math.floor((Date.now() + untilN) / 60_000);
+      // One fresh solve per window is enough — after that, tick() uses the
+      // cached value; the poller stops re-solving until next boundary.
+      if (ctx._preCaptcha[primary.id]?.winKey === winKey && ctx._preCaptcha[primary.id]?.solved) return;
+      const { img, reason } = await fetchCaptchaImage(primary);
+      if (!img) return; // sap-empty (pre-unlock) — normal
+      const r = await solveViaLocal(img);
+      if (r.solved) {
+        ctx._preCaptcha[primary.id] = {
+          solved: r.solved,
+          img,
+          ts: Date.now(),
+          winKey,
+          consumed: false,
+        };
+        log.info(`[cap-poller] ⚡ PRE-SOLVED captcha ready for ${primary.id} (session, sample: ${r.solved.slice(0, 5)}) — next tick will submit INSTANTLY`);
+        // Reuse the timing telemetry that nextCaptcha uses.
+        if (!globalThis.__firstCaptchaAt) {
+          globalThis.__firstCaptchaAt = Date.now();
+          try {
+            const now = Date.now();
+            const boundaryMs = globalThis.__lastBoundaryMs || 0;
+            const latency = boundaryMs > 0 ? now - boundaryMs : null;
+            const ist = new Intl.DateTimeFormat('en-GB', {
+              timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: false,
+            }).format(new Date(boundaryMs > 0 ? boundaryMs : now));
+            captchaTimingLog.write({
+              ts: new Date(now).toISOString(),
+              window_boundary: ist,
+              boundary_ms: boundaryMs > 0 ? boundaryMs : '',
+              first_captcha_ms: now,
+              latency_ms: latency,
+              session: primary.id,
+              captcha_flag: primary._lastCaptchaFlag || '',
+              sample: r.solved.slice(0, 5),
+            });
+            if (latency != null) log.info(`   ↳ CAPTCHA UNLOCK LATENCY (poller) = ${latency}ms`);
+          } catch (_) { /* never let logging break bidding */ }
+        }
+      }
+    } catch (e) {
+      // silent — poller must never crash the process
+    } finally {
+      capPollerBusy = false;
+    }
+  }, CAPTCHA_POLLER_INTERVAL);
+  capPollerHandle.unref?.();
+  log.info(`🔍 Independent captcha poller ACTIVE (interval=${CAPTCHA_POLLER_INTERVAL}ms, activates ${CAPTCHA_POLLER_LEAD_MS/1000}s before each :15/:45 window)`);
+  }
 
   // Main polling loop.
   //

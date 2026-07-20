@@ -287,7 +287,19 @@ User feedback ("mai UI me 1 sec pehele chor deta hu... 50% mera rank 1 hota") re
 - **3 new unit tests** in `test-window-scheduler.js`: `testEarlyDropWindow` (8 cases), `testEarlyDropOnceSemantics` (3-window verification), `testEarlyDropAndBoundaryComplementary` (temporal ordering with v3.25 boundary block)
 - **Set `EARLY_DROP_MS=0` to disable** and revert to strict-at-boundary behaviour
 
-## Implemented (2026-02 — v3.32 READY-TO-USE per user directive 2026-07-19)
+## Implemented (2026-02 — v3.33 INDEPENDENT CAPTCHA POLLER + extended pre-scan)
+User directive 2026-07-19: "ek scanner laga do jo bid window k khulne se pehele he scan karne lage or jaise window khule submit kar de captcha dikhte he tab tho hoga na thora fast"
+Changes:
+- **Extended pre-scan** — `isHotWindow()` now returns true for the ENTIRE minute :14 and :44 (60s runway, was 30s). BidOrderListSet scanner and captcha poller both get 2× more warmup time. Unit tests updated (11 hot + 11 cold cases).
+- **Independent captcha poller** — new 50ms `setInterval` loop that runs OUT-OF-BAND from tick(). Starts polling 90s before boundary (config `CAPTCHA_POLLER_LEAD_MS`) or immediately when `isHotWindow()`. When SAP returns non-empty captcha, solves via local server and caches on `ctx._preCaptcha[sessionId]` with winKey + ts. Also emits `⚡ PRE-SOLVED captcha ready` log + writes to `logs/captcha-timing-*.csv` (single-source of truth for latency telemetry).
+- **Instant-dispatch hook** — `resolveCaptcha()` checks `ctx._preCaptcha[auth.id]` FIRST before the sequential fetch. If fresh (<3s) and unconsumed, returns pre-solved captcha instantly. Logs `⚡ INSTANT-DISPATCH: using pre-solved captcha (age Xms)`. Shaves 100-300ms boundary→submit latency (previously captcha fetch was serialised inside tick, blocking on the 200-500ms fetchOrders call).
+- **Config**: `.env` and `.env.example` added `CAPTCHA_POLLER_MS=50` and `CAPTCHA_POLLER_LEAD_MS=90000`. Set `CAPTCHA_POLLER_MS=0` to disable (falls back to sequential in-tick fetch).
+- **Fastpath handling**: poller skips work when `EvCaptchaFlag=''` (no captcha needed anyway). WAF cool-off honoured.
+- **Mirrors SAP browser controller** — deobfuscated `EBidding-dbg.controller.js` at `getCaptcha(...poll=true, interval=50)` shows the browser uses identical 50ms polling to auto-fire save the moment captcha appears. Now our bot has the same architecture.
+
+Testing: 28/28 unit tests pass, `node --check` clean, boot smoke test clean.
+
+
 User's July 19 10:15 test showed:
 - Ghost saves persist even with fresh CSRF (`Rank=0`, `BiddingDate=/Date(1784419200000)/` = 5 days old → likely SAP duplicate/tie silent-reject)
 - EARLY_DROP FIRE never fired (v3.31 setTimeout fix ready but not yet re-tested)

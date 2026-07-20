@@ -49,7 +49,8 @@ function isHotWindow(now = new Date()) {
   }).formatToParts(now);
   const o = {};
   for (const p of parts) if (p.type !== 'literal') o[p.type] = parseInt(p.value, 10);
-  if ((o.minute === 14 || o.minute === 44) && o.second >= 30) return true;
+  // v3.33 — extended pre-warm from 30s to full minute (60s before boundary)
+  if ((o.minute === 14 || o.minute === 44)) return true;
   if (o.minute >= 15 && o.minute < 20) return true;
   if (o.minute >= 45 && o.minute < 50) return true;
   return false;
@@ -100,15 +101,16 @@ function testMsUntilNextWindow() {
 
 function testIsHotWindow() {
   const trueCases = [
-    [14, 14, 30], [14, 14, 45], [14, 14, 59], // pre-warm before :15
+    // v3.33 — pre-warm is now the ENTIRE minute :14 or :44 (60s runway)
+    [14, 14,  0], [14, 14, 15], [14, 14, 30], [14, 14, 45], [14, 14, 59],
     [14, 15,  0], [14, 17,  0], [14, 19, 59], // active window after :15
-    [14, 44, 30], [14, 44, 59],               // pre-warm before :45
+    [14, 44,  0], [14, 44, 15], [14, 44, 30], [14, 44, 59],
     [14, 45,  0], [14, 47,  0], [14, 49, 59], // active window after :45
   ];
   const falseCases = [
-    [14,  0,  0], [14, 10,  0], [14, 14, 29], // too early
+    [14,  0,  0], [14, 10,  0], [14, 13, 59], // still too early (before :14 minute)
     [14, 20,  0], [14, 25,  0], [14, 30,  0], // between windows
-    [14, 40,  0], [14, 44, 29],               // too early for :45
+    [14, 40,  0], [14, 43, 59],               // still too early (before :44 minute)
     [14, 50,  0], [14, 55,  0], [14, 59, 59], // after active
   ];
   for (const c of trueCases) {
@@ -119,7 +121,7 @@ function testIsHotWindow() {
     assert(isHotWindow(istDate(...c)) === false,
       `isHotWindow(${c.join(':')}) should be FALSE`);
   }
-  console.log(`✓ isHotWindow(): ${trueCases.length} hot + ${falseCases.length} cold cases pass`);
+  console.log(`✓ isHotWindow(): ${trueCases.length} hot + ${falseCases.length} cold cases pass (v3.33 extended pre-warm to full :14/:44 minute)`);
 }
 
 // ---- Test global mutex serialisation --------------------------------------
