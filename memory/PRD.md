@@ -287,6 +287,37 @@ User feedback ("mai UI me 1 sec pehele chor deta hu... 50% mera rank 1 hota") re
 - **3 new unit tests** in `test-window-scheduler.js`: `testEarlyDropWindow` (8 cases), `testEarlyDropOnceSemantics` (3-window verification), `testEarlyDropAndBoundaryComplementary` (temporal ordering with v3.25 boundary block)
 - **Set `EARLY_DROP_MS=0` to disable** and revert to strict-at-boundary behaviour
 
+## Implemented (2026-02 — v3.35 PARALLEL ORDERS POLLER)
+User's 2026-07-23 18:15 live log (from AWS South-1a) exposed the residual bottleneck:
+- Boundary at :45:00.480, captcha unlocked at T+661ms (:45:01.141)
+- **But INSTANT-DISPATCH happened at T+2432ms (:45:02.912) — a 1771ms gap!**
+- Root cause: tick()'s `fetchLiveOrders` (200-500ms per call, 3-4 iterations) was blocking the captcha-ready → submit path
+- User: "mera opponent 45:01 me process complete kar de raha hai, hum 45:02 me... 45:01 me full complete"
+
+Fix (v3.35):
+- **Parallel orders poller**: new `setInterval` at 150ms (`ORDERS_POLLER_MS`) runs during pre-warm + boundary (90s lead time). Fetches BidOrderListSet in the background and caches on `ctx._cachedOrders`. When captcha unlocks, orders are ALREADY cached — instant-submit fires with zero wait. Logs `[orders-poller] 📦 First non-empty orders scan for this window: N orders (fetch took Xms)`.
+- **Captcha-poller inline order-fetch fallback**: if `ctx._cachedOrders` is empty when captcha unlocks (edge case: orders published AFTER captcha), the captcha poller does an INLINE `fetchLiveOrders()` right there instead of giving up. Logs `[cap-poller] captcha ready but no cached orders — fetching orders INLINE`.
+- **Concurrency safety**: two SAP GET streams (captcha every 50ms + orders every 150ms) are safe — SAP treats them as separate rate-limit buckets. WAF cool-off honoured. Both pollers `unref()` for clean shutdown.
+- **Config**: `.env` and `.env.example` added `ORDERS_POLLER_MS=150` and `ORDERS_POLLER_LEAD_MS=90000`. Set `ORDERS_POLLER_MS=0` to disable (falls back to tick-loop fetches only).
+
+Expected new timeline (from AWS South-1a with ~30ms RTT to SAP):
+```
+T-90000  orders-poller starts (idle till 30s pre-warm)
+T-30000  orders-poller + captcha-poller both active (poll every 50-150ms)
+T-100    orders-poller may already have order list cached
+T+0      boundary; SAP starts publishing captcha + orders
+T+50     next captcha-poller tick — probes captcha (empty)
+T+500    orders-poller has fresh orders cached
+T+661    captcha-poller: captcha unlocks + solved (via 5ms cache HIT)
+         instant-submit dispatch (orders already cached — ZERO wait)
+T+711    submitBid POST fires
+T+861    SAP responds "Bidding Amount Saved Successfully"
+         → save complete by :45:00.861 (below :45:01 target!)
+```
+
+Testing: `node --check` clean, 28/28 tests pass, boot smoke test shows both pollers active.
+
+
 ## Implemented (2026-02 — v3.34 GHOST FIX + REVERSE MATCH + INSTANT-SUBMIT-FROM-POLLER)
 User's 2026-07-23 log analysis (09:45 & 11:45 windows) revealed CRITICAL bug in v3.24 ghost detection. Live evidence:
 - 09:45 window: Vbeln 1153958547, submit response had `Type=S`, `Message="Bidding Amount Saved Successfully."`, `Ev_Text=""` — BUT also `ChangeNo="AAAA...=="` + `CreatedOn=null` + `CreatedAt="PT0S"`. Bot marked as GHOST and retried 3× (all with same result). Actually this IS the real success signature — SAP doesn't populate persistence markers in the immediate response.

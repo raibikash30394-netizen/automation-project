@@ -3,6 +3,16 @@
 /**
  * bid-engine.js — Bikas Bidding v2 main bot
  *
+ * v3.35 — PARALLEL ORDERS POLLER (user 2026-07-23 live log analysis):
+ *   Live 18:15 window showed captcha ready at T+661ms but instant-dispatch
+ *   happened at T+2432ms (1771ms gap) because tick()'s fetchLiveOrders was
+ *   blocking the captcha-ready → submit path. Fix: new independent orders
+ *   poller (150ms interval) running in PARALLEL with the captcha poller
+ *   (v3.33). Orders are always pre-cached on `ctx._cachedOrders` before
+ *   captcha unlocks, so the instant-submit-from-poller fires immediately.
+ *   Also: captcha-poller now fetches orders INLINE if cache is empty as a
+ *   safety net. Target: full save at :45:01 IST from AWS Mumbai.
+ *
  * v3.34 — GHOST FIX + REVERSE MATCH + INSTANT-SUBMIT-FROM-POLLER (user 2026-07-23):
  *   Live log analysis of 09:45 window revealed our v3.24 ghost detection
  *   was falsely marking GENUINELY successful saves as ghost. SAP returned
@@ -2400,28 +2410,45 @@ async function main() {
         }
         // v3.34 — INSTANT-SUBMIT-FROM-POLLER (user directive 2026-07-23:
         // "tum sab tik karo ki bid 45:01 sec me full process ho jaye jitna
-        // jaldi ho sake"). Once captcha is solved AND we have cached matched
-        // orders from the pre-warm scan, fire the submit RIGHT HERE without
-        // waiting for the next tick() iteration. Removes 200-500ms of tick
-        // loop scheduling overhead — target: full save at :45:01.
-        if (ctx._cachedOrders && ctx._cachedOrders.length && !ctx._pollerSubmittedForWinKey?.[winKey]) {
+        // jaldi ho sake"). v3.35 improvement (2026-07-23 live log analysis):
+        // if orders are not cached yet, fetch them INLINE right here to
+        // eliminate the 1771ms tick-loop delay observed in the 18:15 window
+        // between captcha-ready (T+661ms) and instant-dispatch (T+2432ms).
+        if (!ctx._pollerSubmittedForWinKey?.[winKey]) {
           ctx._pollerSubmittedForWinKey = ctx._pollerSubmittedForWinKey || {};
           ctx._pollerSubmittedForWinKey[winKey] = true;
           try {
-            const { plan, stats } = buildBatches(
-              ctx._cachedOrders, ctx.rules, ctx.blacklist, ctx.submitted, ctx.inFlight, ctx.cooldown,
-              ctx.sessions.length, ctx.priorityVbelns
-            );
-            if (plan.length) {
-              log.info(`[cap-poller] 🚀 INSTANT-SUBMIT dispatching ${plan.length} batch(es) with ${stats.matched} matched orders (captcha ready, cached orders present — bypassing tick loop!)`);
-              ctx._hotStall = true;
-              const workerCtx = { ...ctx, plan };
-              const workers = makeWorkerPool(workerCtx);
-              // Fire-and-forget — don't await, the poller must return quickly
-              // for the next 50ms tick.
-              Promise.all(workers).catch(() => {});
-            } else {
-              log.info(`[cap-poller] no matched orders in cache to submit (matched=${stats.matched}, total=${stats.total}) — tick() will pick up next scan`);
+            let ordersToUse = ctx._cachedOrders;
+            if (!ordersToUse || !ordersToUse.length) {
+              log.info(`[cap-poller] captcha ready but no cached orders — fetching orders INLINE (parallel to captcha unlock)…`);
+              const fetchT0 = Date.now();
+              try {
+                const res = await fetchLiveOrders(primary);
+                ordersToUse = res.orders;
+                ctx._cachedOrders = ordersToUse;
+                ctx._cachedOrdersScan = ctx.scan;
+                log.info(`[cap-poller] inline order-fetch completed in ${Date.now() - fetchT0}ms — got ${ordersToUse.length} orders`);
+              } catch (e) {
+                log.warn(`[cap-poller] inline order-fetch failed: ${e.message}`);
+                ordersToUse = [];
+              }
+            }
+            if (ordersToUse && ordersToUse.length) {
+              const { plan, stats } = buildBatches(
+                ordersToUse, ctx.rules, ctx.blacklist, ctx.submitted, ctx.inFlight, ctx.cooldown,
+                ctx.sessions.length, ctx.priorityVbelns
+              );
+              if (plan.length) {
+                log.info(`[cap-poller] 🚀 INSTANT-SUBMIT dispatching ${plan.length} batch(es) with ${stats.matched} matched orders (captcha ready — bypassing tick loop entirely!)`);
+                ctx._hotStall = true;
+                const workerCtx = { ...ctx, plan };
+                const workers = makeWorkerPool(workerCtx);
+                // Fire-and-forget — don't await, the poller must return quickly
+                // for the next 50ms tick.
+                Promise.all(workers).catch(() => {});
+              } else {
+                log.info(`[cap-poller] no matched orders (matched=${stats.matched}, total=${stats.total}) — tick() may pick up next scan`);
+              }
             }
           } catch (e) {
             log.warn(`[cap-poller] instant-submit dispatch failed: ${e.message}`);
@@ -2436,6 +2463,59 @@ async function main() {
   }, CAPTCHA_POLLER_INTERVAL);
   capPollerHandle.unref?.();
   log.info(`🔍 Independent captcha poller ACTIVE (interval=${CAPTCHA_POLLER_INTERVAL}ms, activates ${CAPTCHA_POLLER_LEAD_MS/1000}s before each :15/:45 window)`);
+  }
+
+  // v3.35 — INDEPENDENT ORDERS POLLER (parallel to captcha poller).
+  //
+  // User's 2026-07-23 18:15 log showed a 1771 ms gap between "captcha
+  // ready" (T+661 ms) and "instant-dispatch" (T+2432 ms) because tick()
+  // was blocked on the sequential fetchLiveOrders round-trip when captcha
+  // unlocked. By running an INDEPENDENT orders poller (100 ms interval)
+  // during the pre-warm + boundary phase, orders are already cached on
+  // `ctx._cachedOrders` when captcha unlocks → the instant-submit path
+  // can fire immediately, targeting :45:01 total completion.
+  //
+  // Two concurrent SAP GET streams (captcha + orders) are safe: (a) SAP
+  // sees these as the same session, (b) captcha and orders are separate
+  // endpoints with independent rate-limits, (c) tick() still runs but
+  // reuses `_cachedOrders` when fresh (<5 scans old).
+  const ORDERS_POLLER_INTERVAL = parseInt(process.env.ORDERS_POLLER_MS || '150', 10);
+  const ORDERS_POLLER_LEAD_MS  = parseInt(process.env.ORDERS_POLLER_LEAD_MS || '90000', 10);
+  if (ORDERS_POLLER_INTERVAL <= 0) {
+    log.info(`🔎 Independent orders poller DISABLED (ORDERS_POLLER_MS=0)`);
+  } else {
+    let ordersPollerBusy = false;
+    const ordersPollerHandle = setInterval(async () => {
+      if (ordersPollerBusy) return;
+      const untilN = msUntilNextWindow();
+      if (untilN > ORDERS_POLLER_LEAD_MS && !isHotWindow()) return;
+      if (wafActive()) return;
+      ordersPollerBusy = true;
+      try {
+        const primary = ctx.sessions[0];
+        if (!primary || !primary.cookie) return;
+        // Fetch orders in the background and cache them so the captcha
+        // poller's instant-dispatch path doesn't have to wait for a fetch.
+        const t0 = Date.now();
+        const res = await fetchLiveOrders(primary);
+        const orders = res.orders || [];
+        ctx._cachedOrders = orders;
+        ctx._cachedOrdersScan = ctx.scan;
+        const winKey = Math.floor((Date.now() + untilN) / 60_000);
+        // Log the first non-empty scan per window so we can see order-list
+        // publication latency in the log (mirrors captcha-timing telemetry).
+        if (orders.length && ctx._ordersPollerFirstSeenWin !== winKey) {
+          ctx._ordersPollerFirstSeenWin = winKey;
+          log.info(`[orders-poller] 📦 First non-empty orders scan for this window: ${orders.length} orders (fetch took ${Date.now() - t0}ms)`);
+        }
+      } catch (e) {
+        // silent — poller must never crash the process
+      } finally {
+        ordersPollerBusy = false;
+      }
+    }, ORDERS_POLLER_INTERVAL);
+    ordersPollerHandle.unref?.();
+    log.info(`🔎 Independent orders poller ACTIVE (interval=${ORDERS_POLLER_INTERVAL}ms, activates ${ORDERS_POLLER_LEAD_MS/1000}s before each :15/:45 window)`);
   }
 
   // Main polling loop.
