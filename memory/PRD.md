@@ -287,6 +287,26 @@ User feedback ("mai UI me 1 sec pehele chor deta hu... 50% mera rank 1 hota") re
 - **3 new unit tests** in `test-window-scheduler.js`: `testEarlyDropWindow` (8 cases), `testEarlyDropOnceSemantics` (3-window verification), `testEarlyDropAndBoundaryComplementary` (temporal ordering with v3.25 boundary block)
 - **Set `EARLY_DROP_MS=0` to disable** and revert to strict-at-boundary behaviour
 
+## Implemented (2026-02 — v3.33+ Linux/macOS launchers)
+User directive 2026-07-23: "isko ubuntu or windows dono k liye bana do abhi or save bhaut accha ho raha hai" — parity between Ubuntu/macOS and Windows launcher workflow. Bot save behavior is now confirmed working well by user; just needed the Linux one-shot launchers.
+
+Added:
+- **`start.sh`** — one-shot Ubuntu/macOS launcher. Runs sanity checks (node_modules, cookie.txt, .env), warns if cookie >6h old, attempts NTP sync (chrony → ntpdate → timedatectl best-effort), launches `bidding.js` + `bid-engine.js` in background with `nohup`. PIDs saved to `.bikas-solver.pid` / `.bikas-engine.pid`, logs to `/tmp/bikas-*.log`. Supports `--tmux` mode for split-pane live view.
+- **`stop.sh`** — safe cleanup. Reads PID files, sends SIGTERM then SIGKILL if needed. Fallback port-3000 kill is SAFE: only kills if `/proc/PID/cmdline` matches `bidding.js` (does NOT touch unrelated node servers). Also runs `pkill -f "node.*bid-engine.js|node.*bidding.js"` as belt-and-suspenders.
+- **`test.sh`** — runs the 28-test unit suite (no SAP calls). Verifies node installed, prints pass/fail summary.
+- **README updated** with Linux/macOS section: setup, launch, tmux mode, tail commands, NTP prerequisite (chrony install), post-run analysis snippets.
+
+All 4 shell scripts executable (`chmod +x`), `bash -n` syntax-clean. Verified: `stop.sh` no longer aggressively kills unrelated port-3000 processes (fixed after killing supervisor frontend in initial test).
+
+Full launcher parity now:
+| Task    | Windows      | Linux/macOS   |
+|---------|--------------|---------------|
+| Bootstrap | `setup.bat` | `./setup.sh`  |
+| Test    | `test.bat`   | `./test.sh`   |
+| Start   | `start.bat`  | `./start.sh` (or `./start.sh --tmux`) |
+| Stop    | `stop.bat`   | `./stop.sh`   |
+
+
 ## Implemented (2026-02 — v3.33 INDEPENDENT CAPTCHA POLLER + extended pre-scan)
 User directive 2026-07-19: "ek scanner laga do jo bid window k khulne se pehele he scan karne lage or jaise window khule submit kar de captcha dikhte he tab tho hoga na thora fast"
 Changes:

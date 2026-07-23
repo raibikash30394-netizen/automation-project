@@ -100,6 +100,65 @@ files/delete.csv    CSV with a Customer column (blacklist)
 
 ## Run
 
+### Ubuntu / Linux / macOS (one-shot launcher, v3.33)
+
+**One-shot launch (same as Windows workflow):**
+```bash
+chmod +x setup.sh test.sh start.sh stop.sh   # first-time only
+./setup.sh              # installs deps, seeds .env / cookie.txt.example
+./test.sh               # 28-test unit suite (no SAP calls, safe anytime)
+./start.sh              # launches solver + engine in background (nohup)
+./stop.sh               # kills both processes cleanly
+```
+
+`start.sh` will:
+1. Verify `node_modules`, `cookie.txt` (non-empty), `.env` exist
+2. Warn if `cookie.txt` is >6h old (SAP will 403)
+3. Print current `EARLY_DROP_MS`, `CAPTCHA_POLLER_MS`, `POLL_MS` from `.env`
+4. Attempt NTP time sync via `chronyc makestep` → `ntpdate` → `timedatectl` (best-effort, never blocks)
+5. Launch `bidding.js` and `bid-engine.js` in background with `nohup`; PIDs saved to `.bikas-solver.pid` / `.bikas-engine.pid`
+6. Print `tail -f` command for the live log
+
+**Alternative — `tmux` mode** (if you prefer split-pane live view):
+```bash
+sudo apt install tmux -y      # if not already installed
+./start.sh --tmux
+tmux attach -t bikas          # attach; Ctrl+B then D to detach
+```
+
+**Watch live logs (background mode):**
+```bash
+tail -f /tmp/bikas-engine.log     # main bot output — look for:
+#   🔍 Independent captcha poller ACTIVE (interval=50ms, ...)
+#   [cap-poller] ⚡ PRE-SOLVED captcha ready for s1 (sample: KiLL)
+#   [worker-1]  ⚡ INSTANT-DISPATCH: using pre-solved captcha (age 42ms)
+#   ✓ ACCEPTED (single, 2) in 245ms — Bidding Amount Saved Successfully.
+tail -f /tmp/bikas-solver.log     # captcha solver output
+```
+
+**NTP prerequisite (one-time, run as sudo):**
+```bash
+# Ubuntu 20.04+ — chrony is the recommended NTP daemon:
+sudo apt install chrony -y
+sudo systemctl enable --now chronyd
+# Verify:
+chronyc tracking
+# Ensure "System time" offset is <100ms.
+```
+Without accurate clock, :15/:45 boundary timing drifts and you miss the window.
+
+**Post-run analysis:**
+```bash
+# Latest engine log (JSON pino format, one line per event)
+ls -lt logs/engine.log.*.1 | head -1
+
+# Bid history (CSV, one row per submit attempt)
+tail -20 logs/bids-$(date +%F).csv
+
+# Captcha unlock latency (v3.32 telemetry)
+column -t -s, logs/captcha-timing-$(date +%F).csv | head -10
+```
+
 ### Windows (LOCAL TEST FIRST — recommended before AWS/PM2 deploy)
 
 **One-click launch:**
@@ -141,9 +200,9 @@ Then normal-user `start.bat` will work.
 | International               | `1000`      | Cross-region latency               |
 | Disable early-drop          | `0`         | Revert to strict-at-boundary       |
 
-### Linux / macOS / Docker
+### Linux / macOS / Docker — manual (no launcher)
 
-Two terminals (or `pm2` / `screen`):
+If you don't want to use `start.sh`, two terminals (or `pm2` / `screen`):
 
 ```bash
 # Terminal 1 — captcha solver
