@@ -1234,8 +1234,17 @@ function testGhostSaveDetection() {
     const evText = (result.evText || '').toString();
     const evTextLower = evText.toLowerCase();
     const isTieRejected = /same\s+(avg\s+)?amount\s+has\s+been\s+bid\s+by\s+other\s+vendor/i.test(evTextLower);
-    const ghostHints = (result.rankHints || []).filter((h) => h.isGhostRecord);
-    const isGhostSaved = ghostHints.length > 0 && ghostHints.length === (result.rankHints || []).length;
+    // v3.34 — recalibrated ghost detection: only mark as ghost if hints are
+    // ghost AND SAP did NOT explicitly acknowledge success.
+    const _ghostMarkerHints = (result.rankHints || []).filter((h) => h.isGhostRecord);
+    const _allHintsAreGhost = _ghostMarkerHints.length > 0 && _ghostMarkerHints.length === (result.rankHints || []).length;
+    const _sapExplicitSuccess = (
+      result.info === 'S' &&
+      /saved\s*successfully/i.test(result.text || '') &&
+      !evText.trim() &&
+      !isTieRejected
+    );
+    const isGhostSaved = _allHintsAreGhost && !_sapExplicitSuccess;
     const isSavedOk = /saved successfully|bid.*accepted|success/i.test(textLower);
     const isRealSuccess = !isTieRejected && !isGhostSaved && result.info !== 'E' && (
       (result.info === 'S' && !/ended|closed|expired|invalid|error/i.test(textLower)) || isSavedOk
@@ -1266,8 +1275,10 @@ function testGhostSaveDetection() {
     };
   }
 
-  // Case 1: THE actual live-log case — Type=S, empty Ev_Text, ChangeNo empty
-  // + CreatedOn null + CreatedAt PT0S → REJECTED_GHOST
+  // v3.34 — Case 1 RECALIBRATED per live 09:45 window (2026-07-23):
+  //   Type=S, Message="Saved Successfully", Ev_Text="" AND ghost markers
+  //   → SAP's immediate-response for a real success. Now ACCEPTED (was
+  //   wrongly REJECTED_GHOST in v3.24 causing 3× retry hammering).
   assert.strictEqual(
     classify({
       statusCode: 201,
@@ -1276,8 +1287,8 @@ function testGhostSaveDetection() {
       evText: '',
       rankHints: [hint({ ghost: true })],
     }),
-    'REJECTED_GHOST',
-    'ghost persistence markers must classify as REJECTED_GHOST despite Type=S'
+    'ACCEPTED',
+    'v3.34: explicit "Saved Successfully" + empty Ev_Text overrides ghost markers → REAL save'
   );
 
   // Case 2: Real successful save — non-empty ChangeNo + timestamps → ACCEPTED
@@ -1334,8 +1345,10 @@ function testGhostSaveDetection() {
     'tie-rejection wins over ghost (Ev_Text is the strongest signal)'
   );
 
-  // Case 6: Alternative empty ChangeNo variants (all-A padding differs by GUID length)
-  // Ensure regex catches 22-A, 22-A + "=", 22-A + "==", or purely empty.
+  // Case 6: v3.34 — All ChangeNo variants that WERE ghost-flagged in v3.24
+  // now correctly return ACCEPTED because SAP explicitly acknowledged
+  // "Saved Successfully" + empty Ev_Text.  Only when SAP does NOT ack
+  // success would these still be flagged as ghost.
   const emptyChangeVariants = ['AAAAAAAAAAAAAAAAAAAAAA', 'AAAAAAAAAAAAAAAAAAAAAA=', 'AAAAAAAAAAAAAAAAAAAAAA==', ''];
   for (const cn of emptyChangeVariants) {
     const rh = hint({ ghost: false });
@@ -1345,12 +1358,18 @@ function testGhostSaveDetection() {
     rh.isGhostRecord = (!cn || /^A+={0,2}$/.test(cn)) && rh.createdOn === null && /^PT0+H0+M0+S$/i.test(rh.createdAt);
     assert.strictEqual(
       classify({ statusCode: 201, info: 'S', text: 'Bidding Amount Saved Successfully.', evText: '', rankHints: [rh] }),
+      'ACCEPTED',
+      `v3.34: variant ChangeNo="${cn}" with explicit success message → ACCEPTED (was REJECTED_GHOST in v3.24)`
+    );
+    // And WITHOUT explicit success message → still REJECTED_GHOST
+    assert.strictEqual(
+      classify({ statusCode: 201, info: 'S', text: '', evText: '', rankHints: [rh] }),
       'REJECTED_GHOST',
-      `variant ChangeNo="${cn}" should be detected as ghost`
+      `v3.34: variant ChangeNo="${cn}" WITHOUT explicit success → REJECTED_GHOST`
     );
   }
 
-  console.log('✓ Ghost-save detection: 6 cases pass (ChangeNo/CreatedOn/CreatedAt ghost markers correctly flagged despite Type=S "Saved" text)');
+  console.log('✓ Ghost-save detection (v3.34): 6 cases pass — explicit "Saved Successfully" + empty Ev_Text now overrides ghost markers → REAL success, no false retries');
 }
 // SAP's load-balancer silently closes idle keep-alive sockets after ~30s.
 // The next request on that socket bombs with HeadersTimeoutError / socket

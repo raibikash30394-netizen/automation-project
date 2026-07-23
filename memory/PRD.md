@@ -287,6 +287,30 @@ User feedback ("mai UI me 1 sec pehele chor deta hu... 50% mera rank 1 hota") re
 - **3 new unit tests** in `test-window-scheduler.js`: `testEarlyDropWindow` (8 cases), `testEarlyDropOnceSemantics` (3-window verification), `testEarlyDropAndBoundaryComplementary` (temporal ordering with v3.25 boundary block)
 - **Set `EARLY_DROP_MS=0` to disable** and revert to strict-at-boundary behaviour
 
+## Implemented (2026-02 — v3.34 GHOST FIX + REVERSE MATCH + INSTANT-SUBMIT-FROM-POLLER)
+User's 2026-07-23 log analysis (09:45 & 11:45 windows) revealed CRITICAL bug in v3.24 ghost detection. Live evidence:
+- 09:45 window: Vbeln 1153958547, submit response had `Type=S`, `Message="Bidding Amount Saved Successfully."`, `Ev_Text=""` — BUT also `ChangeNo="AAAA...=="` + `CreatedOn=null` + `CreatedAt="PT0S"`. Bot marked as GHOST and retried 3× (all with same result). Actually this IS the real success signature — SAP doesn't populate persistence markers in the immediate response.
+- 11:45 window: 9 SAVED_TIED responses with `Type=E` + `Ev_Text="Same amount has been bid by other vendor..."` — bot correctly identified as tie.
+
+User directives (2026-07-23):
+1. "ager bid ammount save ho jaa raha hai tho usko ghost samj k bar bar save kar raha hai" — stop treating successful saves as ghost
+2. "sirf 'Bidding Amount Saved Successfully' he aaye ga" — explicit success text is the marker
+3. "niche se match kar k save karo uper se nahi ise bid win k chance 60% badh jayega" — iterate order list bottom-up
+4. "bid 45:01 sec me full process ho jaye jitna jaldi ho sake" — save must complete within 1s of boundary
+
+Changes:
+- **Ghost detection recalibrated**: `isGhostSaved = _allHintsAreGhost && !_sapExplicitSuccess`. New `_sapExplicitSuccess` = `Type=S && Message="Saved Successfully" && Ev_Text=empty && !isTieRejected`. When SAP explicitly acknowledges, ghost markers are IGNORED. Prevents the 3× retry hammering seen in 09:45 window.
+- **Reverse order matching**: `MATCH_ORDER_REVERSE=true` (default) reverses `orders` array in `buildBatches()` before iteration. User claim: 60% higher Rank 1 chance. Config-gated (set false in `.env` to revert).
+- **Instant-submit-from-poller**: When captcha poller (v3.33) unlocks captcha AND `ctx._cachedOrders` has matched orders, dispatches `makeWorkerPool()` INLINE from the 50ms poller tick — bypasses next tick() scheduling (200-500ms lag). Log: `🚀 INSTANT-SUBMIT dispatching N batch(es) with M matched orders (bypassing tick loop!)`. One-shot per window (`ctx._pollerSubmittedForWinKey[winKey]`).
+- **Unit tests updated**: `testGhostSaveDetection` now expects ACCEPTED for the 09:45-window signature (was REJECTED_GHOST). Case 6 recalibrated with explicit-vs-implicit success matrix. 28/28 pass.
+
+Config additions to `.env` and `.env.example`:
+- `MATCH_ORDER_REVERSE=true`
+No new env for instant-submit — inherits `CAPTCHA_POLLER_MS`.
+
+Testing status: `node --check` clean, 28/28 tests pass, boot smoke test clean. Ready for next :15/:45 window trial.
+
+
 ## Implemented (2026-02 — v3.33+ Linux/macOS launchers)
 User directive 2026-07-23: "isko ubuntu or windows dono k liye bana do abhi or save bhaut accha ho raha hai" — parity between Ubuntu/macOS and Windows launcher workflow. Bot save behavior is now confirmed working well by user; just needed the Linux one-shot launchers.
 

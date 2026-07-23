@@ -3,6 +3,27 @@
 /**
  * bid-engine.js — Bikas Bidding v2 main bot
  *
+ * v3.34 — GHOST FIX + REVERSE MATCH + INSTANT-SUBMIT-FROM-POLLER (user 2026-07-23):
+ *   Live log analysis of 09:45 window revealed our v3.24 ghost detection
+ *   was falsely marking GENUINELY successful saves as ghost. SAP returned
+ *   `Type=S, Message="Bidding Amount Saved Successfully.", Ev_Text=""` but
+ *   also `ChangeNo=""` + `CreatedOn=null` + `CreatedAt="PT0S"` — this is
+ *   SAP's IMMEDIATE-response signature for a real success (persistence
+ *   markers only appear on subsequent SessionSet fetches). Bot retried 3×
+ *   causing hammering + likely triggering anti-fraud.
+ *
+ *   Changes:
+ *   • Ghost detection: only mark ghost if ghost-markers present AND SAP
+ *     did NOT explicitly acknowledge success. If Type='S' + Message="Saved
+ *     Successfully" + Ev_Text=empty, treat as REAL success (no retry).
+ *   • Reverse order match: `MATCH_ORDER_REVERSE=true` (default) iterates
+ *     BidOrderListSet from BOTTOM. User claim: 60% higher Rank 1 chance —
+ *     less contested by top-down scanning competitors.
+ *   • Instant-submit-from-poller: when captcha poller (v3.33) unlocks and
+ *     cached orders exist, dispatches `makeWorkerPool()` inline from the
+ *     50ms poller tick — bypasses next tick() scheduling (200-500ms lag).
+ *     Target: full save by :45:01 IST per user's directive.
+ *
  * v3.33 — INDEPENDENT CAPTCHA POLLER + extended pre-scan (user directive 2026-07-19):
  *   "ek scanner laga do jo bid window k khulne se pehele he scan karne lage
  *    or jaise window khule submit kar de captcha dikhte he" —
@@ -1327,7 +1348,16 @@ function buildBatches(orders, rules, blacklist, seenSubmitted, inFlight, cooldow
   // Pre-sort rule cities: longest first → "KRISHNANAGAR - STO" wins over "KRISHNANAGAR"
   const ruleCitiesByLen = Array.from(rules.keys()).sort((a, b) => b.length - a.length);
 
-  const fresh = orders.filter((o) => {
+  // v3.34 — user directive 2026-07-23: "niche se match kar k save karo uper
+  // se nahi ise bid win k chance 60% badh jayega". Iterate the order list
+  // from the BOTTOM (last-published orders) rather than the top. Rationale:
+  // newer orders at the bottom may be less contested by other vendors who
+  // scan top-down. Default TRUE per user directive; disable via
+  // MATCH_ORDER_REVERSE=false in .env.
+  const MATCH_ORDER_REVERSE = (process.env.MATCH_ORDER_REVERSE ?? 'true').toString().toLowerCase() !== 'false';
+  const iterOrders = MATCH_ORDER_REVERSE ? [...orders].reverse() : orders;
+
+  const fresh = iterOrders.filter((o) => {
     const key = String(o.SapOrderId || '');
     if (!key || seenSubmitted.has(key) || inFlight.has(key)) return false;
     const retryAt = cooldown.get(key);
@@ -1617,29 +1647,44 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
   // rejection signal, override any misleading Message.
   const isTieRejected = /same\s+(avg\s+)?amount\s+has\s+been\s+bid\s+by\s+other\s+vendor/i.test(evTextLower);
 
-  // v3.24 CRITICAL FIX — Ghost-record detection.
+  // v3.34 CRITICAL FIX — Ghost-record detection recalibrated (user 2026-07-23).
   //
-  // Second silent-fail pattern discovered from user's live logs (2026-07-17):
-  //     SAP responded Type=S, Message="Saved Successfully.", Ev_Text=""
-  //     ...but NavEBiddingTrackHis[0] had:
-  //       ChangeNo   = "AAAAAAAAAAAAAAAAAAAAAA=="  (empty base64, no GUID)
-  //       CreatedOn  = null                         (no timestamp)
-  //       CreatedAt  = "PT00H00M00S"                (zero duration)
-  //     Result: browser showed no bid ("browser me save nahi hua"), even
-  //     though bot logged ACCEPTED + POST-SAVE OK.
+  // Live log analysis showed our v3.24 ghost detection was TOO AGGRESSIVE:
+  // SAP's immediate response for a GENUINELY successful save also contains:
+  //   Message   = "Bidding Amount Saved Successfully."
+  //   Type      = "S"
+  //   Ev_Text   = ""     (empty — no tie, no error)
+  //   ChangeNo  = "AAAA==" + CreatedOn = null + CreatedAt = "PT0S"
+  // …because SAP doesn't populate the persistence GUID in the immediate
+  // response. Only on a SUBSEQUENT SessionSet('') fetch does the real
+  // ChangeNo appear.
   //
-  // A genuinely-saved bid has: ChangeNo = a real base64 GUID (~24 chars,
-  // NOT all A's), CreatedOn = a "/Date(<ms>)/" timestamp string, and
-  // CreatedAt = a non-zero ISO-8601 duration. When ALL persistence markers
-  // are ghosts, the write did NOT commit — treat as silent rejection so
-  // the bot re-submits next scan.
-  const ghostHints = (result.rankHints || []).filter((h) => h.isGhostRecord);
-  const isGhostSaved = ghostHints.length > 0 && ghostHints.length === (result.rankHints || []).length;
+  // Our v3.24 code marked these as "ghost" and retried 3× (verified from
+  // 09:45 window bids.csv on 2026-07-23: 3 attempts on Vbeln 1153958547
+  // all had Message="Saved Successfully" Ev_Text="" but got REJECTED_GHOST).
+  // This wasted 3× the requests AND may have triggered SAP anti-fraud.
+  //
+  // NEW rule: only mark as ghost when BOTH:
+  //   (a) all rankHints have ChangeNo/CreatedOn/CreatedAt ghost markers, AND
+  //   (b) SAP did NOT explicitly acknowledge success (Ev_Text has content
+  //       OR primary info is 'E' OR Message is not the standard success text)
+  // If SAP clearly said "Saved Successfully" with Ev_Text="" and Type='S',
+  // TREAT AS REAL SUCCESS — no retry, no ghost flag.
+  const _ghostMarkerHints = (result.rankHints || []).filter((h) => h.isGhostRecord);
+  const _allHintsAreGhost = _ghostMarkerHints.length > 0 && _ghostMarkerHints.length === (result.rankHints || []).length;
+  const _sapExplicitSuccess = (
+    result.info === 'S' &&
+    /saved\s*successfully/i.test(result.text || '') &&
+    !evText.trim() && // Ev_Text is empty — no tie, no error text
+    !isTieRejected
+  );
+  const isGhostSaved = _allHintsAreGhost && !_sapExplicitSuccess;
 
   const isSavedOk      = /saved successfully|bid.*accepted|success/i.test(textLower);
   // isRealSuccess must NOT trigger when SAP flags Type='E' with a tie-reject
   // Ev_Text — even if Message cosmetically says "Saved Successfully" — OR when
-  // the response only contains ghost persistence markers (v3.24).
+  // the response only contains ghost persistence markers AND SAP did not
+  // explicitly acknowledge (v3.34 recalibrated).
   const isRealSuccess  = !isTieRejected && !isGhostSaved && result.info !== 'E' && (
     (result.info === 'S' && !/ended|closed|expired|invalid|error/i.test(textLower)) || isSavedOk
   );
@@ -1958,7 +2003,7 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
   // branch — burning cycles just delays other orders in the plan).
   if (isGhostSaved) {
     metrics.submitsRejected++;
-    const ghostIds = ghostHints.map((h) => h.sapOrderId).join(', ');
+    const ghostIds = _ghostMarkerHints.map((h) => h.sapOrderId).join(', ');
     const MAX_GHOST_RETRIES = 3;
     let anyGaveUp = false;
     for (const b of item.bids) {
@@ -2352,6 +2397,35 @@ async function main() {
             });
             if (latency != null) log.info(`   ↳ CAPTCHA UNLOCK LATENCY (poller) = ${latency}ms`);
           } catch (_) { /* never let logging break bidding */ }
+        }
+        // v3.34 — INSTANT-SUBMIT-FROM-POLLER (user directive 2026-07-23:
+        // "tum sab tik karo ki bid 45:01 sec me full process ho jaye jitna
+        // jaldi ho sake"). Once captcha is solved AND we have cached matched
+        // orders from the pre-warm scan, fire the submit RIGHT HERE without
+        // waiting for the next tick() iteration. Removes 200-500ms of tick
+        // loop scheduling overhead — target: full save at :45:01.
+        if (ctx._cachedOrders && ctx._cachedOrders.length && !ctx._pollerSubmittedForWinKey?.[winKey]) {
+          ctx._pollerSubmittedForWinKey = ctx._pollerSubmittedForWinKey || {};
+          ctx._pollerSubmittedForWinKey[winKey] = true;
+          try {
+            const { plan, stats } = buildBatches(
+              ctx._cachedOrders, ctx.rules, ctx.blacklist, ctx.submitted, ctx.inFlight, ctx.cooldown,
+              ctx.sessions.length, ctx.priorityVbelns
+            );
+            if (plan.length) {
+              log.info(`[cap-poller] 🚀 INSTANT-SUBMIT dispatching ${plan.length} batch(es) with ${stats.matched} matched orders (captcha ready, cached orders present — bypassing tick loop!)`);
+              ctx._hotStall = true;
+              const workerCtx = { ...ctx, plan };
+              const workers = makeWorkerPool(workerCtx);
+              // Fire-and-forget — don't await, the poller must return quickly
+              // for the next 50ms tick.
+              Promise.all(workers).catch(() => {});
+            } else {
+              log.info(`[cap-poller] no matched orders in cache to submit (matched=${stats.matched}, total=${stats.total}) — tick() will pick up next scan`);
+            }
+          } catch (e) {
+            log.warn(`[cap-poller] instant-submit dispatch failed: ${e.message}`);
+          }
         }
       }
     } catch (e) {
