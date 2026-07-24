@@ -1,0 +1,41 @@
+{
+  "verdict": "fixed",
+  "user_reported_bug": "ager bid ammount save ho jaa raha hai tho usko ghost samj k bar bar save kar raha hai agar save ho jaye ga bid win hoga tho tie wala msg nahi aayega sirf 'Bidding Amount Saved Successfully' he aayega. subha se bhaut mast chala sara win hua acchank se dopher ko problem hone laga sab tik karo save 45:01 me complet ho jaa raha tha sara win tha mera abhi problrm ho raha submit resonce nice copy pest kar raha hu dekhan tho plese tik karo mast kam kar raha tha acchanak se aisa hone laga",
+  "summary": "Focused backend verification passed. No relevant testing skill found. Verified bid-engine.js now treats SAP Type=S + 'Bidding Amount Saved Successfully.' + empty Ev_Text as ACCEPTED even when immediate response track hints have ghost markers, while preserving REJECTED_GHOST when explicit success text is absent and tie detection when Ev_Text contains 'Same amount has been bid by other vendor'. Existing suite passed (ALL TESTS PASS), node syntax check passed, and .env contains EARLY_DROP_MS=0, CAPTCHA_POLLER_MS=50, ORDERS_POLLER_MS=150, MATCH_ORDER_REVERSE=true. Live SAP endpoints were not called; SAP API behavior was verified with MOCKED fixture responses only.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/test_reports/bug_verification_13_regression.js",
+    "/app/test_reports/bug_verification_13.json",
+    "/app/test_reports/iteration_13.json"
+  ],
+  "action_items": [
+    "If production symptoms continue, collect live logs/submit-responses.jsonl from the affected :15/:45 window because live SAP OData endpoints were not exercised in this preview verification."
+  ],
+  "critical_code_review_comments": [
+    "bid-engine.js lines 1683-1699 implement the explicit-success override so successful SAP immediate responses with ghost-looking ChangeNo/CreatedOn/CreatedAt are not retried as ghost.",
+    "bid-engine.js lines 1948-2002 handle tie Ev_Text separately as SAVED_TIED/ok, preventing cosmetic 'Saved Successfully' text from masking ties.",
+    "buildBatches uses const iterOrders = MATCH_ORDER_REVERSE ? [...orders].reverse() : orders; so MATCH_ORDER_REVERSE=true scans from bottom/last-published orders first."
+  ],
+  "updated_files": [
+    "/app/test_reports/bug_verification_13_regression.js",
+    "/app/test_reports/bug_verification_13.json",
+    "/app/test_reports/iteration_13.json"
+  ],
+  "success_rate": {
+    "backend": "100% for mocked/unit classification checks",
+    "frontend": "not tested - backend-only bug"
+  },
+  "seed_data_creation": "No seed data created; used static SAP response fixtures.",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Run cd /app/bikas-bidding && node --check bid-engine.js && node tests/test-window-scheduler.js && node /app/test_reports/bug_verification_13_regression.js. Live SAP was not tested; fixtures are MOCKED SAP EBidding OData responses.",
+  "rca_of_the_issue": "Previous ghost detection treated immediate SAP success responses as ghost because ChangeNo/CreatedOn/CreatedAt are not populated immediately. The current code requires ghost markers AND absence of explicit Type=S + Saved Successfully + empty Ev_Text before retrying as ghost. Tie Ev_Text remains a stronger signal and is handled separately."
+}
