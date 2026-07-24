@@ -1229,13 +1229,15 @@ function testTieRejection() {
 // The API is lying — no DB commit occurred. Browser won't show the bid.
 // This is the "abhi browser me save nahi hua" case from user's live logs.
 function testGhostSaveDetection() {
-  function classify(result) {
+  function classify(result, opts = {}) {
+    const TRUST_TYPE_S = opts.trustTypeS !== false; // default true for v3.36
     const textLower = (result.text || '').toString().toLowerCase();
     const evText = (result.evText || '').toString();
     const evTextLower = evText.toLowerCase();
     const isTieRejected = /same\s+(avg\s+)?amount\s+has\s+been\s+bid\s+by\s+other\s+vendor/i.test(evTextLower);
-    // v3.34 — recalibrated ghost detection: only mark as ghost if hints are
-    // ghost AND SAP did NOT explicitly acknowledge success.
+    // v3.34 — ghost detection: only mark as ghost if hints are ghost AND SAP
+    // did NOT explicitly acknowledge success.
+    // v3.36 — TRUST_TYPE_S upgrade: any Type='S' is trusted unconditionally.
     const _ghostMarkerHints = (result.rankHints || []).filter((h) => h.isGhostRecord);
     const _allHintsAreGhost = _ghostMarkerHints.length > 0 && _ghostMarkerHints.length === (result.rankHints || []).length;
     const _sapExplicitSuccess = (
@@ -1244,9 +1246,11 @@ function testGhostSaveDetection() {
       !evText.trim() &&
       !isTieRejected
     );
-    const isGhostSaved = _allHintsAreGhost && !_sapExplicitSuccess;
+    const _trustTypeS = TRUST_TYPE_S && result.info === 'S' && !isTieRejected;
+    const isGhostSaved = _allHintsAreGhost && !_sapExplicitSuccess && !_trustTypeS;
     const isSavedOk = /saved successfully|bid.*accepted|success/i.test(textLower);
     const isRealSuccess = !isTieRejected && !isGhostSaved && result.info !== 'E' && (
+      _trustTypeS ||
       (result.info === 'S' && !/ended|closed|expired|invalid|error/i.test(textLower)) || isSavedOk
     );
     if (isTieRejected) return 'REJECTED_TIE';
@@ -1348,7 +1352,7 @@ function testGhostSaveDetection() {
   // Case 6: v3.34 — All ChangeNo variants that WERE ghost-flagged in v3.24
   // now correctly return ACCEPTED because SAP explicitly acknowledged
   // "Saved Successfully" + empty Ev_Text.  Only when SAP does NOT ack
-  // success would these still be flagged as ghost.
+  // success would these still be flagged as ghost (in v3.34 mode).
   const emptyChangeVariants = ['AAAAAAAAAAAAAAAAAAAAAA', 'AAAAAAAAAAAAAAAAAAAAAA=', 'AAAAAAAAAAAAAAAAAAAAAA==', ''];
   for (const cn of emptyChangeVariants) {
     const rh = hint({ ghost: false });
@@ -1361,15 +1365,91 @@ function testGhostSaveDetection() {
       'ACCEPTED',
       `v3.34: variant ChangeNo="${cn}" with explicit success message → ACCEPTED (was REJECTED_GHOST in v3.24)`
     );
-    // And WITHOUT explicit success message → still REJECTED_GHOST
+    // v3.36 TRUST_TYPE_S (default) — even WITHOUT explicit success message,
+    // Type='S' is trusted → ACCEPTED. This closes the last false-positive
+    // path where the reference bot (ebidding-secure.js) would ACCEPT but
+    // bid-engine v3.34 would still REJECT_GHOST.
     assert.strictEqual(
-      classify({ statusCode: 201, info: 'S', text: '', evText: '', rankHints: [rh] }),
+      classify({ statusCode: 201, info: 'S', text: '', evText: '', rankHints: [rh] }, { trustTypeS: true }),
+      'ACCEPTED',
+      `v3.36 TRUST_TYPE_S=true: variant ChangeNo="${cn}" Type=S w/o explicit ack → ACCEPTED (parity with ebidding-secure.js)`
+    );
+    // v3.34 fallback path (TRUST_TYPE_S=false): without explicit ack → still REJECTED_GHOST
+    assert.strictEqual(
+      classify({ statusCode: 201, info: 'S', text: '', evText: '', rankHints: [rh] }, { trustTypeS: false }),
       'REJECTED_GHOST',
-      `v3.34: variant ChangeNo="${cn}" WITHOUT explicit success → REJECTED_GHOST`
+      `v3.34 (TRUST_TYPE_S=false): variant ChangeNo="${cn}" WITHOUT explicit success → REJECTED_GHOST`
     );
   }
 
-  console.log('✓ Ghost-save detection (v3.34): 6 cases pass — explicit "Saved Successfully" + empty Ev_Text now overrides ghost markers → REAL success, no false retries');
+  // Case 7 (v3.36 parity): Type='E' + ghost markers → still REJECTED_GHOST
+  // regardless of TRUST_TYPE_S (only 'S' is trusted). Ensures we don't
+  // over-trust true error responses.
+  const eGhost = hint({ ghost: true });
+  assert.strictEqual(
+    classify({ statusCode: 201, info: 'E', text: '', evText: '', rankHints: [eGhost] }, { trustTypeS: true }),
+    'REJECTED_GHOST',
+    'v3.36 TRUST_TYPE_S only trusts Type=S; Type=E with ghost markers still REJECTED_GHOST'
+  );
+
+  console.log('✓ Ghost-save detection (v3.34+v3.36): all cases pass — explicit "Saved Successfully" AND TRUST_TYPE_S=true both accept legitimate saves without ghost retries');
+}
+
+// v3.36 — INFO_INSTANT_RETRY parity with ebidding-secure.js#submitBids.
+// SAP's Type='I' info-level rejection (usually "wrong captcha" / "captcha
+// expired") must be retried in-place with a fresh captcha up to N times
+// rather than deferred to the next scan tick (which loses 1-2 s per attempt
+// during the 5-min bid window).
+async function testInfoInstantRetry() {
+  async function simulate({ sapSequence, INFO_INSTANT_RETRY_MAX }) {
+    let attempts = 0;
+    let deferredToNextScan = false;
+    let acceptedAt = -1;
+    async function attempt(retryDepth) {
+      attempts++;
+      const outcome = sapSequence[attempts - 1] || { info: 'I' };
+      if (outcome.info === 'S') { acceptedAt = attempts; return { ok: true }; }
+      if (outcome.info === 'I') {
+        if (retryDepth < INFO_INSTANT_RETRY_MAX) return attempt(retryDepth + 1);
+        deferredToNextScan = true;
+        return { retry: true };
+      }
+      return { retry: false };
+    }
+    await attempt(0);
+    return { attempts, deferredToNextScan, acceptedAt };
+  }
+
+  // Case A: 3× I then S with MAX=5 → 4 attempts, accepted, no deferral.
+  let r = await simulate({
+    sapSequence: [{ info: 'I' }, { info: 'I' }, { info: 'I' }, { info: 'S' }],
+    INFO_INSTANT_RETRY_MAX: 5,
+  });
+  assert.strictEqual(r.attempts, 4, `Case A: 4 attempts, got ${r.attempts}`);
+  assert.strictEqual(r.acceptedAt, 4);
+  assert.strictEqual(r.deferredToNextScan, false);
+
+  // Case B: 6× I with MAX=5 → exhausts retries (initial + 5 retries = 6), defers.
+  r = await simulate({
+    sapSequence: [{ info: 'I' }, { info: 'I' }, { info: 'I' }, { info: 'I' }, { info: 'I' }, { info: 'I' }],
+    INFO_INSTANT_RETRY_MAX: 5,
+  });
+  assert.strictEqual(r.attempts, 6, `Case B: expected 6 total attempts, got ${r.attempts}`);
+  assert.strictEqual(r.deferredToNextScan, true);
+  assert.strictEqual(r.acceptedAt, -1);
+
+  // Case C: immediate S → single attempt.
+  r = await simulate({ sapSequence: [{ info: 'S' }], INFO_INSTANT_RETRY_MAX: 5 });
+  assert.strictEqual(r.attempts, 1);
+  assert.strictEqual(r.acceptedAt, 1);
+  assert.strictEqual(r.deferredToNextScan, false);
+
+  // Case D: MAX=0 → no in-place retries on 'I', first 'I' defers immediately.
+  r = await simulate({ sapSequence: [{ info: 'I' }, { info: 'S' }], INFO_INSTANT_RETRY_MAX: 0 });
+  assert.strictEqual(r.attempts, 1);
+  assert.strictEqual(r.deferredToNextScan, true);
+
+  console.log('✓ INFO_INSTANT_RETRY (v3.36): 4 cases pass — 3×I→S accepts in 4 attempts, 6×I defers after 5 retries, MAX=0 defers immediately, matches ebidding-secure.js#submitBids');
 }
 // SAP's load-balancer silently closes idle keep-alive sockets after ~30s.
 // The next request on that socket bombs with HeadersTimeoutError / socket
@@ -1655,6 +1735,7 @@ function testEarlyDropAndBoundaryComplementary() {
     testPriorityLoader();
     testTieRejection();
     testGhostSaveDetection();
+    await testInfoInstantRetry();
     await testNetworkRetryOnIdempotent();
     console.log('\n🎉 ALL TESTS PASS');
     process.exit(0);

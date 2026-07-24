@@ -287,6 +287,27 @@ User feedback ("mai UI me 1 sec pehele chor deta hu... 50% mera rank 1 hota") re
 - **3 new unit tests** in `test-window-scheduler.js`: `testEarlyDropWindow` (8 cases), `testEarlyDropOnceSemantics` (3-window verification), `testEarlyDropAndBoundaryComplementary` (temporal ordering with v3.25 boundary block)
 - **Set `EARLY_DROP_MS=0` to disable** and revert to strict-at-boundary behaviour
 
+## Implemented (2026-02 — v3.36 24×7 ROBUST-SAVE PARITY with ebidding-secure.js)
+User uploaded a reference bot ("ebidding-secure.js" — 85 KB obfuscated) claiming it runs 24×7 without missing saves and asked to port its robust-save patterns into `bid-engine.js` while keeping the engine core intact. After deobfuscating the reference (webcrack pre-pass + custom RC4-string-array resolver → 2577 lines readable), two behaviour gaps were identified and closed:
+
+**Gap 1 — Ghost-marker false positives on `Type=S`.**
+The reference bot **never** inspects `ChangeNo` / `CreatedOn` / `CreatedAt`. It treats any `Type=S` response as a success and moves on. v3.34 already relaxed our detection to trust "Saved Successfully" + empty `Ev_Text`, but a residual path could still mark valid saves as ghost when the exact success text differed. Fix: `TRUST_TYPE_S=true` (default) makes any non-tie `Type=S` a definitive success. Post-save monitor (1.5s later, via `fetchLiveOrders`) still verifies persistence and logs mismatches. Reverts to v3.34 semantics if `TRUST_TYPE_S=false`.
+
+**Gap 2 — `Type=I` (info-level, usually "wrong captcha") deferred to next scan.**
+Old flow: `return { retry:true }` → wait for next tick → 1-2s delay per attempt during hot windows → time-window burn. Reference bot's `submitBids` loops up to 10× on `Type=I`, refetching a fresh captcha and retrying in-place. Fix: `INFO_INSTANT_RETRY_MAX=5` (default) — on `Type=I`, invalidate the used captcha, fetch a fresh one, and recurse `handleBatch` up to 5 times before deferring. Matches reference bot behaviour, keeps the mutex held so no other batch races.
+
+Config additions to `.env` and `.env.example`:
+```
+TRUST_TYPE_S=true
+INFO_INSTANT_RETRY_MAX=5
+```
+
+Unit tests (29/29 pass — was 28/28):
+- `testGhostSaveDetection` extended to verify BOTH v3.34 (`trustTypeS:false`) and v3.36 (`trustTypeS:true`) code paths for all `ChangeNo` variants + explicit-vs-implicit-success matrix + Type=E-still-rejected safety case.
+- New `testInfoInstantRetry` (4 cases): 3×I→S accepts in 4 attempts, 6×I defers after 5 retries, immediate S = 1 attempt, `MAX=0` defers on first `I` (config-off parity).
+
+Testing status: `node --check` clean, 29/29 tests pass, boot smoke test clean.
+
 ## Implemented (2026-02 — v3.35 PARALLEL ORDERS POLLER)
 User's 2026-07-23 18:15 live log (from AWS South-1a) exposed the residual bottleneck:
 - Boundary at :45:00.480, captcha unlocked at T+661ms (:45:01.141)

@@ -3,6 +3,28 @@
 /**
  * bid-engine.js — Bikas Bidding v2 main bot
  *
+ * v3.36 — 24×7 ROBUST-SAVE PARITY (user 2026-07-24, ebidding-secure.js reference):
+ *   User uploaded a reference bot ("ebidding-secure.js") that runs 24×7
+ *   without missing saves ("save bhaut acche se ho raha, jo missing hai
+ *   engine me lo — 24×7 run kare jaise ye karta hai"). Comparing the two:
+ *
+ *   Changes:
+ *   • TRUST_TYPE_S=true (default) — any SAP Type='S' response is trusted
+ *     as a real success unconditionally. Ghost-marker retry path only fires
+ *     for empty/'E' types. ebidding-secure.js never inspects ChangeNo /
+ *     CreatedOn / CreatedAt — those are transient markers that populate on
+ *     subsequent SessionSet fetches. v3.34 already relaxed this partially;
+ *     v3.36 makes it complete so no legitimate save is ever retried and
+ *     no captcha is burnt on ghost false-positives. Post-save monitor
+ *     (1.5s later) still verifies actual persistence via fetchLiveOrders
+ *     and logs any mismatch clearly.
+ *   • INFO_INSTANT_RETRY_MAX=5 (default) — on Type='I' (info-level)
+ *     responses (almost always "wrong captcha"), fetch a fresh captcha and
+ *     retry the same batch inside the current tick, up to 5 attempts.
+ *     Previously returned { retry:true } which deferred to the next scan
+ *     (1-2s delay during hot windows, wasting saves-per-second). Matches
+ *     `ebidding-secure.js#submitBids` which loops up to 10× on 'I'.
+ *
  * v3.35 — PARALLEL ORDERS POLLER (user 2026-07-23 live log analysis):
  *   Live 18:15 window showed captcha ready at T+661ms but instant-dispatch
  *   happened at T+2432ms (1771ms gap) because tick()'s fetchLiveOrders was
@@ -159,6 +181,31 @@ const L1_UNDERCUT_MIN_REMAINING_MS = parseInt(process.env.L1_UNDERCUT_MIN_REMAIN
 const AUTO_ADJUST         = String(process.env.AUTO_ADJUST || 'false').toLowerCase() === 'true';
 const MAX_ADJUST_RETRIES  = parseInt(process.env.MAX_ADJUST_RETRIES || '3', 10);
 const SKIP_RANK_PREVIEW   = String(process.env.SKIP_RANK_PREVIEW || 'true').toLowerCase() === 'true';
+
+// v3.36 — 24x7 ROBUST-SAVE parity with ebidding-secure.js (user 2026-07-24):
+// User uploaded a reference bot ("ebidding-secure.js") that runs 24×7 without
+// missing saves. Two robustness patterns were missing here:
+//
+// TRUST_TYPE_S (default true) — When SAP replies Type='S', trust it as a real
+//   success unconditionally (skip ghost-marker retry). ebidding-secure.js NEVER
+//   inspects ChangeNo/CreatedOn — those are just "not-yet-persisted" markers
+//   that populate on subsequent SessionSet fetches. Retrying on Type=S burns
+//   captcha attempts and can trigger SAP anti-fraud. v3.34 already relaxed
+//   this partially (via _sapExplicitSuccess), but v3.36 makes it complete:
+//   any Type='S' is trusted immediately; ghost detection only fires for
+//   type='E' or empty type responses. Post-save monitor (1.5s later) still
+//   verifies actual persistence via fetchLiveOrders and logs any mismatch.
+//   Set to 'false' to fall back to v3.34 conditional ghost detection.
+//
+// INFO_INSTANT_RETRY_MAX (default 5) — When SAP replies Type='I' (info-level,
+//   almost always "wrong captcha" or "captcha expired"), immediately fetch a
+//   fresh captcha and retry the SAME batch inside the current tick — up to
+//   N attempts. Prior behaviour was `return { retry:true }` which delayed
+//   the retry by 1-2s (next scan). During the 5-min window, saving 1-2s per
+//   info-retry × 10-20 orders = major throughput win. Matches
+//   ebidding-secure.js's `submitBids` while-loop (up to 10 retries).
+const TRUST_TYPE_S           = String(process.env.TRUST_TYPE_S || 'true').toLowerCase() === 'true';
+const INFO_INSTANT_RETRY_MAX = parseInt(process.env.INFO_INSTANT_RETRY_MAX || '5', 10);
 
 const WAF_MIN_MS   = parseInt(process.env.WAF_BACKOFF_MIN_MS || '30000', 10);
 const WAF_MAX_MS   = parseInt(process.env.WAF_BACKOFF_MAX_MS || '120000', 10);
@@ -1674,12 +1721,17 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
   // all had Message="Saved Successfully" Ev_Text="" but got REJECTED_GHOST).
   // This wasted 3× the requests AND may have triggered SAP anti-fraud.
   //
-  // NEW rule: only mark as ghost when BOTH:
-  //   (a) all rankHints have ChangeNo/CreatedOn/CreatedAt ghost markers, AND
-  //   (b) SAP did NOT explicitly acknowledge success (Ev_Text has content
-  //       OR primary info is 'E' OR Message is not the standard success text)
-  // If SAP clearly said "Saved Successfully" with Ev_Text="" and Type='S',
-  // TREAT AS REAL SUCCESS — no retry, no ghost flag.
+  // v3.34 rule: only mark as ghost when BOTH (a) all rankHints have ghost
+  // markers AND (b) SAP did NOT explicitly acknowledge success (Ev_Text has
+  // content OR primary info is 'E' OR Message is not the standard success text).
+  //
+  // v3.36 UPGRADE — TRUST_TYPE_S (default true, user 2026-07-24 directive
+  // "ebidding-secure jaisa bana do — kabhi save nahi chorta"): when SAP
+  // returns Type='S' at ALL, trust it unconditionally as a real success.
+  // ebidding-secure.js NEVER inspects ChangeNo/CreatedOn/CreatedAt — those
+  // are transient markers. Reproducing that behaviour eliminates the last
+  // false-positive ghost paths. Ghost retries now only fire on non-S types
+  // (empty info or 'E' with ghost markers), which is a rare corner case.
   const _ghostMarkerHints = (result.rankHints || []).filter((h) => h.isGhostRecord);
   const _allHintsAreGhost = _ghostMarkerHints.length > 0 && _ghostMarkerHints.length === (result.rankHints || []).length;
   const _sapExplicitSuccess = (
@@ -1688,14 +1740,19 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
     !evText.trim() && // Ev_Text is empty — no tie, no error text
     !isTieRejected
   );
-  const isGhostSaved = _allHintsAreGhost && !_sapExplicitSuccess;
+  // v3.36 — when TRUST_TYPE_S is on, ANY Type='S' is treated as success
+  // (except when Ev_Text says tie-rejection, still respected).
+  const _trustTypeS = TRUST_TYPE_S && result.info === 'S' && !isTieRejected;
+  const isGhostSaved = _allHintsAreGhost && !_sapExplicitSuccess && !_trustTypeS;
 
   const isSavedOk      = /saved successfully|bid.*accepted|success/i.test(textLower);
   // isRealSuccess must NOT trigger when SAP flags Type='E' with a tie-reject
   // Ev_Text — even if Message cosmetically says "Saved Successfully" — OR when
   // the response only contains ghost persistence markers AND SAP did not
   // explicitly acknowledge (v3.34 recalibrated).
+  // v3.36 — TRUST_TYPE_S: any non-tie Type='S' is a real success.
   const isRealSuccess  = !isTieRejected && !isGhostSaved && result.info !== 'E' && (
+    _trustTypeS ||
     (result.info === 'S' && !/ended|closed|expired|invalid|error/i.test(textLower)) || isSavedOk
   );
   const isTimeEnded    = /ended|closed|expired/i.test(textLower) && !isSavedOk;
@@ -1926,8 +1983,35 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
     return { ok: true };
   }
 
+  // v3.36 — INFO-LEVEL INSTANT RETRY (parity with ebidding-secure.js).
+  //
+  // Prior behaviour: `return { retry:true }` → main tick loop schedules a
+  // fresh scan (1-2s later during hot window, wasting captcha lead time).
+  //
+  // New behaviour: fetch a fresh captcha and recurse INSIDE the same call —
+  // up to INFO_INSTANT_RETRY_MAX attempts (default 5). Matches
+  // `ebidding-secure.js#submitBids` which loops up to 10× on 'I' responses.
+  // The retryDepth counter is shared with wrong-captcha (max 3) plus info
+  // retries (max INFO_INSTANT_RETRY_MAX), guarded by an overall cap of
+  // (3 + INFO_INSTANT_RETRY_MAX + 3 auto-adjust) = ~11 attempts worst-case.
   if (result.info === 'I') {
-    log.warn(`[${workerId}] ↻ Info-level rejection: ${result.text} — retry next scan`);
+    if (retryDepth < INFO_INSTANT_RETRY_MAX) {
+      log.warn(`[${workerId}] ↻ Info-level rejection (${result.text || 'captcha issue'}) — instant refetch + retry ${retryDepth + 1}/${INFO_INSTANT_RETRY_MAX}`);
+      // Invalidate the captcha we just used (SAP told us it was bad).
+      invalidateCaptchaCache(auth._lastCaptchaImg, solved);
+      let fresh = '';
+      for (let i = 0; i < 3; i++) {
+        const r = await nextCaptcha(auth);
+        if (r.solved) { fresh = r.solved; auth._lastCaptchaImg = r.img; break; }
+        if (wafActive()) return { retry: false };
+      }
+      if (!fresh) {
+        log.warn(`[${workerId}] Info-retry: could not solve fresh captcha — fall back to next-scan retry`);
+        return { retry: true };
+      }
+      return handleBatch(ctx, session, item, fresh, workerId, retryDepth + 1);
+    }
+    log.warn(`[${workerId}] ↻ Info-level rejection ${INFO_INSTANT_RETRY_MAX}× — deferring to next scan: ${result.text}`);
     for (const b of item.bids) bidLogRow(b, 'INFO_RETRY', result.text || '');
     return { retry: true };
   }
