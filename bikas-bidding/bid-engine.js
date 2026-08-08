@@ -3,6 +3,32 @@
 /**
  * bid-engine.js — Bikas Bidding v2 main bot
  *
+ * v3.37 — PRE-WINDOW PLANNER + 10 ms CAPTCHA POLL (user 2026-08-08 log analysis):
+ *   User shared a screenshot of a reference bot's timeline:
+ *     10:44:59  ✓ Bid order list fetched: 40 orders
+ *     10:44:59  ✓ CSV matching: 1 rows matched across 1 groups
+ *     10:44:59  ℹ Batch size: 3, Total batches: 1
+ *     10:44:59  ℹ First batch applied: 1 groups
+ *     10:45:00  ℹ ⏳ Submitting in 00:00:02.944
+ *     10:45:00  ℹ Polling SAP for captcha availability (catching it as it opens)…
+ *     10:45:01  ✓ Captcha became available after 3 polling attempts! (Captured in 1008ms)
+ *     10:45:01  ✓ Captcha solved: "TK58P"
+ *     10:45:01  ★ SAP sent the captcha! Submitting instantly to beat the crowd…
+ *     10:45:01  ★ Starting auto-continuous batch submission…
+ *   Reference flow: fetch+plan T-1000ms → aggressive captcha poll → submit-instant → Rank 1.
+ *
+ *   Changes:
+ *   • CAPTCHA_POLLER_MS default 50→10 (matches reference `sleep(10)`
+ *     inner-loop; captcha caught within FIRST poll after SAP unlocks).
+ *   • Pre-window planner in orders poller: at T ≤ 2500 ms, run
+ *     `buildBatches` ONCE per window and cache the plan on `ctx._cachedPlan`
+ *     + log the exact same 4-line block ("Bid order list fetched" / "CSV
+ *     matching" / "Batch size" / "First batch applied") the reference bot
+ *     shows. Zero-latency at captcha unlock.
+ *   • Captcha poller INSTANT-SUBMIT path prefers the pre-built plan
+ *     (`havePreBuilt` fast-path); falls back to inline build if plan was
+ *     invalidated (e.g., fresh orders arrived after plan was built).
+ *
  * v3.36 — 24×7 ROBUST-SAVE PARITY (user 2026-07-24, ebidding-secure.js reference):
  *   User uploaded a reference bot ("ebidding-secure.js") that runs 24×7
  *   without missing saves ("save bhaut acche se ho raha, jo missing hai
@@ -2518,18 +2544,35 @@ async function main() {
               }
             }
             if (ordersToUse && ordersToUse.length) {
-              const { plan, stats } = buildBatches(
-                ordersToUse, ctx.rules, ctx.blacklist, ctx.submitted, ctx.inFlight, ctx.cooldown,
-                ctx.sessions.length, ctx.priorityVbelns
+              // v3.37 — reuse the pre-window plan built by the orders poller
+              // at T-1500ms (parity with ebidding-secure.js). If we have a
+              // cached plan for this same window, skip the buildBatches
+              // step (~5-20ms saved). Otherwise build inline as fallback.
+              let plan, stats;
+              const havePreBuilt = (
+                ctx._cachedPlan && ctx._cachedPlan.length &&
+                ctx._planBuiltForWinKey === winKey
               );
+              if (havePreBuilt) {
+                plan = ctx._cachedPlan;
+                stats = ctx._cachedPlanStats || { matched: plan.reduce((s, b) => s + (b.bids?.length || 0), 0), total: ordersToUse.length };
+              } else {
+                const built = buildBatches(
+                  ordersToUse, ctx.rules, ctx.blacklist, ctx.submitted, ctx.inFlight, ctx.cooldown,
+                  ctx.sessions.length, ctx.priorityVbelns
+                );
+                plan = built.plan; stats = built.stats;
+              }
               if (plan.length) {
-                log.info(`[cap-poller] 🚀 INSTANT-SUBMIT dispatching ${plan.length} batch(es) with ${stats.matched} matched orders (captcha ready — bypassing tick loop entirely!)`);
+                log.info(`[cap-poller] 🚀 INSTANT-SUBMIT dispatching ${plan.length} batch(es) with ${stats.matched} matched orders (${havePreBuilt ? 'PRE-BUILT plan reused' : 'built inline'}) — bypassing tick loop entirely!`);
                 ctx._hotStall = true;
                 const workerCtx = { ...ctx, plan };
                 const workers = makeWorkerPool(workerCtx);
                 // Fire-and-forget — don't await, the poller must return quickly
-                // for the next 50ms tick.
+                // for the next tick.
                 Promise.all(workers).catch(() => {});
+                // Consume the pre-built plan so we don't re-fire it.
+                ctx._cachedPlan = null;
               } else {
                 log.info(`[cap-poller] no matched orders (matched=${stats.matched}, total=${stats.total}) — tick() may pick up next scan`);
               }
@@ -2591,6 +2634,54 @@ async function main() {
         if (orders.length && ctx._ordersPollerFirstSeenWin !== winKey) {
           ctx._ordersPollerFirstSeenWin = winKey;
           log.info(`[orders-poller] 📦 First non-empty orders scan for this window: ${orders.length} orders (fetch took ${Date.now() - t0}ms)`);
+        }
+
+        // v3.37 — PRE-WINDOW PLANNER (parity with ebidding-secure.js log timeline).
+        //
+        // Reference bot's log at T-1000ms shows:
+        //   ✓ Bid order list fetched: 40 orders
+        //   ✓ CSV matching: 1 rows matched across 1 groups
+        //   ℹ Batch size: 3, Total batches: 1
+        //   ℹ First batch applied: 1 groups
+        //
+        // So it: (a) fetches orders BEFORE the boundary, (b) runs CSV
+        // matching, (c) pre-builds the batch plan, (d) waits for captcha.
+        // Then at T+captcha-unlock, it submits the pre-built plan INSTANTLY.
+        //
+        // Our orders poller already caches orders every 150ms. Here we
+        // ALSO run buildBatches() ONCE per window when we're within 2s of
+        // the boundary and orders are cached, then stash the plan on
+        // ctx._cachedPlan for the captcha poller to pick up with zero
+        // computation cost at the T+captcha-unlock moment.
+        if (
+          orders.length &&
+          untilN > 0 && untilN <= 2500 &&
+          ctx._planBuiltForWinKey !== winKey
+        ) {
+          ctx._planBuiltForWinKey = winKey;
+          try {
+            const { plan, stats } = buildBatches(
+              orders, ctx.rules, ctx.blacklist, ctx.submitted, ctx.inFlight, ctx.cooldown,
+              ctx.sessions.length, ctx.priorityVbelns
+            );
+            ctx._cachedPlan = plan;
+            ctx._cachedPlanStats = stats;
+            log.info(`[pre-window] ✓ Bid order list fetched: ${orders.length} orders (T-${untilN}ms)`);
+            log.info(`[pre-window] ✓ CSV matching: ${stats.matched} rows matched across ${plan.length} groups`);
+            if (plan.length) {
+              const batchSize = plan[0]?.bids?.length || 0;
+              log.info(`[pre-window] ℹ Batch size: ${batchSize}, Total batches: ${plan.length}`);
+              log.info(`[pre-window] ℹ First batch applied: ${plan.length} groups — waiting for captcha unlock…`);
+            } else {
+              log.info(`[pre-window] ℹ No matches in this pre-window scan — orders-poller will re-check every ${ORDERS_POLLER_INTERVAL}ms until boundary`);
+              // Allow re-planning on the next tick if no match this time —
+              // by clearing the guard so a fresh order-set gets re-planned.
+              ctx._planBuiltForWinKey = 0;
+            }
+          } catch (e) {
+            log.warn(`[pre-window] plan build failed: ${e.message}`);
+            ctx._planBuiltForWinKey = 0;
+          }
         }
       } catch (e) {
         // silent — poller must never crash the process

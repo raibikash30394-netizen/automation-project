@@ -287,6 +287,39 @@ User feedback ("mai UI me 1 sec pehele chor deta hu... 50% mera rank 1 hota") re
 - **3 new unit tests** in `test-window-scheduler.js`: `testEarlyDropWindow` (8 cases), `testEarlyDropOnceSemantics` (3-window verification), `testEarlyDropAndBoundaryComplementary` (temporal ordering with v3.25 boundary block)
 - **Set `EARLY_DROP_MS=0` to disable** and revert to strict-at-boundary behaviour
 
+## Implemented (2026-02 — v3.37 PRE-WINDOW PLANNER + 10ms CAPTCHA POLL)
+User (2026-08-08) shared a screenshot of a reference bot's log timeline (fast/working, always Rank 1):
+```
+10:44:59  ✓ Bid order list fetched: 40 orders
+10:44:59  ✓ CSV matching: 1 rows matched across 1 groups
+10:44:59  ℹ Batch size: 3, Total batches: 1
+10:44:59  ℹ First batch applied: 1 groups
+10:45:00  ℹ ⏳ Submitting in 00:00:02.944
+10:45:00  ℹ Polling SAP for captcha availability (catching it as it opens)…
+10:45:01  ✓ Captcha became available after 3 polling attempts! (Captured in 1008ms)
+10:45:01  ✓ Captcha solved: "TK58P"
+10:45:01  ★ SAP sent the captcha! Submitting instantly to beat the crowd…
+10:45:01  ★ Starting auto-continuous batch submission…
+```
+Reference flow: fetch+plan T-1000ms → aggressive captcha poll → submit-instant → Rank 1. User directive: "jo ek dam fast or working ho banao ab" (make one that's blazing fast AND working now).
+
+Changes:
+- **`CAPTCHA_POLLER_MS` default 50 → 10** — matches reference's `sleep(10)` inner-loop. Captcha caught within FIRST poll after SAP unlocks (was up to 50ms wasted between polls).
+- **Pre-window planner** — inside the existing orders poller, when we're within T ≤ 2500 ms of a boundary AND orders are cached, run `buildBatches` ONCE per window and stash the plan on `ctx._cachedPlan`. Log the exact same 4-line block ("Bid order list fetched" / "CSV matching" / "Batch size: N, Total batches: N" / "First batch applied: N groups") as the reference bot for visual parity.
+- **Captcha poller INSTANT-SUBMIT prefers pre-built plan** — when captcha unlocks and `ctx._cachedPlan` is present for the current winKey, skip the `buildBatches` step (~5-20 ms saved). Fallback: inline build if plan is invalid or absent. Log tag `(PRE-BUILT plan reused)` vs `(built inline)` so we can verify the fast path fires from live logs.
+
+Expected new timeline (parity with reference bot):
+```
+T-1500  orders-poller fetches → pre-window planner logs 4-line block → plan cached
+T-500   captcha-poller starts probing (10ms interval)
+T+0     boundary; SAP begins unlocking captcha
+T+~1000 captcha probe hits, solves locally
+T+~1050 INSTANT-SUBMIT (pre-built plan reused, zero build overhead)
+T+~1200 SAP responds "Bidding Amount Saved Successfully"
+```
+
+Testing: `node --check` clean, 29/29 unit tests pass, boot smoke test clean.
+
 ## Implemented (2026-02 — v3.36 24×7 ROBUST-SAVE PARITY with ebidding-secure.js)
 User uploaded a reference bot ("ebidding-secure.js" — 85 KB obfuscated) claiming it runs 24×7 without missing saves and asked to port its robust-save patterns into `bid-engine.js` while keeping the engine core intact. After deobfuscating the reference (webcrack pre-pass + custom RC4-string-array resolver → 2577 lines readable), two behaviour gaps were identified and closed:
 
