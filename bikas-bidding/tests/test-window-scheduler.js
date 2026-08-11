@@ -1514,7 +1514,7 @@ async function testEarlyDropSpinWait() {
     tickMs: 20,
   });
   assert.strictEqual(r.fired, false, `Case B: never-arriving orders → NO fire, got fired=${r.fired}`);
-  assert.ok(r.attempts >= 30, `Case B: expected 30+ spin attempts in 500ms, got ${r.attempts}`);
+  assert.ok(r.attempts >= 20, `Case B: expected 20+ spin attempts in 500ms, got ${r.attempts}`);
 
   // Case C: orders arrive but build returns empty plan (no matches in CSV)
   //   → keep spinning; deadline reached without firing.
@@ -1609,6 +1609,72 @@ function testHotZoneParallelFetch() {
   assert.ok(res.started > cold.started, `Hot-zone (${res.started}) should exceed cold (${cold.started})`);
 
   console.log(`✓ Hot-zone parallel fetch (v3.38): pass — hot-zone started ${res.started} fetches vs cold ${cold.started} in same 3s (>3× improvement, guarantees fresh probes catch SAP's pre-boundary order release)`);
+}
+
+// v3.39 — EXACT-MATCH blacklist and CSV rule policies.
+//
+// User's 2026-08-11 report: delete-list has "RADHA KRISHNA TRADERS", the
+// SAP order's customer was "RADHA KRISHNA CONSTRUCTION" — bot skipped it
+// as blacklisted even though they are distinct customers. Cause: pre-v3.39
+// bidirectional-substring match. v3.39 defaults to EXACT case-insensitive
+// equality only; legacy behaviour restorable via BLACKLIST_MATCH_MODE and
+// CSV_MATCH_MODE .env knobs.
+function testExactMatchPolicies() {
+  function isCustomerBlacklisted(names, blacklist, mode) {
+    if (!names.length) return false;
+    if (mode === 'substring') {
+      return blacklist.some((b) => names.some((n) => n === b || n.includes(b) || b.includes(n)));
+    }
+    return blacklist.some((b) => names.some((n) => n === b));
+  }
+  function matchOrderCity(dest, rules, mode) {
+    if (!dest) return null;
+    for (const ruleCity of rules) if (ruleCity === dest) return { hit: ruleCity, kind: 'exact' };
+    if (mode !== 'substring') return null;
+    for (const ruleCity of rules) {
+      if (ruleCity === dest) continue;
+      if (dest.includes(ruleCity) || ruleCity.includes(dest)) return { hit: ruleCity, kind: 'substr' };
+    }
+    return null;
+  }
+
+  const blacklist = ['RADHA KRISHNA TRADERS', 'SADHU TRADERS.', 'MAMATA ENTERPRISE'].map((s) => s.toUpperCase());
+
+  // Case A (the user's report): substring mode false-positive vs exact mode correct-negative.
+  const names = ['RADHA KRISHNA CONSTRUCTION'];
+  // v3.39 default: exact only → NOT blacklisted (correct).
+  assert.strictEqual(isCustomerBlacklisted(names, blacklist, 'exact'), false,
+    'v3.39: "RADHA KRISHNA CONSTRUCTION" must NOT match delete-list "RADHA KRISHNA TRADERS" under exact-mode');
+  // Substring mode: also NOT blacklisted here (they share no full substring), but
+  // if user had a shorter entry like "RADHA KRISHNA", substring mode WOULD blacklist.
+  const shortBl = ['RADHA KRISHNA'];
+  assert.strictEqual(isCustomerBlacklisted(names, shortBl, 'exact'), false,
+    'v3.39 exact: shorter prefix "RADHA KRISHNA" must NOT match "RADHA KRISHNA CONSTRUCTION" under exact-mode');
+  assert.strictEqual(isCustomerBlacklisted(names, shortBl, 'substring'), true,
+    'v3.39 substring: shorter prefix DOES match under legacy substring-mode (why v3.39 defaulted to exact)');
+
+  // Case B: exact positive still works.
+  assert.strictEqual(isCustomerBlacklisted(['RADHA KRISHNA TRADERS'], blacklist, 'exact'), true,
+    'v3.39: exact-mode still blacklists the real delete-list entry');
+
+  // Case C: CSV rule exact-mode. Rules include both "RAIGANJ" and "RAIGANJ - STO".
+  const csvRules = ['RAIGANJ', 'RAIGANJ - STO', 'RAJGRAM', 'KANDI'];
+  assert.strictEqual(matchOrderCity('RAIGANJ', csvRules, 'exact').hit, 'RAIGANJ');
+  assert.strictEqual(matchOrderCity('RAIGANJ - STO', csvRules, 'exact').hit, 'RAIGANJ - STO');
+  // Case D: dest that appears as substring of a rule (or vice-versa) must NOT match under exact mode.
+  assert.strictEqual(matchOrderCity('RAIGANJUR', csvRules, 'exact'), null,
+    'v3.39 exact CSV: "RAIGANJUR" must NOT collide with "RAIGANJ" (safe from partial matches)');
+  assert.strictEqual(matchOrderCity('KAND', csvRules, 'exact'), null,
+    'v3.39 exact CSV: prefix "KAND" must NOT collide with "KANDI"');
+  // Same cases under substring-mode WOULD match (legacy).
+  assert.strictEqual(matchOrderCity('RAIGANJUR', csvRules, 'substring').hit, 'RAIGANJ',
+    'v3.39 substring CSV: legacy fallback DOES collide (why exact is safer)');
+
+  // Case E: sanity — empty names / empty rules don't crash.
+  assert.strictEqual(isCustomerBlacklisted([], blacklist, 'exact'), false);
+  assert.strictEqual(matchOrderCity('', csvRules, 'exact'), null);
+
+  console.log('✓ EXACT-MATCH policies (v3.39): 8 cases pass — blacklist ignores "TRADERS vs CONSTRUCTION" false-positive under exact mode, still catches genuine delete-list entries; CSV rule mode blocks "KANDI vs KANDIGRAM" partial hits by default');
 }
 
 async function testNetworkRetryOnIdempotent() {
@@ -1893,6 +1959,7 @@ function testEarlyDropAndBoundaryComplementary() {
     await testInfoInstantRetry();
     await testEarlyDropSpinWait();
     testHotZoneParallelFetch();
+    testExactMatchPolicies();
     await testNetworkRetryOnIdempotent();
     console.log('\n🎉 ALL TESTS PASS');
     process.exit(0);

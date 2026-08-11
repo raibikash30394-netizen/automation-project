@@ -3,6 +3,45 @@
 /**
  * bid-engine.js — Bikas Bidding v2 main bot
  *
+ * v3.39 — EXACT-MATCH BLACKLIST + CSV RULES + SILENT-DROP DIAGNOSTICS
+ *         (user 2026-08-11 live-run report):
+ *   User's directive (Hindi/Hinglish): "RADHA KRISHNA CONSTRUCTION diya
+ *   tha lekin delet me naam thora alag hai RADHA KRISHNA TRADERS hai tho
+ *   skip kar diya jab ki wo hit karna tha… input2 me bhi same pura naam
+ *   proper match kar he save karna hai matlab ek dam same save ho koi
+ *   oder chutna nahi chaiye".
+ *
+ *   Live-log analysis (06:45 window):
+ *     • Scan showed `bl=10 no-rule=14` — 10 orders blacklisted, 14 no-rule
+ *     • bids.csv logged 4 SAVED-TIED rows for 3 batches
+ *     • Batch 2 (AMRAPARA/TALIBPUR/BALURGHAT) was submitted but produced
+ *       NO response entry in any log — a fully silent drop.
+ *
+ *   Changes:
+ *   • Blacklist match: EXACT case-insensitive equality only. Previously
+ *     `n === b || n.includes(b) || b.includes(n)` — bidirectional
+ *     substring — caused false positives (e.g., "RADHA KRISHNA
+ *     CONSTRUCTION" would match delete-list "RADHA KRISHNA TRADERS" iff
+ *     a shorter common prefix was somewhere in the list, or a suffix like
+ *     "TRADERS" collided with "TRADERSE" typo). Set
+ *     BLACKLIST_MATCH_MODE=substring in .env to restore legacy behaviour.
+ *   • CSV rule match: EXACT only by default. Pass-2 substring fallback
+ *     is now gated on CSV_MATCH_MODE=substring (default 'exact'). User's
+ *     CSV already lists all destination variants (RAIGANJ, RAIGANJ - STO,
+ *     etc.) so exact-only is safe and eliminates the "KANDI matches
+ *     KANDIGRAM" style false hits.
+ *   • Worker-exit safety net: `runAll()` now wraps its per-batch loop in
+ *     try/catch and logs a `[worker] ✗ WORKER ERROR` line plus writes a
+ *     WORKER_ERROR row to bids.csv whenever an unhandled exception drops
+ *     the batch. Also emits `[worker] ⚠ batch exit without persisted
+ *     outcome` when a batch completes without any persisted result. This
+ *     surfaces the AMRAPARA-style silent drop observed in the 06:45 log.
+ *   • Per-order visibility: the "waiting for matched orders" telemetry
+ *     now includes samples of the first 5 blacklisted vbelns (with
+ *     customer name), first 5 no-rule vbelns (with destination + SPI),
+ *     and first 3 club-dropped groups. User can spot mis-configuration
+ *     immediately without SAP-side inspection.
+ *
  * v3.38 — PRE-BOUNDARY ORDER-CAPTURE FIX (user 2026-08-10 log analysis):
  *   User's engine.log showed EVERY window logging:
  *     "🎯 EARLY-DROP FIRE @ T-500ms — attempting direct speculative submit"
@@ -908,9 +947,15 @@ function matchOrder(order, rules, ruleCitiesByLen) {
     if (hit) return hit;
   }
 
-  // Pass 2: containment (longest first). Prefer dest.includes(ruleCity)
-  // over ruleCity.includes(dest) because CSV keys are usually more specific
-  // than the raw SAP dest string.
+  // v3.39 — CSV_MATCH_MODE (user 2026-08-11 directive: "input2 me bhi same
+  // pura naam proper match kar he save karna hai"). Default 'exact' skips
+  // the substring pass entirely. Was previously prone to false matches
+  // when partial city names collided (e.g., "KANDI" vs "KANDIGRAM").
+  // Set CSV_MATCH_MODE=substring to restore the previous behaviour.
+  const mode = String(process.env.CSV_MATCH_MODE || 'exact').toLowerCase();
+  if (mode !== 'substring') return null;
+
+  // Pass 2 (substring, legacy): dest.includes(ruleCity) or ruleCity.includes(dest).
   for (const ruleCity of candidates) {
     if (dest === ruleCity) continue;
     if (!(dest.includes(ruleCity) || ruleCity.includes(dest))) continue;
@@ -951,7 +996,22 @@ function isCustomerBlacklisted(order, blacklist) {
     order.CustomerName, order.Kunag, order.Kunnr, order.Kunwe,
   ].filter(Boolean).map((v) => v.toString().trim().toUpperCase());
   if (!names.length) return false;
-  return blacklist.some((b) => names.some((n) => n === b || n.includes(b) || b.includes(n)));
+  // v3.39 EXACT-MATCH policy (user 2026-08-11 directive: "proper match kar
+  // he skip karna hai"). Previously we used bidirectional substring:
+  //     n === b || n.includes(b) || b.includes(n)
+  // which falsely blacklisted "RADHA KRISHNA CONSTRUCTION" when the
+  // delete-list had "RADHA KRISHNA TRADERS" iff a shorter prefix was in
+  // the list, and generally over-blocked orders with common company
+  // suffixes ("ENTERPRISE", "HARDWARE", "DAS", etc.).
+  // New rule: STRICT case-insensitive equality after trim only.
+  // Set BLACKLIST_MATCH_MODE=substring in .env to restore the previous
+  // bidirectional-substring behaviour.
+  const mode = String(process.env.BLACKLIST_MATCH_MODE || 'exact').toLowerCase();
+  if (mode === 'substring') {
+    return blacklist.some((b) => names.some((n) => n === b || n.includes(b) || b.includes(n)));
+  }
+  // Default: exact-only (safer, matches user's directive).
+  return blacklist.some((b) => names.some((n) => n === b));
 }
 
 // ---- Priority (COF Order ID / Vbeln) list ----------------------------------
@@ -1499,9 +1559,32 @@ function buildBatches(orders, rules, blacklist, seenSubmitted, inFlight, cooldow
   for (const [club, members] of byClub.entries()) {
     if (!club) {
       for (const o of members) {
-        if (isCustomerBlacklisted(o, blacklist)) { stats.blacklisted++; continue; }
+        if (isCustomerBlacklisted(o, blacklist)) {
+          stats.blacklisted++;
+          // v3.39 — per-order blacklist visibility. User's 2026-08-11 report
+          // asked "delete me naam thora alag hai, tho skip kar diya" — now
+          // the CSV audit shows exactly which vbeln + customer name got
+          // skipped so mis-blacklists are trivially spot-checkable.
+          if (stats._blSamples === undefined) stats._blSamples = [];
+          if (stats._blSamples.length < 5) {
+            const cust = (o.KunagName1 || o.KunweName1 || o.Customer || o.CustomerName || '').toString().trim();
+            stats._blSamples.push(`${o.SapOrderId || o.Vbeln}[${cust}]`);
+          }
+          continue;
+        }
         const m = matchOrder(o, rules, ruleCitiesByLen);
-        if (!m) { stats.noRule++; continue; }
+        if (!m) {
+          stats.noRule++;
+          // v3.39 — per-order no-rule visibility (sample first 5). Helps
+          // the user notice CSV cities that need adding.
+          if (stats._nrSamples === undefined) stats._nrSamples = [];
+          if (stats._nrSamples.length < 5) {
+            const dest = (o.Destination || o.DestCityDesc || o.CityCodeDescription || '').toString().trim();
+            const spi = (o.SPI || o.Spi || o.SpecialProcessInd || o.Zspi || '').toString().trim();
+            stats._nrSamples.push(`${o.SapOrderId || o.Vbeln}[${dest}/${spi}]`);
+          }
+          continue;
+        }
         stats.matched++;
         const priority = isPriorityOrder(o);
         if (priority) stats.priority++;
@@ -1510,15 +1593,28 @@ function buildBatches(orders, rules, blacklist, seenSubmitted, inFlight, cooldow
     } else {
       const items = [];
       let drop = false;
+      let dropReason = '';
       let clubPriority = false;
       for (const o of members) {
-        if (isCustomerBlacklisted(o, blacklist)) { drop = true; break; }
+        if (isCustomerBlacklisted(o, blacklist)) {
+          drop = true;
+          dropReason = `blacklisted customer (${(o.KunagName1 || o.Customer || '').toString().trim()})`;
+          break;
+        }
         const m = matchOrder(o, rules, ruleCitiesByLen);
-        if (!m) { drop = true; break; }
+        if (!m) {
+          drop = true;
+          dropReason = `no CSV rule for dest="${(o.Destination || o.DestCityDesc || o.CityCodeDescription || '').toString().trim()}"`;
+          break;
+        }
         if (isPriorityOrder(o)) clubPriority = true;
         items.push({ order: o, amount: m.amount, city: m.matchedCity, spi: m.matchedSpi });
       }
-      if (drop) stats.clubDropped++;
+      if (drop) {
+        stats.clubDropped++;
+        if (stats._cdSamples === undefined) stats._cdSamples = [];
+        if (stats._cdSamples.length < 3) stats._cdSamples.push(`club=${club}(${members.length}): ${dropReason}`);
+      }
       else if (items.length) {
         stats.matched += items.length;
         if (clubPriority) stats.priority += items.length;
@@ -1678,25 +1774,64 @@ function makeWorkerPool(ctx) {
       // If ALL sessions silent-fail → mark cooldown so we retry next scan.
       let finalOutcome = null;
       let allSilentFail = true;
-      for (const session of ctx.sessions) {
-        const outcome = await session.mutex.run(async () => {
-          const solved = await fetchFreshCaptcha(session, session.id);
-          if (!solved) return { skipped: true };
-          // Global mutex: serialise the actual submit HTTP call across ALL sessions.
-          return await globalSubmitMutex.run(async () => {
-            return await handleBatch(ctx, session, item, solved, session.id);
+      // v3.39 — track submitted vbelns for the worker-exit log so any silent
+      // exception (bug / SAP timeout / mutex crash / etc.) that swallows the
+      // per-batch response is at least visible in the log. Prior to v3.39
+      // a batch that hit an unlogged error (e.g., session mutex threw, or
+      // a race where the outcome was undefined) simply vanished — the user's
+      // 2026-08-11 log had one such batch (AMRAPARA/1154850608).
+      const vbelns = item.bids.map((b) => String(b.order.SapOrderId));
+      try {
+        for (const session of ctx.sessions) {
+          const outcome = await session.mutex.run(async () => {
+            const solved = await fetchFreshCaptcha(session, session.id);
+            if (!solved) return { skipped: true };
+            // Global mutex: serialise the actual submit HTTP call across ALL sessions.
+            return await globalSubmitMutex.run(async () => {
+              return await handleBatch(ctx, session, item, solved, session.id);
+            });
           });
-        });
 
-        finalOutcome = outcome;
-        if (!outcome || outcome.skipped) continue;
-        if (outcome.silentFail) {
-          log.warn(`[${session.id}] Silent 201 → falling back to next session`);
-          continue;
+          finalOutcome = outcome;
+          if (!outcome || outcome.skipped) continue;
+          if (outcome.silentFail) {
+            log.warn(`[${session.id}] Silent 201 → falling back to next session`);
+            continue;
+          }
+          // Real result (success OR definitive rejection) → stop fallback loop
+          allSilentFail = false;
+          break;
         }
-        // Real result (success OR definitive rejection) → stop fallback loop
-        allSilentFail = false;
-        break;
+      } catch (workerErr) {
+        // v3.39 — catch-all safety net: log any thrown error that would
+        // otherwise silently drop the batch. Also write a WORKER_ERROR row
+        // to bids.csv so the user's daily audit shows the drop.
+        log.error(`[worker] ✗ WORKER ERROR while processing batch (vbelns=${vbelns.join(',')}): ${workerErr && workerErr.message} — stack: ${workerErr && workerErr.stack}`);
+        for (const b of item.bids) bidLog.write({
+          session: (ctx.sessions[0] && ctx.sessions[0].id) || 'unknown',
+          sap_order_id: b.order.SapOrderId,
+          city: b.city,
+          spi: b.spi,
+          csv_rate: b.amount,
+          submit_ms: '',
+          status: 'WORKER_ERROR',
+          message: (workerErr && workerErr.message) || 'unknown worker error',
+        });
+      }
+
+      // v3.39 — worker-exit diagnostic. If the batch completed but produced
+      // no persisted outcome (e.g., outcome=null, outcome.skipped, all
+      // silent-fails without cooldown), log WHAT happened so silent drops
+      // are always visible in the log stream. Applies to both cap-poller
+      // INSTANT-SUBMIT dispatches (via workerCtx) and main tick dispatches.
+      const outcomeSummary = finalOutcome
+        ? (finalOutcome.ok ? 'ok'
+          : finalOutcome.silentFail ? 'silent-fail'
+          : finalOutcome.skipped ? 'skipped'
+          : finalOutcome.retry ? 'retry' : 'other')
+        : 'no-outcome';
+      if (!finalOutcome || (finalOutcome.skipped) || (allSilentFail && !finalOutcome?.silentFail)) {
+        log.warn(`[worker] ⚠ batch exit without persisted outcome (vbelns=${vbelns.join(',')}, outcome=${outcomeSummary}) — investigate: was captcha fetched, was mutex acquired?`);
       }
 
       // If every session silent-failed on this item, cooldown so we retry later
@@ -2280,7 +2415,16 @@ async function tick(ctx) {
         if (!globalThis.__lastWaitLog || now - globalThis.__lastWaitLog > 10_000) {
           globalThis.__lastWaitLog = now;
           const alreadySubmitted = ctx.submitted.size;
-          log.info(`⏳ waiting for matched orders to appear (${stats.total} live: bl=${stats.blacklisted} no-rule=${stats.noRule} club-drop=${stats.clubDropped} cool=${stats.coolskip} sub-this-window=${alreadySubmitted} → 0 matched)… ${boundaryStatusText()} (bot polling tight, session-shake active — do NOT restart)`);
+          // v3.39 — surface WHICH orders were skipped (first 5 blacklist +
+          // first 5 no-rule samples) so user can tell "wrongly blacklisted"
+          // from "genuinely blacklisted" without grepping raw SAP orders.
+          const blSample = (stats._blSamples && stats._blSamples.length)
+            ? ` | bl-samples: ${stats._blSamples.join('; ')}${stats.blacklisted > stats._blSamples.length ? `+${stats.blacklisted - stats._blSamples.length} more` : ''}` : '';
+          const nrSample = (stats._nrSamples && stats._nrSamples.length)
+            ? ` | no-rule samples: ${stats._nrSamples.join('; ')}${stats.noRule > stats._nrSamples.length ? `+${stats.noRule - stats._nrSamples.length} more` : ''}` : '';
+          const cdSample = (stats._cdSamples && stats._cdSamples.length)
+            ? ` | club-drop samples: ${stats._cdSamples.join('; ')}` : '';
+          log.info(`⏳ waiting for matched orders to appear (${stats.total} live: bl=${stats.blacklisted} no-rule=${stats.noRule} club-drop=${stats.clubDropped} cool=${stats.coolskip} sub-this-window=${alreadySubmitted} → 0 matched)… ${boundaryStatusText()} (bot polling tight, session-shake active — do NOT restart)${blSample}${nrSample}${cdSample}`);
         }
         return;
       }

@@ -1,0 +1,5 @@
+timestamp,session,sap_order_id,city,spi,csv_rate,submit_ms,status,message
+2026-08-11T06:45:01.529Z,s1,1154929409,TALIBPUR,1162,690,332,SAVED_TIED,Same amount has been bid by other vendor for order  id : 5575751563 and posnr: 000102# Same amount has been bid by other vendor for order  id : 5575752327 and posnr: 000101#
+2026-08-11T06:45:01.529Z,s1,1154929437,KANDI,1162,530,332,SAVED_TIED,Same amount has been bid by other vendor for order  id : 5575751563 and posnr: 000102# Same amount has been bid by other vendor for order  id : 5575752327 and posnr: 000101#
+2026-08-11T06:45:01.529Z,s1,1154928776,PATIRAM,1164,833,332,SAVED_TIED,Same amount has been bid by other vendor for order  id : 5575751563 and posnr: 000102# Same amount has been bid by other vendor for order  id : 5575752327 and posnr: 000101#
+2026-08-11T06:45:11.414Z,s1,1154928797,KUSHIDA,1163,792,1751,SAVED_TIED,Same amount has been bid by other vendor for order  id : 5575753730 and posnr: 000101#

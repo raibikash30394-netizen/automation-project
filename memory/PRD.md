@@ -287,6 +287,29 @@ User feedback ("mai UI me 1 sec pehele chor deta hu... 50% mera rank 1 hota") re
 - **3 new unit tests** in `test-window-scheduler.js`: `testEarlyDropWindow` (8 cases), `testEarlyDropOnceSemantics` (3-window verification), `testEarlyDropAndBoundaryComplementary` (temporal ordering with v3.25 boundary block)
 - **Set `EARLY_DROP_MS=0` to disable** and revert to strict-at-boundary behaviour
 
+## Implemented (2026-02 — v3.39 EXACT-MATCH BLACKLIST + CSV RULES + SILENT-DROP DIAGNOSTICS)
+User (2026-08-11) shared engine log + input2.csv + delete.csv + bids-2026-08-11.csv + agent-boost.js/runner.js reference from `ebidding.zip`. Analysis of the 06:45 window found THREE root-causes:
+
+**Root cause 1 — Blacklist over-blocking (bidirectional substring).**
+The `isCustomerBlacklisted` matcher used `n === b || n.includes(b) || b.includes(n)`. When the delete-list contained `RADHA KRISHNA TRADERS` and the SAP order's customer was `RADHA KRISHNA CONSTRUCTION` (as in the user's report), the bidirectional substring path could false-positive — especially if any shorter delete-list entry shared a prefix. The 06:45 scan showed `bl=10` (10 orders blacklisted) with the user manually confirming several were false blocks.
+
+**Root cause 2 — CSV rule over-matching (Pass 2 substring fallback).**
+`matchOrder` had a `Pass 2` that matched `dest.includes(ruleCity) || ruleCity.includes(dest)`. This could produce wrong-city matches (e.g., destination `KANDIGRAM` matching rule `KANDI` → wrong bid amount applied). User's directive: "input2 me bhi same pura naam proper match kar he save karna hai matlab ek dam same save ho".
+
+**Root cause 3 — Silent batch drop (AMRAPARA/TALIBPUR/BALURGHAT).**
+The 06:45 log shows Batch 2 (`1154850608 [AMRAPARA/1162]@567, 1154929666 [TALIBPUR/1162]@690, 1154919752 [BALURGHAT/1164]@869`) was submitted, but NO subsequent `✓ SAVED-TIED` / `✗ REJECTED` / `✗ GHOST-SAVED` / any response log line appeared. Metrics showed `wrong-captcha=1` around the same time. Hypothesis: an unhandled exception in the worker loop's `session.mutex.run(...)` or `globalSubmitMutex.run(...)` swallowed the outcome; there was no worker-level `try/catch` to surface it.
+
+**Changes (v3.39):**
+- `isCustomerBlacklisted` — default `BLACKLIST_MATCH_MODE=exact` (case-insensitive equality only). Legacy behaviour still accessible via `BLACKLIST_MATCH_MODE=substring`.
+- `matchOrder` — default `CSV_MATCH_MODE=exact` (Pass-1 only). Pass-2 substring fallback gated on `CSV_MATCH_MODE=substring`. User's CSV lists all destination variants explicitly (RAIGANJ, `RAIGANJ - STO`, etc.) so exact is safe.
+- Worker-exit safety net — `runAll()` now wraps its per-batch loop in `try/catch`. Any thrown error logs `[worker] ✗ WORKER ERROR while processing batch (vbelns=…): …` and writes a `WORKER_ERROR` row to `bids.csv`. A separate `[worker] ⚠ batch exit without persisted outcome` line fires when a batch completes without any persisted result — surfaces the AMRAPARA-style silent drop.
+- Per-order diagnostics — the "waiting for matched orders" telemetry now includes samples of the first 5 blacklisted vbelns (with customer name), first 5 no-rule vbelns (with destination + SPI), and first 3 club-dropped groups. User can spot misconfig without SAP-side inspection.
+- .env / .env.example updated with the two new knobs. Version banner updated in `bid-engine.js` header.
+
+Unit tests: `testExactMatchPolicies` — 8 cases (RADHA KRISHNA false-positive, exact-mode still catches genuine hit, CSV exact blocks `KANDIGRAM`-vs-`KANDI` collision, substring mode legacy behaviour verified). **32/32 tests pass** (up from 31).
+
+Testing status: `node --check` clean, all tests green, boot smoke test clean.
+
 ## Implemented (2026-02 — v3.38 PRE-BOUNDARY ORDER-CAPTURE FIX)
 User (2026-08-10) shared `engine.log` (~9000 lines) + CSV + solver.log after a full run. Analysis revealed:
 

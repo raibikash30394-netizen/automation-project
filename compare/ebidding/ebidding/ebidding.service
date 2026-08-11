@@ -1,0 +1,21 @@
+[Unit]
+Description=E-Bidding 24x7 Runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# EDIT these two lines for your VM:
+User=ubuntu
+WorkingDirectory=/home/ubuntu/ebidding
+
+ExecStart=/usr/bin/node runner.js
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/ubuntu/ebidding/logs/systemd.log
+StandardError=append:/home/ubuntu/ebidding/logs/systemd.err.log
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
