@@ -1230,7 +1230,7 @@ function testTieRejection() {
 // This is the "abhi browser me save nahi hua" case from user's live logs.
 function testGhostSaveDetection() {
   function classify(result, opts = {}) {
-    const TRUST_TYPE_S = opts.trustTypeS !== false; // default true for v3.36
+    const TRUST_TYPE_S = opts.trustTypeS !== false; // default true for v3.36+
     const textLower = (result.text || '').toString().toLowerCase();
     const evText = (result.evText || '').toString();
     const evTextLower = evText.toLowerCase();
@@ -1238,6 +1238,11 @@ function testGhostSaveDetection() {
     // v3.34 — ghost detection: only mark as ghost if hints are ghost AND SAP
     // did NOT explicitly acknowledge success.
     // v3.36 — TRUST_TYPE_S upgrade: any Type='S' is trusted unconditionally.
+    // v3.40 — ghost detection is DISABLED entirely when TRUST_TYPE_S=true
+    //   (default). The reference bot (ebidding-secure.js) never inspects
+    //   Type/ChangeNo markers; post-save fetchLiveOrders is the only
+    //   authoritative persistence check. Set opts.trustTypeS=false to
+    //   restore v3.34 conditional ghost detection.
     const _ghostMarkerHints = (result.rankHints || []).filter((h) => h.isGhostRecord);
     const _allHintsAreGhost = _ghostMarkerHints.length > 0 && _ghostMarkerHints.length === (result.rankHints || []).length;
     const _sapExplicitSuccess = (
@@ -1247,10 +1252,16 @@ function testGhostSaveDetection() {
       !isTieRejected
     );
     const _trustTypeS = TRUST_TYPE_S && result.info === 'S' && !isTieRejected;
-    const isGhostSaved = _allHintsAreGhost && !_sapExplicitSuccess && !_trustTypeS;
+    const _trustSavedText = TRUST_TYPE_S && !isTieRejected && (
+      /saved\s*successfully|bid.*accepted|save.*success/i.test(result.text || '') ||
+      /saved\s*successfully|bid.*accepted|save.*success/i.test(evText)
+    );
+    const isGhostSaved = TRUST_TYPE_S
+      ? false
+      : (_allHintsAreGhost && !_sapExplicitSuccess);
     const isSavedOk = /saved successfully|bid.*accepted|success/i.test(textLower);
     const isRealSuccess = !isTieRejected && !isGhostSaved && result.info !== 'E' && (
-      _trustTypeS ||
+      _trustTypeS || _trustSavedText ||
       (result.info === 'S' && !/ended|closed|expired|invalid|error/i.test(textLower)) || isSavedOk
     );
     if (isTieRejected) return 'REJECTED_TIE';
@@ -1382,17 +1393,40 @@ function testGhostSaveDetection() {
     );
   }
 
-  // Case 7 (v3.36 parity): Type='E' + ghost markers → still REJECTED_GHOST
-  // regardless of TRUST_TYPE_S (only 'S' is trusted). Ensures we don't
-  // over-trust true error responses.
+  // Case 7 (v3.36 parity → REVISED for v3.40): with TRUST_TYPE_S=true
+  // (default) ghost detection is DISABLED, so Type='E' + ghost markers
+  // classifies as UNKNOWN (not REJECTED_GHOST). Legacy behaviour still
+  // available with TRUST_TYPE_S=false (see next case).
   const eGhost = hint({ ghost: true });
   assert.strictEqual(
     classify({ statusCode: 201, info: 'E', text: '', evText: '', rankHints: [eGhost] }, { trustTypeS: true }),
+    'UNKNOWN',
+    'v3.40 TRUST_TYPE_S=true: ghost detection DISABLED; empty text/Ev_Text on Type=E → UNKNOWN (retry path)'
+  );
+  assert.strictEqual(
+    classify({ statusCode: 201, info: 'E', text: '', evText: '', rankHints: [eGhost] }, { trustTypeS: false }),
     'REJECTED_GHOST',
-    'v3.36 TRUST_TYPE_S only trusts Type=S; Type=E with ghost markers still REJECTED_GHOST'
+    'v3.40 fallback (TRUST_TYPE_S=false): Type=E with ghost markers still REJECTED_GHOST'
   );
 
-  console.log('✓ Ghost-save detection (v3.34+v3.36): all cases pass — explicit "Saved Successfully" AND TRUST_TYPE_S=true both accept legitimate saves without ghost retries');
+  // Case 8 (v3.40 — THE bhai 07:45 window bug):
+  //   SAP returned NavEBiddingMessage with EMPTY Type + "Saved" text.
+  //   v3.36 rule required Type='S' so _trustTypeS was false → ghost fired.
+  //   v3.40 adds _trustSavedText for the text-only ACK case.
+  const emptyTypeGhost = hint({ ghost: true });
+  assert.strictEqual(
+    classify({
+      statusCode: 201,
+      info: '',   // empty Type — SAP quirk that hit bhai in 07:45
+      text: 'Bidding Amount Saved Successfully.',
+      evText: '',
+      rankHints: [emptyTypeGhost],
+    }, { trustTypeS: true }),
+    'ACCEPTED',
+    'v3.40: empty Type + "Saved" text → ACCEPTED (fixes bhai 2026-08-11 07:45 3-order rejection)'
+  );
+
+  console.log('✓ Ghost-save detection (v3.34+v3.36+v3.40): all cases pass — text-based "Saved" trust closes the empty-Type gap that caused bhai\'s 07:45 zero-save outcome');
 }
 
 // v3.36 — INFO_INSTANT_RETRY parity with ebidding-secure.js#submitBids.

@@ -3,6 +3,37 @@
 /**
  * bid-engine.js — Bikas Bidding v2 main bot
  *
+ * v3.40 — GHOST DETECTION DISABLED + WARNING SUPPRESSION (user 2026-08-11
+ *         second-run report: "ek bhi save nahi hua"):
+ *   User's 07:45 window log:
+ *     • 3 orders (NAZIRPUR, BHARATPUR, TALIBPUR) submitted, all rejected
+ *       as GHOST-SAVED, retried 3 times each, then `REJECTED_GHOST_MAX`.
+ *     • Warning `[worker] ⚠ batch exit without persisted outcome
+ *       (outcome=skipped)` fired 251 times per window — flooding logs.
+ *     • Only 1 order (BASICMORE) actually saved (TIED). User's browser
+ *       showed zero rank-1s.
+ *
+ *   Analysis: v3.36's TRUST_TYPE_S only bypassed ghost detection when
+ *   `result.info === 'S'`. But SAP was returning NavEBiddingMessage with
+ *   EMPTY Type field + Message containing "Saved" — so _trustTypeS=false,
+ *   ghost detection fired, 3 captcha-burning retries per order, all with
+ *   the same ghost response.
+ *
+ *   Changes:
+ *   • Ghost detection is now GATED on `TRUST_TYPE_S=true` (default). With
+ *     the default TRUE, `isGhostSaved = false` UNCONDITIONALLY — SAP's
+ *     text response is trusted at face value. Post-save verification
+ *     (1.5s later, via fetchLiveOrders) is now the sole authoritative
+ *     check. Matches ebidding-secure.js which never inspects Type or
+ *     ChangeNo markers. Set TRUST_TYPE_S=false to opt back into the
+ *     conservative v3.34-era ghost detection.
+ *   • Added `_trustSavedText` — text-based success match (SAP "Saved"
+ *     even with empty Type) so isRealSuccess correctly flags true saves.
+ *   • Tightened v3.39's worker-exit warning: only fires on a GENUINE
+ *     silent drop (finalOutcome=null AND no exception caught). The
+ *     `outcome=skipped` case (SAP hasn't unlocked captcha yet) is now
+ *     suppressed — it fired 251 times per window in the v3.39 build.
+ *
  * v3.39 — EXACT-MATCH BLACKLIST + CSV RULES + SILENT-DROP DIAGNOSTICS
  *         (user 2026-08-11 live-run report):
  *   User's directive (Hindi/Hinglish): "RADHA KRISHNA CONSTRUCTION diya
@@ -1781,6 +1812,7 @@ function makeWorkerPool(ctx) {
       // a race where the outcome was undefined) simply vanished — the user's
       // 2026-08-11 log had one such batch (AMRAPARA/1154850608).
       const vbelns = item.bids.map((b) => String(b.order.SapOrderId));
+      let workerErrorAlreadyLogged = false;
       try {
         for (const session of ctx.sessions) {
           const outcome = await session.mutex.run(async () => {
@@ -1806,6 +1838,7 @@ function makeWorkerPool(ctx) {
         // v3.39 — catch-all safety net: log any thrown error that would
         // otherwise silently drop the batch. Also write a WORKER_ERROR row
         // to bids.csv so the user's daily audit shows the drop.
+        workerErrorAlreadyLogged = true;
         log.error(`[worker] ✗ WORKER ERROR while processing batch (vbelns=${vbelns.join(',')}): ${workerErr && workerErr.message} — stack: ${workerErr && workerErr.stack}`);
         for (const b of item.bids) bidLog.write({
           session: (ctx.sessions[0] && ctx.sessions[0].id) || 'unknown',
@@ -1819,18 +1852,22 @@ function makeWorkerPool(ctx) {
         });
       }
 
-      // v3.39 — worker-exit diagnostic. If the batch completed but produced
-      // no persisted outcome (e.g., outcome=null, outcome.skipped, all
-      // silent-fails without cooldown), log WHAT happened so silent drops
-      // are always visible in the log stream. Applies to both cap-poller
-      // INSTANT-SUBMIT dispatches (via workerCtx) and main tick dispatches.
+      // v3.40 — worker-exit diagnostic (tightened from v3.39).
+      // Only warn when we produced NO outcome at all AND the batch was NOT
+      // a normal pre-warm skip. v3.39's version fired on `outcome=skipped`
+      // which is the NORMAL "SAP hasn't unlocked captcha yet" state during
+      // pre-warm — flooded the log 251 times per window. v3.40 rule:
+      // suppress `outcome=skipped` (that just means captcha wasn't ready
+      // yet; the retry will fire next scan), only warn on genuinely
+      // unlogged drops (finalOutcome=null AND no exception was caught).
       const outcomeSummary = finalOutcome
         ? (finalOutcome.ok ? 'ok'
           : finalOutcome.silentFail ? 'silent-fail'
           : finalOutcome.skipped ? 'skipped'
           : finalOutcome.retry ? 'retry' : 'other')
         : 'no-outcome';
-      if (!finalOutcome || (finalOutcome.skipped) || (allSilentFail && !finalOutcome?.silentFail)) {
+      const isGenuineDrop = !finalOutcome && !workerErrorAlreadyLogged;
+      if (isGenuineDrop) {
         log.warn(`[worker] ⚠ batch exit without persisted outcome (vbelns=${vbelns.join(',')}, outcome=${outcomeSummary}) — investigate: was captcha fetched, was mutex acquired?`);
       }
 
@@ -1932,7 +1969,30 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
   // v3.36 — when TRUST_TYPE_S is on, ANY Type='S' is treated as success
   // (except when Ev_Text says tie-rejection, still respected).
   const _trustTypeS = TRUST_TYPE_S && result.info === 'S' && !isTieRejected;
-  const isGhostSaved = _allHintsAreGhost && !_sapExplicitSuccess && !_trustTypeS;
+  // v3.40 CRITICAL FIX (user 2026-08-11 log: "ek bhi save nahi hua"):
+  //   In the 07:45 window bhai's bot rejected 3 orders as GHOST-SAVED even
+  //   though SAP's text said "Saved". Root cause: SAP returned the
+  //   NavEBiddingMessage array with an EMPTY Type field (or no message at
+  //   all), so `result.info` was '' — not 'S' — hence _trustTypeS=false
+  //   and ghost detection fired. The retry burned 3 captchas per order
+  //   and left the user with ZERO saved orders that window.
+  //
+  // New rule: TRUST_SAVED_TEXT (default true, tied to TRUST_TYPE_S). When
+  // SAP's Message/text contains "Saved" at any severity, treat as SUCCESS
+  // regardless of Type. The reference bot (ebidding-secure.js) never
+  // inspects Type/ChangeNo — it trusts SAP's text response unconditionally.
+  // Ghost detection is now GATED on TRUST_TYPE_S=false (opt-out only) so
+  // the default behaviour matches the reference bot.
+  const _trustSavedText = TRUST_TYPE_S && !isTieRejected && (
+    /saved\s*successfully|bid.*accepted|save.*success/i.test(result.text || '') ||
+    /saved\s*successfully|bid.*accepted|save.*success/i.test(evText)
+  );
+  const isGhostSaved = TRUST_TYPE_S
+    ? false  // v3.40: with TRUST_TYPE_S=true (default), ghost detection is DISABLED entirely.
+             //         Post-save verification (1.5s later via fetchLiveOrders) is the
+             //         authoritative check. Prevents the "3-retry hammer" seen in bhai's
+             //         07:45 log which produced zero saves for NAZIRPUR/BHARATPUR/TALIBPUR.
+    : (_allHintsAreGhost && !_sapExplicitSuccess);
 
   const isSavedOk      = /saved successfully|bid.*accepted|success/i.test(textLower);
   // isRealSuccess must NOT trigger when SAP flags Type='E' with a tie-reject
@@ -1940,8 +2000,9 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
   // the response only contains ghost persistence markers AND SAP did not
   // explicitly acknowledge (v3.34 recalibrated).
   // v3.36 — TRUST_TYPE_S: any non-tie Type='S' is a real success.
+  // v3.40 — also accept when SAP's text says "Saved" even with empty Type.
   const isRealSuccess  = !isTieRejected && !isGhostSaved && result.info !== 'E' && (
-    _trustTypeS ||
+    _trustTypeS || _trustSavedText ||
     (result.info === 'S' && !/ended|closed|expired|invalid|error/i.test(textLower)) || isSavedOk
   );
   const isTimeEnded    = /ended|closed|expired/i.test(textLower) && !isSavedOk;

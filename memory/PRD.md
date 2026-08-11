@@ -287,6 +287,25 @@ User feedback ("mai UI me 1 sec pehele chor deta hu... 50% mera rank 1 hota") re
 - **3 new unit tests** in `test-window-scheduler.js`: `testEarlyDropWindow` (8 cases), `testEarlyDropOnceSemantics` (3-window verification), `testEarlyDropAndBoundaryComplementary` (temporal ordering with v3.25 boundary block)
 - **Set `EARLY_DROP_MS=0` to disable** and revert to strict-at-boundary behaviour
 
+## Implemented (2026-02 — v3.40 GHOST DETECTION DISABLED + WARN SUPPRESSION)
+User (2026-08-11 second run) reported "ek bhi save nahi hua" (zero saves) and shared engine.log + solver.log + bids.csv + captcha-timing.csv. Analysis of the 07:45 window found TWO root causes:
+
+**Root cause 1 — Ghost-detection false-positive on empty-Type responses.**
+Three orders (NAZIRPUR / BHARATPUR / TALIBPUR) were submitted at 07:45:05, all rejected as `GHOST-SAVED`, retried 3× each, then `REJECTED_GHOST_MAX`. v3.36's `TRUST_TYPE_S=true` was supposed to prevent this but only fired when `result.info === 'S'`. SAP was returning `NavEBiddingMessage` with an EMPTY Type field + Message="Saved Successfully" — so `_trustTypeS=false` → ghost detection fired → 3 retries burned SAP captcha rate-limit → all rejected. bids.csv confirms: 3× `REJECTED_GHOST` + 1× `REJECTED_GHOST_MAX` per order. Only BASICMORE (which had Type='S' explicitly) saved as tied.
+
+**Root cause 2 — Worker-exit warning flooding logs.**
+v3.39's `[worker] ⚠ batch exit without persisted outcome (outcome=skipped)` fired 251× per window — every pre-warm scan where captcha wasn't unlocked yet emitted this warning. Made the log unreadable and hid the real ghost-save issue.
+
+**Changes (v3.40):**
+- **Ghost detection GATED on `TRUST_TYPE_S`** — with default `TRUST_TYPE_S=true`, `isGhostSaved = false` unconditionally. SAP's text response is trusted at face value (matching `ebidding-secure.js` which never inspects Type/ChangeNo). Post-save `fetchLiveOrders` monitor (1.5s later) is the sole authoritative persistence check. `TRUST_TYPE_S=false` restores conservative v3.34 detection.
+- **`_trustSavedText`** — new text-based success flag: any response text containing `saved successfully | bid accepted | save success` is treated as success (even with empty Type). Closes the empty-Type gap that produced bhai's 07:45 zero-save outcome.
+- **Worker-exit warning tightened** — only fires when `finalOutcome=null` AND no exception was caught (i.e., a genuinely unlogged silent drop). The normal `outcome=skipped` case (SAP hasn't unlocked captcha yet) no longer emits a warning.
+- Version banner updated in `bid-engine.js` header. No .env changes (TRUST_TYPE_S already exists as of v3.36).
+
+Unit tests: `testGhostSaveDetection` extended with Case 7 revision (Type=E + ghost markers → UNKNOWN under v3.40 default, still REJECTED_GHOST under legacy) + new Case 8 (empty Type + "Saved" text → ACCEPTED — the exact bug from bhai's 07:45 log). **33/33 tests pass** (up from 32).
+
+Testing status: `node --check` clean, all tests green, boot smoke clean.
+
 ## Implemented (2026-02 — v3.39 EXACT-MATCH BLACKLIST + CSV RULES + SILENT-DROP DIAGNOSTICS)
 User (2026-08-11) shared engine log + input2.csv + delete.csv + bids-2026-08-11.csv + agent-boost.js/runner.js reference from `ebidding.zip`. Analysis of the 06:45 window found THREE root-causes:
 
