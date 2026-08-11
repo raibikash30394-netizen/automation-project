@@ -1,0 +1,25 @@
+{
+  "name": "bikas-bidding",
+  "version": "2.0.0",
+  "description": "SAP eBidding automation bot + local captcha solver (undici + pino, pipelined captcha, 4-way parallel workers).",
+  "private": true,
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start:solver": "node bidding.js",
+    "start:engine": "node bid-engine.js",
+    "dev:solver": "node bidding.js | pino-pretty -c -t 'SYS:HH:MM:ss'",
+    "dev:engine": "node bid-engine.js | pino-pretty -c -t 'SYS:HH:MM:ss'"
+  },
+  "dependencies": {
+    "csv-parser": "^3.0.0",
+    "dotenv": "^17.4.2",
+    "express": "^4.19.2",
+    "pino": "^9.5.0",
+    "pino-pretty": "^11.2.2",
+    "pino-roll": "^3.0.0",
+    "tesseract.js": "^7.0.0",
+    "undici": "^6.20.0"
+  }
+}

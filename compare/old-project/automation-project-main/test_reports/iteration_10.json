@@ -1,0 +1,18 @@
+{
+  "summary": "v3.12 revert of parallel-captcha race verified. Static + syntax + unit tests all pass. PARALLEL_CAPTCHA_PROBES defaults to 1 (disabled); when >1, nextCaptchaParallel returns LAST-arrived solved (SAP-safe). All v3.11 speed optimizations (adaptive keep-warm, POLL_MS=20, boundary logging, setImmediate tight loop) preserved.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": ["/app/bikas-bidding/tests/test-window-scheduler.js"],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "Comment block at lines 770-785 in bid-engine.js clearly documents the SAP single-active-captcha invariant and cites the exact 16:45 IST user log (ry2n4, f8233, VFh@4@) as regression evidence — good.",
+    "nextCaptchaParallel now returns solvedResults[solvedResults.length - 1] (LAST) instead of results.find(r => r.solved) (FIRST) — correct semantics.",
+    "Both .env (PARALLEL_CAPTCHA_PROBES=1) and const default (parseInt(... || '1')) agree — safe fallback if .env missing."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "100%", "frontend": "N/A (skipped per request)"},
+  "seed_data_creation": "None",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "v3.12 targeted revert. Validated via: (1) node --check on bid-engine.js and bidding.js — SYNTAX_OK. (2) node tests/test-window-scheduler.js — 14/14 test groups pass including 'Parallel captcha probes (SAP-safe): returns LAST-arrived solved, prevents captcha invalidation race'. (3) Static grep confirms PARALLEL_CAPTCHA_PROBES=1 in .env, const default '1' in bid-engine.js line 786, solvedResults[solvedResults.length - 1] at line 796 (LAST semantics), comment at line 772 references user's exact solver hashes (ry2n4, f8233, VFh@4@). v3.11 optimizations retained: POLL_MS=20 (line 51), boundary logging with secsPast (line 754), setImmediate tight loop (line 1660), adaptive keep-warm test still passes. No live SAP testing performed per constraints."
+}

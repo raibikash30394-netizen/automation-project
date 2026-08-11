@@ -1,0 +1,24 @@
+# priority.csv — COF Order IDs (SAP Vbeln) to bid FIRST
+#
+# When a bid window opens (:15 / :45 IST), matched orders whose Vbeln
+# (COF Order ID) appears below will be pushed to the FRONT of the
+# submit plan — before any non-priority order — so they hit SAP within
+# the first ~300 ms of the window.
+#
+# Format:
+#   • One Vbeln per line (numeric string as SAP shows it), OR
+#   • CSV with a header row containing "Vbeln" or "COF Order ID"
+#
+# Rules:
+#   • Blank lines and lines starting with "#" are ignored.
+#   • Vbelns are compared as EXACT strings, so preserve any leading zeros
+#     that SAP uses ("0000123456" ≠ "123456").
+#   • Reloaded automatically at every :15/:45 boundary — you can edit
+#     this file mid-run without restarting the bot.
+#   • You can also (or instead) set PRIORITY_VBELNS in .env as a
+#     comma-separated list; both sources are merged and de-duplicated.
+#
+# Example (copy this file to priority.csv and edit):
+1153420264
+1153420262
+1153406814

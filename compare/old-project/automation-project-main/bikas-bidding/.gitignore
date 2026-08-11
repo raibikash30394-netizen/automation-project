@@ -1,0 +1,42 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnp
+.pnp.js
+
+# Environment / secrets (NEVER commit these)
+.env
+.env.local
+.env.*.local
+cookie.txt
+token.txt
+creds.json
+credentials.json
+
+# Runtime cache (grows over time — keep local)
+data.json
+
+# Logs
+logs/
+*.log
+
+# User CSVs (bidding rules are private business data)
+files/input2.csv
+files/delete.csv
+files/priority.csv
+
+# Reference / scratch
+reference/
+uploads/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+tessdata/

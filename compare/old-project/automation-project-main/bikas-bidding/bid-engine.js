@@ -3,252 +3,6 @@
 /**
  * bid-engine.js — Bikas Bidding v2 main bot
  *
- * v3.44 — DYNAMIC ORDER-SHIFT PROTECTION + solvedCaptcha crash fix
- *         (user 2026-08-11 6th run: "new oder ghuse ga tho kabhi kabhi wo
- *         uper ya niche kahi chala jata hai jise uska position change ho
- *         jata hai" + "2nd time save karte time error aya"):
- *   Two independent bugs surfaced in bhai's live logs:
- *
- *   BUG A — WORKER_ERROR crash on captcha invalidation:
- *     handleBatch's captcha-error branch referenced `solvedCaptcha`, but
- *     the actual parameter is `solved`. When SAP returned WRONG_CAPTCHA,
- *     the invalidation call threw ReferenceError → try/catch logged
- *     WORKER_ERROR → batch silently died. Second-window submits (07:16,
- *     07:46) never retried because the mutex released with an exception.
- *     Fix: `invalidateCaptchaCache(auth._lastCaptchaImg, solved)` (var
- *     name normalised at all 3 call sites).
- *
- *   BUG B — Pre-window plan lock-out for late-arriving orders:
- *     Orders-poller built the plan at T-1500ms and set
- *     `_planBuiltForWinKey === winKey` guard, preventing rebuild for the
- *     rest of the window. When SAP published a new priority order at
- *     T-500ms or T+200ms (very common — SAP staggers its order releases),
- *     that order was in `_cachedOrders` but NOT in `_cachedPlan`; the
- *     cap-poller reused the stale plan and the new order was silently
- *     ignored until the next :15/:45 window. This is what bhai meant by
- *     "position shift" — from the user's POV, the new order "moved" up
- *     or down in the SAP order list and got missed.
- *
- *     Fix: `buildBatches` now returns `observedOrderIds` (Set<SapOrderId>
- *     seen at build time). Both the orders-poller and cap-poller compare
- *     the current `_cachedOrders` against this snapshot. Any new
- *     SapOrderId triggers a plan rebuild (~5-20ms). Also `_planBuiltForWinKey`
- *     is now RESET to 0 after cap-poller consumes the plan, so a fresh
- *     rebuild fires if SAP publishes yet another late order in the same
- *     window. Pure position-shifts (SAP reorders the list but no new
- *     SapOrderIds) correctly do NOT trigger rebuild — bot matches by
- *     Vbeln/SapOrderId, position is irrelevant.
- *
- *     Note: the bot's core matcher was already position-independent
- *     (matchOrder + buildBatches iterate the list and key by SapOrderId).
- *     v3.44 fixes the CACHE-STALENESS bug that made a position-independent
- *     matcher behave as if it was position-dependent.
- *
- * v3.43 — LATE-SAVE + CAPTCHA-FAIL-AS-ACCEPTED FIXES (user 2026-08-11 5th run:
- *         "save kar raha hai lekin itna let pata nahi q... amarapara save he
- *         nahi hua"):
- *   bhai's 11:15 window timeline:
- *     T-1753ms  pre-window planner cached 27 orders + built 3-match plan
- *     T-0       BOUNDARY reached — old code wiped _cachedOrders/_cachedPlan
- *     T+430ms   captcha unlocked (via cap-poller)
- *     T+430ms   cap-poller saw _cachedOrders=null → INLINE order-fetch
- *     T+5000ms  inline fetch returned (SAP LB slow) → build plan
- *     T+5000ms  submit fired
- *     T+8878ms  SAP responded "SAVED-TIED" (3878ms latency, tie at rank 3+)
- *   Then AMRAPARA batch fired at T+17s with fresh captcha → SAP responded
- *   Ev_Text="Captcha Validation Failed. Worng Captcha Value." + Flag="1"
- *   → v3.41 flag-trust classified as ACCEPTED (wrong!) → orders added to
- *   submitted, never retried → user saw no AMRAPARA save.
- *
- *   Changes:
- *   • CAPTCHA-FAIL detection now runs BEFORE Flag/text success trust.
- *     isWrongCaptcha matches both textLower AND evTextLower (SAP puts the
- *     wrong-captcha message in Ev_Text). isRealSuccess explicitly
- *     !isWrongCaptcha — Flag="1" or "Saved" text cannot override a
- *     wrong-captcha error. Fixes AMRAPARA false-accept.
- *   • Boundary clear no longer wipes ctx._cachedOrders / ctx._cachedPlan.
- *     Pre-window orders reflect the same window's bid set — SAP just flips
- *     them from "future" to "active" at boundary; vbelns/amounts/customers
- *     stay identical. Keeping them lets cap-poller submit INSTANTLY on
- *     captcha unlock.
- *   • havePreBuilt guard relaxed from strict winKey match to age-based
- *     (planAge ≤ 10s). winKey changes AT boundary by definition — the
- *     strict guard invalidated fresh plans right when we needed them
- *     most. New _cachedPlanBuiltAt timestamp records build time.
- *
- * v3.42 — QUIET/DEMON LOG MODE (user 2026-08-11 4th run: "bekar ka log
- *         jo jada likha hua aa raha usko kam karo, lod badne se slow
- *         kam kare ga, log jitna halka utna smooth hoga"):
- *   Prior log audit on bhai's engine.log for a 60-min run showed:
- *     • 53× "⏳ waiting for matched orders" (~ 2 KB each = 106 KB)
- *     • 93× "🔄 session-shake" (200 B each)
- *     • 45× "Refreshing CSRF token" + 45× "CSRF token saved"
- *     • 86× "[metrics]" line every 30 s
- *     • Pre-window planner + orders-poller + cap-poller heartbeats
- *   → ~200 KB of chatter per window that competes with the hot-path
- *   for the Node event loop under load.
- *
- *   Changes:
- *   • New env `LOG_LEVEL` ('normal' default, 'quiet' or 'demon' for
- *     minimal). Default in `.env` set to 'quiet' for the user's 24×7
- *     PM2 deployment.
- *   • `qlog.info(...)` helper suppresses when QUIET_MODE — used for:
- *     CSRF refresh + save chatter, session-shake, pre-window planner,
- *     orders-poller/cap-poller heartbeats, early-drop scheduled/CSRF
- *     lines, boundary CSRF re-issue, EvCaptchaFlag=captcha-required
- *     transitions.
- *   • Metrics interval auto-widens 30s → 5min in quiet mode.
- *   • "waiting for matched orders" throttled to 60s in quiet (was 10s).
- *   • Blacklist / no-rule / club-drop samples suppressed in quiet
- *     (still available on 'normal' for diagnostics).
- *   • Log volume reduction estimate: ~85-90 % of INFO-level lines
- *     disappear; warnings/errors/submits/saves/rejects unchanged.
- *
- * v3.41 — SAP `Flag` FIELD SUCCESS TRUST (user 2026-08-11 3rd run):
- *   User's submit-responses.jsonl reveals SAP's OData response has a
- *   top-level `Flag` field. Every accepted save has `Flag="1"` — even
- *   the "async ChangeNo" responses where NavEBiddingMessage=null and
- *   Ev_Text="" (i.e., no text message at all). Prior versions ignored
- *   `Flag` entirely; the classifier fell through to "unknown"/"ghost"
- *   for these responses. bhai's 07:45 (post-restart) + 08:15 windows
- *   saw the same 3 orders repeatedly submitted → all returning Flag="1"
- *   with async persistence markers → all classified as GHOST-SAVED and
- *   REJECTED_GHOST_MAX. In reality they WERE saved.
- *
- *   Changes:
- *   • `submitBid` now returns `respFlag` from SAP's response body.
- *   • handleBatch treats `respFlag === '1'` (when TRUST_TYPE_S=true and
- *     not tie-rejected) as a definitive success signal — the strongest
- *     signal available in the response. Sits alongside the v3.36
- *     _trustTypeS ('S') and v3.40 _trustSavedText (text match) trust
- *     paths. All three feed isRealSuccess.
- *   • Applies to all response shapes: empty NavMsg, empty Ev_Text,
- *     Type=' ', Type='S', with or without persistence markers.
- *
- * v3.40 — GHOST DETECTION DISABLED + WARNING SUPPRESSION (user 2026-08-11
- *         second-run report: "ek bhi save nahi hua"):
- *   User's 07:45 window log:
- *     • 3 orders (NAZIRPUR, BHARATPUR, TALIBPUR) submitted, all rejected
- *       as GHOST-SAVED, retried 3 times each, then `REJECTED_GHOST_MAX`.
- *     • Warning `[worker] ⚠ batch exit without persisted outcome
- *       (outcome=skipped)` fired 251 times per window — flooding logs.
- *     • Only 1 order (BASICMORE) actually saved (TIED). User's browser
- *       showed zero rank-1s.
- *
- *   Analysis: v3.36's TRUST_TYPE_S only bypassed ghost detection when
- *   `result.info === 'S'`. But SAP was returning NavEBiddingMessage with
- *   EMPTY Type field + Message containing "Saved" — so _trustTypeS=false,
- *   ghost detection fired, 3 captcha-burning retries per order, all with
- *   the same ghost response.
- *
- *   Changes:
- *   • Ghost detection is now GATED on `TRUST_TYPE_S=true` (default). With
- *     the default TRUE, `isGhostSaved = false` UNCONDITIONALLY — SAP's
- *     text response is trusted at face value. Post-save verification
- *     (1.5s later, via fetchLiveOrders) is now the sole authoritative
- *     check. Matches ebidding-secure.js which never inspects Type or
- *     ChangeNo markers. Set TRUST_TYPE_S=false to opt back into the
- *     conservative v3.34-era ghost detection.
- *   • Added `_trustSavedText` — text-based success match (SAP "Saved"
- *     even with empty Type) so isRealSuccess correctly flags true saves.
- *   • Tightened v3.39's worker-exit warning: only fires on a GENUINE
- *     silent drop (finalOutcome=null AND no exception caught). The
- *     `outcome=skipped` case (SAP hasn't unlocked captcha yet) is now
- *     suppressed — it fired 251 times per window in the v3.39 build.
- *
- * v3.39 — EXACT-MATCH BLACKLIST + CSV RULES + SILENT-DROP DIAGNOSTICS
- *         (user 2026-08-11 live-run report):
- *   User's directive (Hindi/Hinglish): "RADHA KRISHNA CONSTRUCTION diya
- *   tha lekin delet me naam thora alag hai RADHA KRISHNA TRADERS hai tho
- *   skip kar diya jab ki wo hit karna tha… input2 me bhi same pura naam
- *   proper match kar he save karna hai matlab ek dam same save ho koi
- *   oder chutna nahi chaiye".
- *
- *   Live-log analysis (06:45 window):
- *     • Scan showed `bl=10 no-rule=14` — 10 orders blacklisted, 14 no-rule
- *     • bids.csv logged 4 SAVED-TIED rows for 3 batches
- *     • Batch 2 (AMRAPARA/TALIBPUR/BALURGHAT) was submitted but produced
- *       NO response entry in any log — a fully silent drop.
- *
- *   Changes:
- *   • Blacklist match: EXACT case-insensitive equality only. Previously
- *     `n === b || n.includes(b) || b.includes(n)` — bidirectional
- *     substring — caused false positives (e.g., "RADHA KRISHNA
- *     CONSTRUCTION" would match delete-list "RADHA KRISHNA TRADERS" iff
- *     a shorter common prefix was somewhere in the list, or a suffix like
- *     "TRADERS" collided with "TRADERSE" typo). Set
- *     BLACKLIST_MATCH_MODE=substring in .env to restore legacy behaviour.
- *   • CSV rule match: EXACT only by default. Pass-2 substring fallback
- *     is now gated on CSV_MATCH_MODE=substring (default 'exact'). User's
- *     CSV already lists all destination variants (RAIGANJ, RAIGANJ - STO,
- *     etc.) so exact-only is safe and eliminates the "KANDI matches
- *     KANDIGRAM" style false hits.
- *   • Worker-exit safety net: `runAll()` now wraps its per-batch loop in
- *     try/catch and logs a `[worker] ✗ WORKER ERROR` line plus writes a
- *     WORKER_ERROR row to bids.csv whenever an unhandled exception drops
- *     the batch. Also emits `[worker] ⚠ batch exit without persisted
- *     outcome` when a batch completes without any persisted result. This
- *     surfaces the AMRAPARA-style silent drop observed in the 06:45 log.
- *   • Per-order visibility: the "waiting for matched orders" telemetry
- *     now includes samples of the first 5 blacklisted vbelns (with
- *     customer name), first 5 no-rule vbelns (with destination + SPI),
- *     and first 3 club-dropped groups. User can spot mis-configuration
- *     immediately without SAP-side inspection.
- *
- * v3.38 — PRE-BOUNDARY ORDER-CAPTURE FIX (user 2026-08-10 log analysis):
- *   User's engine.log showed EVERY window logging:
- *     "🎯 EARLY-DROP FIRE @ T-500ms — attempting direct speculative submit"
- *     "🎯 EARLY-DROP FIRE: no cached orders yet — cannot speculatively submit."
- *   User explained SAP releases pre-boundary orders at ~T-1s and each
- *   fetchLiveOrders round-trip takes 1500-2000ms; the previous single-in-flight
- *   busy-guard let one slow fetch block ~14 poll ticks so the T-500ms
- *   probe consistently missed the release moment.
- *
- *   Changes:
- *   • Orders poller HOT-ZONE mode: within ±5s of boundary (or in a hot
- *     window), interval drops from 150ms→50ms AND max-inflight goes from
- *     1→3. A stalled 2s-long fetch no longer blocks the next probe; SAP's
- *     pre-boundary release moment gets multiple parallel probes.
- *   • Empty-response guard: a late-arriving empty fetch will no longer
- *     wipe a previously-populated `ctx._cachedOrders` (protects against
- *     racy overwrites now that we allow parallel fetches).
- *   • Early-drop FIRE now SPIN-WAITS for a matched cached-orders list
- *     (EARLY_DROP_WAIT_MS=1500 default, 10ms tick). Instead of bailing at
- *     T-500ms, it keeps checking every 10ms — the moment the parallel
- *     orders-poller populates the cache with a non-empty matched list,
- *     it fires. Hard-caps at boundary crossing so post-boundary path
- *     picks up cleanly.
- *   • Also picks up v3.36 TRUST_TYPE_S fix — Raiganj/Rajgram GHOST-SAVED
- *     false-positives observed in the user's 2026-08-10 log (Vbelns
- *     1154908154/1154906389/1154906477 were retried as ghost then verified
- *     as persisted 6s later) are eliminated.
- *
- * v3.37 — PRE-WINDOW PLANNER + 10 ms CAPTCHA POLL (user 2026-08-08 log analysis):
- *   User shared a screenshot of a reference bot's timeline:
- *     10:44:59  ✓ Bid order list fetched: 40 orders
- *     10:44:59  ✓ CSV matching: 1 rows matched across 1 groups
- *     10:44:59  ℹ Batch size: 3, Total batches: 1
- *     10:44:59  ℹ First batch applied: 1 groups
- *     10:45:00  ℹ ⏳ Submitting in 00:00:02.944
- *     10:45:00  ℹ Polling SAP for captcha availability (catching it as it opens)…
- *     10:45:01  ✓ Captcha became available after 3 polling attempts! (Captured in 1008ms)
- *     10:45:01  ✓ Captcha solved: "TK58P"
- *     10:45:01  ★ SAP sent the captcha! Submitting instantly to beat the crowd…
- *     10:45:01  ★ Starting auto-continuous batch submission…
- *   Reference flow: fetch+plan T-1000ms → aggressive captcha poll → submit-instant → Rank 1.
- *
- *   Changes:
- *   • CAPTCHA_POLLER_MS default 50→10 (matches reference `sleep(10)`
- *     inner-loop; captcha caught within FIRST poll after SAP unlocks).
- *   • Pre-window planner in orders poller: at T ≤ 2500 ms, run
- *     `buildBatches` ONCE per window and cache the plan on `ctx._cachedPlan`
- *     + log the exact same 4-line block ("Bid order list fetched" / "CSV
- *     matching" / "Batch size" / "First batch applied") the reference bot
- *     shows. Zero-latency at captcha unlock.
- *   • Captcha poller INSTANT-SUBMIT path prefers the pre-built plan
- *     (`havePreBuilt` fast-path); falls back to inline build if plan was
- *     invalidated (e.g., fresh orders arrived after plan was built).
- *
  * v3.36 — 24×7 ROBUST-SAVE PARITY (user 2026-07-24, ebidding-secure.js reference):
  *   User uploaded a reference bot ("ebidding-secure.js") that runs 24×7
  *   without missing saves ("save bhaut acche se ho raha, jo missing hai
@@ -453,37 +207,11 @@ const SKIP_RANK_PREVIEW   = String(process.env.SKIP_RANK_PREVIEW || 'true').toLo
 const TRUST_TYPE_S           = String(process.env.TRUST_TYPE_S || 'true').toLowerCase() === 'true';
 const INFO_INSTANT_RETRY_MAX = parseInt(process.env.INFO_INSTANT_RETRY_MAX || '5', 10);
 
-// v3.42 — LOG_MODE knob (user 2026-08-11 4th run: "bekar ka log jo jada
-// likha hua aa raha usko kam karo, lod badne se slow kam kare ga, log
-// jitna halka utna smooth hoga").  IMPORTANT: named LOG_MODE (not
-// LOG_LEVEL) to avoid colliding with pino's built-in LOG_LEVEL env
-// (which only accepts trace/debug/info/warn/error/fatal — pino throws
-// "default level:quiet must be included in custom levels" if we reuse it).
-//   'normal' (default)  — full verbosity (every session-shake, every
-//                         CSRF refresh, every 10s waiting-for-orders log,
-//                         30s metrics ping, all pre-window + cap-poller
-//                         chatter).
-//   'quiet'  / 'demon'  — minimal noise. Keeps ONLY: startup banner,
-//                         boundary crossings, submits, saves/rejects,
-//                         errors/warnings, and metrics every 5 min.
-//                         Suppresses per-scan chatter (waiting-for-orders,
-//                         session-shake, CSRF-token-saved, pre-window
-//                         planner, orders-poller first-seen). Reduces log
-//                         volume ~90%.
-const LOG_LEVEL_RAW = String(process.env.LOG_MODE || process.env.LOG_LEVEL_MODE || 'normal').toLowerCase();
-const QUIET_MODE    = LOG_LEVEL_RAW === 'quiet' || LOG_LEVEL_RAW === 'demon';
-// Helpers so hot paths can cheaply opt-in to reduced verbosity.
-const qlog = {
-  info : (...args) => { if (!QUIET_MODE) log.info(...args); },
-  warn : (...args) => log.warn(...args),     // warnings always visible
-  error: (...args) => log.error(...args),    // errors always visible
-};
-
 const WAF_MIN_MS   = parseInt(process.env.WAF_BACKOFF_MIN_MS || '30000', 10);
 const WAF_MAX_MS   = parseInt(process.env.WAF_BACKOFF_MAX_MS || '120000', 10);
 const WAF_RESET_MS = parseInt(process.env.WAF_RESET_AFTER_MS || '300000', 10);
 
-const METRICS_MS   = parseInt(process.env.METRICS_INTERVAL_MS || (QUIET_MODE ? '300000' : '30000'), 10);
+const METRICS_MS   = parseInt(process.env.METRICS_INTERVAL_MS || '30000', 10);
 
 // v3.30 — EARLY DROP (a.k.a. "1-second-early trick"). Replicates the user's
 // manual UI behaviour: click Save ~1s BEFORE the :15/:45 boundary. SAP appears
@@ -759,7 +487,7 @@ class AuthConfig {
   async refreshToken() {
     if (this._refreshInFlight) return this._refreshInFlight;
     this._refreshInFlight = (async () => {
-      qlog.info(`[${this.id}] Refreshing CSRF token…`);
+      log.info(`[${this.id}] Refreshing CSRF token…`);
       try {
         const { statusCode, headers } = await sapPool.request({
           path: `${SAP_PATH_PFX}/SessionSet('')`,
@@ -772,7 +500,7 @@ class AuthConfig {
         }
         this.token = String(tok);
         fs.writeFileSync(this.tokenFile, this.token, 'utf8');
-        qlog.info(`[${this.id}] CSRF token saved to ${path.basename(this.tokenFile)}`);
+        log.info(`[${this.id}] CSRF token saved to ${path.basename(this.tokenFile)}`);
         return this.token;
       } finally {
         this._refreshInFlight = null;
@@ -1126,15 +854,9 @@ function matchOrder(order, rules, ruleCitiesByLen) {
     if (hit) return hit;
   }
 
-  // v3.39 — CSV_MATCH_MODE (user 2026-08-11 directive: "input2 me bhi same
-  // pura naam proper match kar he save karna hai"). Default 'exact' skips
-  // the substring pass entirely. Was previously prone to false matches
-  // when partial city names collided (e.g., "KANDI" vs "KANDIGRAM").
-  // Set CSV_MATCH_MODE=substring to restore the previous behaviour.
-  const mode = String(process.env.CSV_MATCH_MODE || 'exact').toLowerCase();
-  if (mode !== 'substring') return null;
-
-  // Pass 2 (substring, legacy): dest.includes(ruleCity) or ruleCity.includes(dest).
+  // Pass 2: containment (longest first). Prefer dest.includes(ruleCity)
+  // over ruleCity.includes(dest) because CSV keys are usually more specific
+  // than the raw SAP dest string.
   for (const ruleCity of candidates) {
     if (dest === ruleCity) continue;
     if (!(dest.includes(ruleCity) || ruleCity.includes(dest))) continue;
@@ -1175,22 +897,7 @@ function isCustomerBlacklisted(order, blacklist) {
     order.CustomerName, order.Kunag, order.Kunnr, order.Kunwe,
   ].filter(Boolean).map((v) => v.toString().trim().toUpperCase());
   if (!names.length) return false;
-  // v3.39 EXACT-MATCH policy (user 2026-08-11 directive: "proper match kar
-  // he skip karna hai"). Previously we used bidirectional substring:
-  //     n === b || n.includes(b) || b.includes(n)
-  // which falsely blacklisted "RADHA KRISHNA CONSTRUCTION" when the
-  // delete-list had "RADHA KRISHNA TRADERS" iff a shorter prefix was in
-  // the list, and generally over-blocked orders with common company
-  // suffixes ("ENTERPRISE", "HARDWARE", "DAS", etc.).
-  // New rule: STRICT case-insensitive equality after trim only.
-  // Set BLACKLIST_MATCH_MODE=substring in .env to restore the previous
-  // bidirectional-substring behaviour.
-  const mode = String(process.env.BLACKLIST_MATCH_MODE || 'exact').toLowerCase();
-  if (mode === 'substring') {
-    return blacklist.some((b) => names.some((n) => n === b || n.includes(b) || b.includes(n)));
-  }
-  // Default: exact-only (safer, matches user's directive).
-  return blacklist.some((b) => names.some((n) => n === b));
+  return blacklist.some((b) => names.some((n) => n === b || n.includes(b) || b.includes(n)));
 }
 
 // ---- Priority (COF Order ID / Vbeln) list ----------------------------------
@@ -1325,7 +1032,7 @@ async function fetchLiveOrders(auth) {
     if (captchaFlag === '') {
       log.info(`[${auth.id}] ⚡ EvCaptchaFlag='' — CAPTCHA-FREE fastpath ENABLED (early-drop can submit pre-boundary)`);
     } else {
-      qlog.info(`[${auth.id}] 🔒 EvCaptchaFlag='${captchaFlag}' — captcha REQUIRED (early-drop will skip; must wait for post-boundary captcha unlock)`);
+      log.info(`[${auth.id}] 🔒 EvCaptchaFlag='${captchaFlag}' — captcha REQUIRED (early-drop will skip; must wait for post-boundary captcha unlock)`);
     }
   }
   auth._lastCaptchaFlag = captchaFlag; // 'X' = captcha required, '' = fast-path
@@ -1632,16 +1339,7 @@ async function submitBid(auth, bids, solvedCaptcha) {
     }
   }
 
-  // v3.41 — capture SAP's response `Flag` field. SAP's OData EBiddingSave
-  // response has a top-level `Flag` string. Live evidence from bhai's
-  // 2026-08-11 07:46 log shows SAP returns `Flag="1"` even on responses
-  // where `NavEBiddingMessage=null` and `Ev_Text=""` (i.e., no text
-  // message at all). Flag="1" means the save was accepted; async DB
-  // replication just hasn't populated ChangeNo/CreatedOn yet. This
-  // single field is the STRONGEST success signal in the response.
-  const respFlag = (d.Flag || '').toString();
-
-  return { statusCode: res.statusCode, info: primary.info, text: primary.text, messages, raw: res.data, submitMs, rankHints, respFlag };
+  return { statusCode: res.statusCode, info: primary.info, text: primary.text, messages, raw: res.data, submitMs, rankHints };
 }
 
 function extractSapMessages(d) {
@@ -1747,32 +1445,9 @@ function buildBatches(orders, rules, blacklist, seenSubmitted, inFlight, cooldow
   for (const [club, members] of byClub.entries()) {
     if (!club) {
       for (const o of members) {
-        if (isCustomerBlacklisted(o, blacklist)) {
-          stats.blacklisted++;
-          // v3.39 — per-order blacklist visibility. User's 2026-08-11 report
-          // asked "delete me naam thora alag hai, tho skip kar diya" — now
-          // the CSV audit shows exactly which vbeln + customer name got
-          // skipped so mis-blacklists are trivially spot-checkable.
-          if (stats._blSamples === undefined) stats._blSamples = [];
-          if (stats._blSamples.length < 5) {
-            const cust = (o.KunagName1 || o.KunweName1 || o.Customer || o.CustomerName || '').toString().trim();
-            stats._blSamples.push(`${o.SapOrderId || o.Vbeln}[${cust}]`);
-          }
-          continue;
-        }
+        if (isCustomerBlacklisted(o, blacklist)) { stats.blacklisted++; continue; }
         const m = matchOrder(o, rules, ruleCitiesByLen);
-        if (!m) {
-          stats.noRule++;
-          // v3.39 — per-order no-rule visibility (sample first 5). Helps
-          // the user notice CSV cities that need adding.
-          if (stats._nrSamples === undefined) stats._nrSamples = [];
-          if (stats._nrSamples.length < 5) {
-            const dest = (o.Destination || o.DestCityDesc || o.CityCodeDescription || '').toString().trim();
-            const spi = (o.SPI || o.Spi || o.SpecialProcessInd || o.Zspi || '').toString().trim();
-            stats._nrSamples.push(`${o.SapOrderId || o.Vbeln}[${dest}/${spi}]`);
-          }
-          continue;
-        }
+        if (!m) { stats.noRule++; continue; }
         stats.matched++;
         const priority = isPriorityOrder(o);
         if (priority) stats.priority++;
@@ -1781,28 +1456,15 @@ function buildBatches(orders, rules, blacklist, seenSubmitted, inFlight, cooldow
     } else {
       const items = [];
       let drop = false;
-      let dropReason = '';
       let clubPriority = false;
       for (const o of members) {
-        if (isCustomerBlacklisted(o, blacklist)) {
-          drop = true;
-          dropReason = `blacklisted customer (${(o.KunagName1 || o.Customer || '').toString().trim()})`;
-          break;
-        }
+        if (isCustomerBlacklisted(o, blacklist)) { drop = true; break; }
         const m = matchOrder(o, rules, ruleCitiesByLen);
-        if (!m) {
-          drop = true;
-          dropReason = `no CSV rule for dest="${(o.Destination || o.DestCityDesc || o.CityCodeDescription || '').toString().trim()}"`;
-          break;
-        }
+        if (!m) { drop = true; break; }
         if (isPriorityOrder(o)) clubPriority = true;
         items.push({ order: o, amount: m.amount, city: m.matchedCity, spi: m.matchedSpi });
       }
-      if (drop) {
-        stats.clubDropped++;
-        if (stats._cdSamples === undefined) stats._cdSamples = [];
-        if (stats._cdSamples.length < 3) stats._cdSamples.push(`club=${club}(${members.length}): ${dropReason}`);
-      }
+      if (drop) stats.clubDropped++;
       else if (items.length) {
         stats.matched += items.length;
         if (clubPriority) stats.priority += items.length;
@@ -1855,23 +1517,7 @@ function buildBatches(orders, rules, blacklist, seenSubmitted, inFlight, cooldow
   for (const b of singleBatchesN) plan.push({ kind: 'single', bids: b, priority: false });
   for (const c of clubsNonPriority) plan.push({ kind: 'club', bids: c.bids, clubId: c.clubId, priority: false });
 
-  // v3.44 — DYNAMIC ORDER-SHIFT PROTECTION (user 2026-08-11: "new order
-  // ghusega toh kabhi kabhi wo uper ya niche kahi chala jata hai jise
-  // uska position change ho jata hai"). Capture the FULL set of SapOrderIds
-  // observed at plan-build time. The orders-poller uses this set to detect
-  // when SAP publishes brand-new orders AFTER the plan was built (during
-  // the T-1500ms → T+0 pre-window window). Any new SapOrderId triggers a
-  // plan rebuild so late-arriving priority/matched orders are never missed.
-  // The cap-poller does the same check before instant-dispatch: if the
-  // current _cachedOrders contains SapOrderIds not seen at plan-build, the
-  // stale plan is discarded and a fresh one is built inline (~5-20ms).
-  const observedOrderIds = new Set();
-  for (const o of orders) {
-    const sid = String(o?.SapOrderId || '');
-    if (sid) observedOrderIds.add(sid);
-  }
-
-  return { plan, stats, effectiveBatchSize, observedOrderIds };
+  return { plan, stats, effectiveBatchSize };
 }
 
 // ---- Worker pool: one worker per SAP session, parallel across sessions ----
@@ -1978,70 +1624,25 @@ function makeWorkerPool(ctx) {
       // If ALL sessions silent-fail → mark cooldown so we retry next scan.
       let finalOutcome = null;
       let allSilentFail = true;
-      // v3.39 — track submitted vbelns for the worker-exit log so any silent
-      // exception (bug / SAP timeout / mutex crash / etc.) that swallows the
-      // per-batch response is at least visible in the log. Prior to v3.39
-      // a batch that hit an unlogged error (e.g., session mutex threw, or
-      // a race where the outcome was undefined) simply vanished — the user's
-      // 2026-08-11 log had one such batch (AMRAPARA/1154850608).
-      const vbelns = item.bids.map((b) => String(b.order.SapOrderId));
-      let workerErrorAlreadyLogged = false;
-      try {
-        for (const session of ctx.sessions) {
-          const outcome = await session.mutex.run(async () => {
-            const solved = await fetchFreshCaptcha(session, session.id);
-            if (!solved) return { skipped: true };
-            // Global mutex: serialise the actual submit HTTP call across ALL sessions.
-            return await globalSubmitMutex.run(async () => {
-              return await handleBatch(ctx, session, item, solved, session.id);
-            });
+      for (const session of ctx.sessions) {
+        const outcome = await session.mutex.run(async () => {
+          const solved = await fetchFreshCaptcha(session, session.id);
+          if (!solved) return { skipped: true };
+          // Global mutex: serialise the actual submit HTTP call across ALL sessions.
+          return await globalSubmitMutex.run(async () => {
+            return await handleBatch(ctx, session, item, solved, session.id);
           });
-
-          finalOutcome = outcome;
-          if (!outcome || outcome.skipped) continue;
-          if (outcome.silentFail) {
-            log.warn(`[${session.id}] Silent 201 → falling back to next session`);
-            continue;
-          }
-          // Real result (success OR definitive rejection) → stop fallback loop
-          allSilentFail = false;
-          break;
-        }
-      } catch (workerErr) {
-        // v3.39 — catch-all safety net: log any thrown error that would
-        // otherwise silently drop the batch. Also write a WORKER_ERROR row
-        // to bids.csv so the user's daily audit shows the drop.
-        workerErrorAlreadyLogged = true;
-        log.error(`[worker] ✗ WORKER ERROR while processing batch (vbelns=${vbelns.join(',')}): ${workerErr && workerErr.message} — stack: ${workerErr && workerErr.stack}`);
-        for (const b of item.bids) bidLog.write({
-          session: (ctx.sessions[0] && ctx.sessions[0].id) || 'unknown',
-          sap_order_id: b.order.SapOrderId,
-          city: b.city,
-          spi: b.spi,
-          csv_rate: b.amount,
-          submit_ms: '',
-          status: 'WORKER_ERROR',
-          message: (workerErr && workerErr.message) || 'unknown worker error',
         });
-      }
 
-      // v3.40 — worker-exit diagnostic (tightened from v3.39).
-      // Only warn when we produced NO outcome at all AND the batch was NOT
-      // a normal pre-warm skip. v3.39's version fired on `outcome=skipped`
-      // which is the NORMAL "SAP hasn't unlocked captcha yet" state during
-      // pre-warm — flooded the log 251 times per window. v3.40 rule:
-      // suppress `outcome=skipped` (that just means captcha wasn't ready
-      // yet; the retry will fire next scan), only warn on genuinely
-      // unlogged drops (finalOutcome=null AND no exception was caught).
-      const outcomeSummary = finalOutcome
-        ? (finalOutcome.ok ? 'ok'
-          : finalOutcome.silentFail ? 'silent-fail'
-          : finalOutcome.skipped ? 'skipped'
-          : finalOutcome.retry ? 'retry' : 'other')
-        : 'no-outcome';
-      const isGenuineDrop = !finalOutcome && !workerErrorAlreadyLogged;
-      if (isGenuineDrop) {
-        log.warn(`[worker] ⚠ batch exit without persisted outcome (vbelns=${vbelns.join(',')}, outcome=${outcomeSummary}) — investigate: was captcha fetched, was mutex acquired?`);
+        finalOutcome = outcome;
+        if (!outcome || outcome.skipped) continue;
+        if (outcome.silentFail) {
+          log.warn(`[${session.id}] Silent 201 → falling back to next session`);
+          continue;
+        }
+        // Real result (success OR definitive rejection) → stop fallback loop
+        allSilentFail = false;
+        break;
       }
 
       // If every session silent-failed on this item, cooldown so we retry later
@@ -2142,62 +1743,20 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
   // v3.36 — when TRUST_TYPE_S is on, ANY Type='S' is treated as success
   // (except when Ev_Text says tie-rejection, still respected).
   const _trustTypeS = TRUST_TYPE_S && result.info === 'S' && !isTieRejected;
-  // v3.40 CRITICAL FIX (user 2026-08-11 log: "ek bhi save nahi hua"):
-  //   In the 07:45 window bhai's bot rejected 3 orders as GHOST-SAVED even
-  //   though SAP's text said "Saved". Root cause: SAP returned the
-  //   NavEBiddingMessage array with an EMPTY Type field (or no message at
-  //   all), so `result.info` was '' — not 'S' — hence _trustTypeS=false
-  //   and ghost detection fired. The retry burned 3 captchas per order
-  //   and left the user with ZERO saved orders that window.
-  //
-  // New rule: TRUST_SAVED_TEXT (default true, tied to TRUST_TYPE_S). When
-  // SAP's Message/text contains "Saved" at any severity, treat as SUCCESS
-  // regardless of Type. The reference bot (ebidding-secure.js) never
-  // inspects Type/ChangeNo — it trusts SAP's text response unconditionally.
-  // Ghost detection is now GATED on TRUST_TYPE_S=false (opt-out only) so
-  // the default behaviour matches the reference bot.
-  const _trustSavedText = TRUST_TYPE_S && !isTieRejected && (
-    /saved\s*successfully|bid.*accepted|save.*success/i.test(result.text || '') ||
-    /saved\s*successfully|bid.*accepted|save.*success/i.test(evText)
-  );
-  // v3.41 — Flag="1" trust (user 2026-08-11 3rd-run response.jsonl analysis).
-  // SAP's OData response top-level `Flag` is "1" on every accepted save,
-  // including the "async ChangeNo" case where NavEBiddingMessage=null and
-  // Ev_Text="". This means the DB row was written; the immediate response
-  // just doesn't include the persistence GUID yet. Treat Flag="1" as
-  // definitive success (highest-priority signal after tie-rejection).
-  const _trustRespFlag = TRUST_TYPE_S && !isTieRejected && (result.respFlag || '').toString() === '1';
-  const isGhostSaved = TRUST_TYPE_S
-    ? false  // v3.40: with TRUST_TYPE_S=true (default), ghost detection is DISABLED entirely.
-             //         Post-save verification (1.5s later via fetchLiveOrders) is the
-             //         authoritative check. Prevents the "3-retry hammer" seen in bhai's
-             //         07:45 log which produced zero saves for NAZIRPUR/BHARATPUR/TALIBPUR.
-    : (_allHintsAreGhost && !_sapExplicitSuccess);
+  const isGhostSaved = _allHintsAreGhost && !_sapExplicitSuccess && !_trustTypeS;
 
   const isSavedOk      = /saved successfully|bid.*accepted|success/i.test(textLower);
-  // v3.43 CRITICAL — captcha-error detection MUST run BEFORE Flag/text trust
-  // so wrong-captcha responses (which SAP sometimes stamps with Flag="1")
-  // are correctly classified. bhai's 2026-08-11 11:15 AMRAPARA batch got
-  // Ev_Text="Captcha Validation Failed. Worng Captcha Value." + Flag="1"
-  // and was wrongly classified as ACCEPTED by v3.41. Both textLower AND
-  // evTextLower are checked (SAP may put the captcha error in either).
-  const isWrongCaptcha = /captcha.*(fail|wrong|invalid)|worng\s*captcha/i.test(textLower)
-                      || /captcha.*(fail|wrong|invalid)|worng\s*captcha/i.test(evTextLower);
   // isRealSuccess must NOT trigger when SAP flags Type='E' with a tie-reject
   // Ev_Text — even if Message cosmetically says "Saved Successfully" — OR when
   // the response only contains ghost persistence markers AND SAP did not
   // explicitly acknowledge (v3.34 recalibrated).
   // v3.36 — TRUST_TYPE_S: any non-tie Type='S' is a real success.
-  // v3.40 — also accept when SAP's text says "Saved" even with empty Type.
-  // v3.41 — also accept when SAP's response `Flag`='1' (async DB commit).
-  // v3.43 — ALSO reject when isWrongCaptcha even if Flag="1" or text-trust
-  //   would have accepted. Prevents the AMRAPARA "captcha-failed but
-  //   Flag=1 present" case from being marked ACCEPTED.
-  const isRealSuccess  = !isTieRejected && !isGhostSaved && !isWrongCaptcha && result.info !== 'E' && (
-    _trustTypeS || _trustSavedText || _trustRespFlag ||
+  const isRealSuccess  = !isTieRejected && !isGhostSaved && result.info !== 'E' && (
+    _trustTypeS ||
     (result.info === 'S' && !/ended|closed|expired|invalid|error/i.test(textLower)) || isSavedOk
   );
   const isTimeEnded    = /ended|closed|expired/i.test(textLower) && !isSavedOk;
+  const isWrongCaptcha = /captcha.*(fail|wrong|invalid)|worng\s*captcha/i.test(textLower);
   const reduceBy       = parseReduceAmount(evText || result.text);
   const minFloor       = parseMinFloor(evText || result.text);
 
@@ -2311,15 +1870,7 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
     metrics.submitsWrongCaptcha++;
     // The captcha we just used was rejected — flush it from the local cache
     // so this same wrong OCR result never comes back as a HIT again.
-    // v3.44 — fix bug introduced in v3.36: the parameter name in
-    // handleBatch is `solved`, NOT `solvedCaptcha`. The old code referred
-    // to the outer submitBid parameter which is out of scope here. Result:
-    // ReferenceError on every wrong-captcha → caught by v3.39 worker
-    // try/catch → logged as WORKER_ERROR ("solvedCaptcha is not defined")
-    // → batch was dropped without retry. bhai's 2026-08-11 12:45
-    // PANCHTHUPI batch hit this exact ReferenceError; 2nd manual save
-    // succeeded because bhai retried by hand.
-    invalidateCaptchaCache(auth._lastCaptchaImg, solved);
+    invalidateCaptchaCache(auth._lastCaptchaImg, solvedCaptcha);
     if (retryDepth < 3) {
       log.warn(`[${workerId}] ↻ Wrong captcha — refetching + retry ${retryDepth + 1}/3`);
       // Immediate retry with a FRESH captcha (still inside session mutex).
@@ -2672,22 +2223,10 @@ async function tick(ctx) {
         ctx._matchedButNoCaptcha = false; // no cache reuse — force fresh order fetch each scan
         maybeShakeSession(ctx, 'no-match');
         const now = Date.now();
-        // v3.42 — throttle waiting log: 10s in normal mode, 60s in quiet/demon.
-        const waitLogGap = QUIET_MODE ? 60_000 : 10_000;
-        if (!globalThis.__lastWaitLog || now - globalThis.__lastWaitLog > waitLogGap) {
+        if (!globalThis.__lastWaitLog || now - globalThis.__lastWaitLog > 10_000) {
           globalThis.__lastWaitLog = now;
           const alreadySubmitted = ctx.submitted.size;
-          // v3.39 — surface WHICH orders were skipped (first 5 blacklist +
-          // first 5 no-rule samples) so user can tell "wrongly blacklisted"
-          // from "genuinely blacklisted" without grepping raw SAP orders.
-          // v3.42 — in quiet mode, drop the samples (too noisy).
-          const blSample = (!QUIET_MODE && stats._blSamples && stats._blSamples.length)
-            ? ` | bl-samples: ${stats._blSamples.join('; ')}${stats.blacklisted > stats._blSamples.length ? `+${stats.blacklisted - stats._blSamples.length} more` : ''}` : '';
-          const nrSample = (!QUIET_MODE && stats._nrSamples && stats._nrSamples.length)
-            ? ` | no-rule samples: ${stats._nrSamples.join('; ')}${stats.noRule > stats._nrSamples.length ? `+${stats.noRule - stats._nrSamples.length} more` : ''}` : '';
-          const cdSample = (!QUIET_MODE && stats._cdSamples && stats._cdSamples.length)
-            ? ` | club-drop samples: ${stats._cdSamples.join('; ')}` : '';
-          log.info(`⏳ waiting for matched orders to appear (${stats.total} live: bl=${stats.blacklisted} no-rule=${stats.noRule} club-drop=${stats.clubDropped} cool=${stats.coolskip} sub-this-window=${alreadySubmitted} → 0 matched)… ${boundaryStatusText()}${blSample}${nrSample}${cdSample}`);
+          log.info(`⏳ waiting for matched orders to appear (${stats.total} live: bl=${stats.blacklisted} no-rule=${stats.noRule} club-drop=${stats.clubDropped} cool=${stats.coolskip} sub-this-window=${alreadySubmitted} → 0 matched)… ${boundaryStatusText()} (bot polling tight, session-shake active — do NOT restart)`);
         }
         return;
       }
@@ -2817,7 +2356,7 @@ function maybeShakeSession(ctx, reason) {
   const now = Date.now();
   if (globalThis.__lastSessionShake && now - globalThis.__lastSessionShake < 15_000) return;
   globalThis.__lastSessionShake = now;
-  qlog.info(`🔄 session-shake (${reason}) — refreshing CSRF on ${ctx.sessions.length} session(s) at ${boundaryStatusText()}`);
+  log.info(`🔄 session-shake (${reason}) — refreshing CSRF on ${ctx.sessions.length} session(s) at ${boundaryStatusText()}`);
   Promise.all(ctx.sessions.map((s) => s.refreshToken().catch(() => {}))).catch(() => {});
 }
 
@@ -2929,7 +2468,7 @@ async function main() {
           winKey,
           consumed: false,
         };
-        qlog.info(`[cap-poller] ⚡ PRE-SOLVED captcha ready for ${primary.id} (session, sample: ${r.solved.slice(0, 5)}) — next tick will submit INSTANTLY`);
+        log.info(`[cap-poller] ⚡ PRE-SOLVED captcha ready for ${primary.id} (session, sample: ${r.solved.slice(0, 5)}) — next tick will submit INSTANTLY`);
         // Reuse the timing telemetry that nextCaptcha uses.
         if (!globalThis.__firstCaptchaAt) {
           globalThis.__firstCaptchaAt = Date.now();
@@ -2965,93 +2504,34 @@ async function main() {
           try {
             let ordersToUse = ctx._cachedOrders;
             if (!ordersToUse || !ordersToUse.length) {
-              qlog.info(`[cap-poller] captcha ready but no cached orders — fetching orders INLINE (parallel to captcha unlock)…`);
+              log.info(`[cap-poller] captcha ready but no cached orders — fetching orders INLINE (parallel to captcha unlock)…`);
               const fetchT0 = Date.now();
               try {
                 const res = await fetchLiveOrders(primary);
                 ordersToUse = res.orders;
                 ctx._cachedOrders = ordersToUse;
                 ctx._cachedOrdersScan = ctx.scan;
-                qlog.info(`[cap-poller] inline order-fetch completed in ${Date.now() - fetchT0}ms — got ${ordersToUse.length} orders`);
+                log.info(`[cap-poller] inline order-fetch completed in ${Date.now() - fetchT0}ms — got ${ordersToUse.length} orders`);
               } catch (e) {
                 log.warn(`[cap-poller] inline order-fetch failed: ${e.message}`);
                 ordersToUse = [];
               }
             }
             if (ordersToUse && ordersToUse.length) {
-              // v3.37 — reuse the pre-window plan built by the orders poller
-              // at T-1500ms (parity with ebidding-secure.js). If we have a
-              // cached plan for this same window, skip the buildBatches
-              // step (~5-20ms saved). Otherwise build inline as fallback.
-              // v3.43 — winKey-match guard RELAXED to age-based (≤10s). At
-              // boundary crossing winKey changes by definition; the old
-              // guard invalidated a fresh (T-1753ms) pre-window plan
-              // 430ms after boundary, forcing a 5s inline SAP fetch and
-              // producing a 9s save delay. Age-based reuse is safe
-              // because pre-window orders reflect the same window's
-              // published bid set (SAP just flips them from "future" to
-              // "active" at boundary; the vbelns/amounts/customers stay
-              // identical). Submitted-map filter in buildBatches (if we
-              // rebuild anyway) keeps duplicate submits out.
-              let plan, stats;
-              const planAge = ctx._cachedPlanBuiltAt ? (Date.now() - ctx._cachedPlanBuiltAt) : Infinity;
-
-              // v3.44 — DYNAMIC ORDER-SHIFT PROTECTION: detect if
-              // _cachedOrders has SapOrderIds not present when plan was
-              // built. If so, the pre-built plan is STALE (misses late
-              // arrivals). Discard it and build inline. See buildBatches
-              // observedOrderIds tracking.
-              let newOrdersSincePlan = 0;
-              if (ctx._cachedPlanObservedIds instanceof Set && ordersToUse) {
-                for (const o of ordersToUse) {
-                  const sid = String(o?.SapOrderId || '');
-                  if (sid && !ctx._cachedPlanObservedIds.has(sid)) newOrdersSincePlan++;
-                }
-              }
-
-              const havePreBuilt = (
-                ctx._cachedPlan && ctx._cachedPlan.length &&
-                planAge <= 10_000 &&
-                newOrdersSincePlan === 0
+              const { plan, stats } = buildBatches(
+                ordersToUse, ctx.rules, ctx.blacklist, ctx.submitted, ctx.inFlight, ctx.cooldown,
+                ctx.sessions.length, ctx.priorityVbelns
               );
-              if (havePreBuilt) {
-                plan = ctx._cachedPlan;
-                stats = ctx._cachedPlanStats || { matched: plan.reduce((s, b) => s + (b.bids?.length || 0), 0), total: ordersToUse.length };
-              } else {
-                if (newOrdersSincePlan > 0) {
-                  log.info(`[cap-poller] 🔄 v3.44 order-shift detected: ${newOrdersSincePlan} new SapOrderId(s) since plan-build — rebuilding inline`);
-                }
-                const built = buildBatches(
-                  ordersToUse, ctx.rules, ctx.blacklist, ctx.submitted, ctx.inFlight, ctx.cooldown,
-                  ctx.sessions.length, ctx.priorityVbelns
-                );
-                plan = built.plan; stats = built.stats;
-                // Refresh caches so subsequent tick uses the up-to-date plan.
-                ctx._cachedPlan = plan;
-                ctx._cachedPlanStats = stats;
-                ctx._cachedPlanBuiltAt = Date.now();
-                ctx._cachedPlanObservedIds = built.observedOrderIds;
-              }
               if (plan.length) {
-                log.info(`[cap-poller] 🚀 INSTANT-SUBMIT dispatching ${plan.length} batch(es) with ${stats.matched} matched orders (${havePreBuilt ? 'PRE-BUILT plan reused' : 'built inline'}) — bypassing tick loop entirely!`);
+                log.info(`[cap-poller] 🚀 INSTANT-SUBMIT dispatching ${plan.length} batch(es) with ${stats.matched} matched orders (captcha ready — bypassing tick loop entirely!)`);
                 ctx._hotStall = true;
                 const workerCtx = { ...ctx, plan };
                 const workers = makeWorkerPool(workerCtx);
                 // Fire-and-forget — don't await, the poller must return quickly
-                // for the next tick.
+                // for the next 50ms tick.
                 Promise.all(workers).catch(() => {});
-                // Consume the pre-built plan so we don't re-fire it.
-                ctx._cachedPlan = null;
-                // v3.44 — reset the winKey guard so that late-arriving
-                // orders (e.g., SAP publishes a new priority order at
-                // T+800ms) still trigger a fresh plan-build on the next
-                // orders-poller tick. Without this, once we consume the
-                // plan, no rebuild ever fires for this window — new
-                // orders would be silently ignored.
-                ctx._planBuiltForWinKey = 0;
-                ctx._cachedPlanObservedIds = null;
               } else {
-                qlog.info(`[cap-poller] no matched orders (matched=${stats.matched}, total=${stats.total}) — tick() may pick up next scan`);
+                log.info(`[cap-poller] no matched orders (matched=${stats.matched}, total=${stats.total}) — tick() may pick up next scan`);
               }
             }
           } catch (e) {
@@ -3085,38 +2565,16 @@ async function main() {
   // reuses `_cachedOrders` when fresh (<5 scans old).
   const ORDERS_POLLER_INTERVAL = parseInt(process.env.ORDERS_POLLER_MS || '150', 10);
   const ORDERS_POLLER_LEAD_MS  = parseInt(process.env.ORDERS_POLLER_LEAD_MS || '90000', 10);
-  // v3.38 — HOT-ZONE aggressive polling parameters (user 2026-08-10 log
-  // analysis). SAP fetches take 1500-2000ms; the busy-guard let ONE slow
-  // fetch block ~14 poll ticks so orders released at T-1s weren't visible
-  // by the T-500ms early-drop moment ("no cached orders yet" warnings
-  // every window). Fix: within ±ORDERS_POLLER_HOT_ZONE_MS of the boundary,
-  // allow up to N parallel fetches at a faster interval so a slow fetch
-  // no longer stalls the poller.
-  const ORDERS_POLLER_HOT_INTERVAL   = parseInt(process.env.ORDERS_POLLER_HOT_MS      || '50',   10);
-  const ORDERS_POLLER_HOT_ZONE_MS    = parseInt(process.env.ORDERS_POLLER_HOT_ZONE_MS || '5000', 10);
-  const ORDERS_POLLER_MAX_INFLIGHT   = parseInt(process.env.ORDERS_POLLER_MAX_INFLIGHT || '3',    10);
   if (ORDERS_POLLER_INTERVAL <= 0) {
     log.info(`🔎 Independent orders poller DISABLED (ORDERS_POLLER_MS=0)`);
   } else {
-    let ordersInflight = 0;                // v3.38 — replaces boolean busy-flag
-    let lastOrdersFetchAt = 0;             // v3.38 — throttle when cold
+    let ordersPollerBusy = false;
     const ordersPollerHandle = setInterval(async () => {
+      if (ordersPollerBusy) return;
       const untilN = msUntilNextWindow();
-      const inHotZone = untilN <= ORDERS_POLLER_HOT_ZONE_MS || isHotWindow();
-      // Cold zone: keep the original busy-guard (1 inflight at a time,
-      // stagger to `ORDERS_POLLER_INTERVAL`). Hot zone: up to N parallel
-      // fetches at `ORDERS_POLLER_HOT_INTERVAL` — the point is that SAP
-      // releases orders in a very narrow T-1s→T+500ms window and each
-      // fetch takes 1500-2000ms, so a single blocking fetch would miss it.
-      if (untilN > ORDERS_POLLER_LEAD_MS && !inHotZone) return;
+      if (untilN > ORDERS_POLLER_LEAD_MS && !isHotWindow()) return;
       if (wafActive()) return;
-      const now = Date.now();
-      const minGap = inHotZone ? ORDERS_POLLER_HOT_INTERVAL : ORDERS_POLLER_INTERVAL;
-      if (now - lastOrdersFetchAt < minGap) return;
-      const maxInflight = inHotZone ? ORDERS_POLLER_MAX_INFLIGHT : 1;
-      if (ordersInflight >= maxInflight) return;
-      lastOrdersFetchAt = now;
-      ordersInflight++;
+      ordersPollerBusy = true;
       try {
         const primary = ctx.sessions[0];
         if (!primary || !primary.cookie) return;
@@ -3125,109 +2583,23 @@ async function main() {
         const t0 = Date.now();
         const res = await fetchLiveOrders(primary);
         const orders = res.orders || [];
-        // Only overwrite the cache if this fetch actually returned data OR
-        // if it's the first fetch for this window (prevents a late-arriving
-        // empty response from wiping a previously-populated cache).
-        if (orders.length > 0 || !ctx._cachedOrders || !ctx._cachedOrders.length) {
-          ctx._cachedOrders = orders;
-          ctx._cachedOrdersScan = ctx.scan;
-          ctx._cachedOrdersAt = Date.now();
-        }
+        ctx._cachedOrders = orders;
+        ctx._cachedOrdersScan = ctx.scan;
         const winKey = Math.floor((Date.now() + untilN) / 60_000);
         // Log the first non-empty scan per window so we can see order-list
         // publication latency in the log (mirrors captcha-timing telemetry).
         if (orders.length && ctx._ordersPollerFirstSeenWin !== winKey) {
           ctx._ordersPollerFirstSeenWin = winKey;
-          qlog.info(`[orders-poller] 📦 First non-empty orders scan for this window: ${orders.length} orders (fetch took ${Date.now() - t0}ms)`);
-        }
-
-        // v3.37 — PRE-WINDOW PLANNER (parity with ebidding-secure.js log timeline).
-        //
-        // Reference bot's log at T-1000ms shows:
-        //   ✓ Bid order list fetched: 40 orders
-        //   ✓ CSV matching: 1 rows matched across 1 groups
-        //   ℹ Batch size: 3, Total batches: 1
-        //   ℹ First batch applied: 1 groups
-        //
-        // So it: (a) fetches orders BEFORE the boundary, (b) runs CSV
-        // matching, (c) pre-builds the batch plan, (d) waits for captcha.
-        // Then at T+captcha-unlock, it submits the pre-built plan INSTANTLY.
-        //
-        // Our orders poller already caches orders every 150ms. Here we
-        // ALSO run buildBatches() ONCE per window when we're within 2s of
-        // the boundary and orders are cached, then stash the plan on
-        // ctx._cachedPlan for the captcha poller to pick up with zero
-        // computation cost at the T+captcha-unlock moment.
-        // v3.44 — DYNAMIC ORDER-SHIFT PROTECTION: rebuild plan if new
-        // SapOrderIds appear AFTER the initial plan-build. User's 2026-08-11
-        // complaint: "new order ghusega toh kabhi kabhi wo uper ya niche
-        // kahi chala jata hai jise uska position change ho jata hai".
-        // SAP releases orders in a narrow window (T-1500 → T+500ms); a
-        // priority order arriving at T-200ms would previously be locked
-        // out because _planBuiltForWinKey guard prevented rebuild.
-        // Now we detect new SapOrderIds vs. plan-build snapshot and
-        // force rebuild — inflight/submitted maps still dedupe on
-        // vbeln so no double-submits.
-        let mustRebuild = false;
-        let newOrdersDetected = 0;
-        if (
-          orders.length &&
-          ctx._planBuiltForWinKey === winKey &&
-          ctx._cachedPlanObservedIds instanceof Set
-        ) {
-          for (const o of orders) {
-            const sid = String(o?.SapOrderId || '');
-            if (sid && !ctx._cachedPlanObservedIds.has(sid)) {
-              mustRebuild = true;
-              newOrdersDetected++;
-            }
-          }
-        }
-
-        if (
-          orders.length &&
-          untilN > 0 && untilN <= 2500 &&
-          (ctx._planBuiltForWinKey !== winKey || mustRebuild)
-        ) {
-          ctx._planBuiltForWinKey = winKey;
-          try {
-            const { plan, stats, observedOrderIds } = buildBatches(
-              orders, ctx.rules, ctx.blacklist, ctx.submitted, ctx.inFlight, ctx.cooldown,
-              ctx.sessions.length, ctx.priorityVbelns
-            );
-            ctx._cachedPlan = plan;
-            ctx._cachedPlanStats = stats;
-            ctx._cachedPlanBuiltAt = Date.now(); // v3.43 — age-based reuse guard
-            ctx._cachedPlanObservedIds = observedOrderIds; // v3.44 — new-order detection
-            if (mustRebuild) {
-              log.info(`[pre-window] 🔄 REBUILD (v3.44 dynamic order-shift): ${newOrdersDetected} new SapOrderId(s) arrived after initial plan — rebuilt to ${plan.length} batch(es), ${stats.matched} matched (T-${untilN}ms)`);
-            } else {
-              qlog.info(`[pre-window] ✓ Bid order list fetched: ${orders.length} orders (T-${untilN}ms)`);
-              qlog.info(`[pre-window] ✓ CSV matching: ${stats.matched} rows matched across ${plan.length} groups`);
-            }
-            if (plan.length) {
-              const batchSize = plan[0]?.bids?.length || 0;
-              qlog.info(`[pre-window] ℹ Batch size: ${batchSize}, Total batches: ${plan.length}`);
-              qlog.info(`[pre-window] ℹ First batch applied: ${plan.length} groups — waiting for captcha unlock…`);
-            } else {
-              qlog.info(`[pre-window] ℹ No matches in this pre-window scan — orders-poller will re-check every ${ORDERS_POLLER_INTERVAL}ms until boundary`);
-              // Allow re-planning on the next tick if no match this time —
-              // by clearing the guard so a fresh order-set gets re-planned.
-              ctx._planBuiltForWinKey = 0;
-            }
-          } catch (e) {
-            log.warn(`[pre-window] plan build failed: ${e.message}`);
-            ctx._planBuiltForWinKey = 0;
-          }
+          log.info(`[orders-poller] 📦 First non-empty orders scan for this window: ${orders.length} orders (fetch took ${Date.now() - t0}ms)`);
         }
       } catch (e) {
         // silent — poller must never crash the process
       } finally {
-        ordersInflight--;
+        ordersPollerBusy = false;
       }
-    }, Math.min(ORDERS_POLLER_INTERVAL, ORDERS_POLLER_HOT_INTERVAL));
+    }, ORDERS_POLLER_INTERVAL);
     ordersPollerHandle.unref?.();
-    log.info(`🔎 Independent orders poller ACTIVE (cold=${ORDERS_POLLER_INTERVAL}ms, hot=${ORDERS_POLLER_HOT_INTERVAL}ms within ±${ORDERS_POLLER_HOT_ZONE_MS}ms of boundary, max ${ORDERS_POLLER_MAX_INFLIGHT} parallel fetches; activates ${ORDERS_POLLER_LEAD_MS/1000}s before each :15/:45 window)`);
+    log.info(`🔎 Independent orders poller ACTIVE (interval=${ORDERS_POLLER_INTERVAL}ms, activates ${ORDERS_POLLER_LEAD_MS/1000}s before each :15/:45 window)`);
   }
 
   // Main polling loop.
@@ -3295,11 +2667,11 @@ async function main() {
       earlyDropScheduledWinKey = nextBoundaryKey;
       const csrfDelay = Math.max(0, untilNext - (EARLY_DROP_MS + EARLY_DROP_CSRF_LEAD_MS));
       const fireDelay = Math.max(0, untilNext - EARLY_DROP_MS);
-      qlog.info(`⏰ EARLY-DROP scheduled: CSRF@T-${EARLY_DROP_MS + EARLY_DROP_CSRF_LEAD_MS}ms (in ${csrfDelay}ms), FIRE@T-${EARLY_DROP_MS}ms (in ${fireDelay}ms)`);
+      log.info(`⏰ EARLY-DROP scheduled: CSRF@T-${EARLY_DROP_MS + EARLY_DROP_CSRF_LEAD_MS}ms (in ${csrfDelay}ms), FIRE@T-${EARLY_DROP_MS}ms (in ${fireDelay}ms)`);
 
       // CSRF refresh — precise setTimeout so it never gets skipped by slow ticks.
       setTimeout(() => {
-        qlog.info(`🚀 EARLY-DROP CSRF refresh @ T-${msUntilNextWindow()}ms — minting post-pre-window token`);
+        log.info(`🚀 EARLY-DROP CSRF refresh @ T-${msUntilNextWindow()}ms — minting post-pre-window token`);
         Promise.all(ctx.sessions.map((s) => s.refreshToken().catch((e) => {
           log.warn(`[${s.id}] early-drop CSRF refresh failed: ${e.message}`);
         })));
@@ -3320,55 +2692,24 @@ async function main() {
         // straight to submitBid using the cached matched-bids from the last
         // successful scan. Only viable when EvCaptchaFlag='' (fastpath).
         try {
-          // v3.38 — SPIN-WAIT for orders to arrive (user 2026-08-10 log analysis).
-          //
-          // Previous behaviour: if `_cachedOrders` was empty at the exact
-          // T-500ms tick, we bailed out and fell back to post-boundary tick().
-          // But SAP releases orders ~1s pre-boundary and each fetch takes
-          // 1500-2000ms — so at T-500ms the orders-poller's most recent
-          // completed fetch was almost always the T-2500ms probe (empty).
-          // Result: EVERY window logged "no cached orders yet" and missed
-          // the pre-boundary submit opportunity.
-          //
-          // Fix: instead of bailing, spin-wait up to EARLY_DROP_WAIT_MS
-          // (default 1500ms) checking every 10ms — the moment the parallel
-          // hot-zone orders-poller populates the cache with a non-empty list
-          // and buildBatches finds a match, we fire IMMEDIATELY. Includes a
-          // hard timeout so we never fire past the boundary here.
-          const EARLY_DROP_WAIT_MS = parseInt(process.env.EARLY_DROP_WAIT_MS || '1500', 10);
-          const spinStartAt = Date.now();
-          const spinDeadline = spinStartAt + EARLY_DROP_WAIT_MS;
+          if (!ctx._cachedOrders || !ctx._cachedOrders.length) {
+            log.warn(`🎯 EARLY-DROP FIRE: no cached orders yet — cannot speculatively submit. Will rely on post-boundary tick() path.`);
+            return;
+          }
           const primary = ctx.sessions[0];
-          const captchaRequired = primary && primary._lastCaptchaFlag === 'X';
-          if (captchaRequired) {
+          if (primary._lastCaptchaFlag === 'X') {
             log.warn(`🎯 EARLY-DROP FIRE: SAP requires captcha (EvCaptchaFlag='X') — cannot fire pre-boundary without captcha unlock. Skipping speculative submit; falling back to normal post-boundary path.`);
             return;
           }
-          let plan = null, stats = null;
-          let spinAttempts = 0;
-          while (Date.now() < spinDeadline) {
-            spinAttempts++;
-            if (ctx._cachedOrders && ctx._cachedOrders.length) {
-              const built = buildBatches(
-                ctx._cachedOrders, ctx.rules, ctx.blacklist, ctx.submitted, ctx.inFlight, ctx.cooldown,
-                ctx.sessions.length, ctx.priorityVbelns
-              );
-              if (built.plan.length) {
-                plan = built.plan;
-                stats = built.stats;
-                break;
-              }
-            }
-            // Guard: if the boundary has passed while spinning, exit — the
-            // regular boundary/instant-submit-from-poller path will pick up.
-            if (msUntilNextWindow() < 0) break;
-            await new Promise((r) => setTimeout(r, 10));
-          }
-          if (!plan) {
-            log.warn(`🎯 EARLY-DROP FIRE: spin-wait ${Date.now() - spinStartAt}ms (${spinAttempts} attempts), no matched cached orders — falling back to boundary path. cachedOrders=${ctx._cachedOrders?.length || 0}, T=${msUntilNextWindow()}ms.`);
+          const { plan, stats } = buildBatches(
+            ctx._cachedOrders, ctx.rules, ctx.blacklist, ctx.submitted, ctx.inFlight, ctx.cooldown,
+            ctx.sessions.length, ctx.priorityVbelns
+          );
+          if (!plan.length) {
+            log.warn(`🎯 EARLY-DROP FIRE: no matched bids in cache (matched=${stats.matched}). Falling back.`);
             return;
           }
-          log.info(`🎯 EARLY-DROP FIRE: dispatching ${plan.length} batch(es), ${stats.matched} matched from cache (fastpath EvCaptchaFlag='', spin=${Date.now() - spinStartAt}ms, ${spinAttempts} attempts, T-${msUntilNextWindow()}ms)`);
+          log.info(`🎯 EARLY-DROP FIRE: dispatching ${plan.length} batch(es), ${stats.matched} matched from cache (fastpath EvCaptchaFlag='')`);
           const workerCtx = { ...ctx, plan };
           const workers = makeWorkerPool(workerCtx);
           await Promise.all(workers).catch(() => {});
@@ -3411,21 +2752,7 @@ async function main() {
       const clearedUc  = ctx.undercutAttempts.size;
       ctx.undercutAttempts.clear();
       ctx.ghostRetries.clear();  // v3.25: reset per-window ghost-retry counters
-      // v3.43 CRITICAL FIX — DO NOT wipe ctx._cachedOrders / ctx._cachedPlan
-      // at boundary crossing. bhai's 2026-08-11 11:15 log showed the exact
-      // race this caused:
-      //   T-1753ms  pre-window planner cached 27 orders + built 3-match plan
-      //   T-0      boundary clear wiped _cachedOrders + _cachedPlan
-      //   T+430ms  captcha unlocked; cap-poller saw _cachedOrders=null
-      //   T+430ms  cap-poller kicked off INLINE order-fetch (~5000ms SAP)
-      //   T+5000ms inline fetch returned; submit finally fired
-      //   T+8878ms SAP saved (3878ms submit latency)
-      // Total: 9-second delay for a save that should've been ~500ms.
-      // With this fix, cap-poller reuses the pre-window plan directly
-      // (winKey guard also relaxed below).
-      ctx._cachedOrders_lastBoundary = ctx._cachedOrders; // keep reference for stats
-      // Note: orders-poller and cap-poller will refresh _cachedOrders naturally
-      // within 50-150ms via the hot-zone parallel fetches (v3.38).
+      ctx._cachedOrders = null; // force fresh order fetch for new window
       // v3.32 — Record boundary timestamp for captcha-timing telemetry (used
       // by nextCaptcha() to compute per-window unlock latency).
       globalThis.__lastBoundaryMs = Date.now();
@@ -3462,7 +2789,7 @@ async function main() {
           log.warn(`[${s.id}] boundary CSRF refresh failed: ${e.message} — will retry on next tick`);
         });
       }
-      qlog.info(`🔑 Boundary CSRF re-issue triggered on ${ctx.sessions.length} session(s) — first submit will use post-boundary token to avoid SAP "pre-window" ghost-save.`);
+      log.info(`🔑 Boundary CSRF re-issue triggered on ${ctx.sessions.length} session(s) — first submit will use post-boundary token to avoid SAP "pre-window" ghost-save.`);
     }
 
     await tick(ctx);
