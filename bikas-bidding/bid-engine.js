@@ -3,6 +3,47 @@
 /**
  * bid-engine.js — Bikas Bidding v2 main bot
  *
+ * v3.45 — HOT-ZONE PARALLEL CAPTCHA PROBES (user 2026-08-11 7th run:
+ *         "rank 2 or 3 hua hai lekin save 45:00 me nahi hua ya 15:00 me
+ *         ek sec let ho ne se sayed ye ho raha hai … ager 00 me save
+ *         hua tho kam grentee ho jaye ga"):
+ *
+ *   Diagnosis (from bhai's engine.log + captcha-timing.csv):
+ *     13:45 window
+ *       T-499ms   EARLY-DROP tried → SAP said EvCaptchaFlag=X → bailed
+ *       T+0       boundary
+ *       T+1119ms  cap-poller finally caught first non-empty captcha,
+ *                 solved as "stack", INSTANT-DISPATCH fired (age=1ms)
+ *       T+1892ms  SAP responded SAVED-TIED (someone else at same amount)
+ *     14:15 window
+ *       T+1316ms  captcha unlocked → INSTANT-DISPATCH (age=0ms)
+ *       T+1604ms  SAP SAVED-TIED (3 orders, all rank 2)
+ *
+ *   Bot-side latency is already 0-1ms once captcha is solved. The whole
+ *   1119-1316ms delay is SAP captcha unlock detection latency. The
+ *   competitor is beating bhai by 100-500ms because they detect unlock
+ *   faster (parallel probes) and hit SAP first with the same amount.
+ *
+ *   Fix: cap-poller was SINGLE-FLIGHT (capPollerBusy). Each SAP captcha
+ *   fetch takes 100-300ms. If SAP unlocked at T+100ms but a probe was
+ *   already in flight until T+300ms, we detected unlock only at T+300ms.
+ *   Now near the boundary we allow up to CAPTCHA_POLLER_HOT_PARALLEL
+ *   (default 3) fetches in flight so the effective unlock-detection
+ *   interval drops from ~one-RTT to ~30-50ms.
+ *
+ *   Safety guards:
+ *   • Race-guard: before solving each returned image, re-check
+ *     ctx._preCaptcha for this winKey. If another parallel probe already
+ *     populated it, skip (no wasted OCR, no burnt SAP captcha rotation).
+ *   • Cold zone stays 1-in-flight (idle CPU/network savings).
+ *   • Config knobs: CAPTCHA_POLLER_HOT_PARALLEL (default 3),
+ *     CAPTCHA_POLLER_HOT_ZONE_MS (default 3000). Set HOT_PARALLEL=1
+ *     to revert to v3.44 single-flight.
+ *
+ *   Expected improvement: 100-500ms shaved off the 1100-1300ms unlock
+ *   detection latency → save fires closer to :15:00.5 / :45:00.5 instead
+ *   of :15:01.3 / :45:01.3 → rank-1 chance up significantly.
+ *
  * v3.44 — DYNAMIC ORDER-SHIFT PROTECTION + solvedCaptcha crash fix
  *         (user 2026-08-11 6th run: "new oder ghuse ga tho kabhi kabhi wo
  *         uper ya niche kahi chala jata hai jise uska position change ho
@@ -2898,17 +2939,37 @@ async function main() {
   ctx._preCaptcha = {};
   const CAPTCHA_POLLER_INTERVAL = parseInt(process.env.CAPTCHA_POLLER_MS || '50', 10);
   const CAPTCHA_POLLER_LEAD_MS  = parseInt(process.env.CAPTCHA_POLLER_LEAD_MS || '90000', 10);
+  // v3.45 — HOT-ZONE PARALLEL CAPTCHA PROBES (user 2026-08-11 7th run:
+  // "rank 2 or 3 hua hai lekin save 45:00 me nahi hua ya 15:00 me ek sec
+  // let ho ne se sayed ye ho raha hai"):
+  // Root cause of the ~1300ms save-latency at boundary: cap-poller was
+  // SINGLE-FLIGHT (capPollerBusy=true blocks concurrent fetches). Each
+  // captcha fetch takes 100-300ms; if SAP unlocked at T+100ms but a
+  // probe was already in flight until T+300ms, we detected unlock only
+  // at T+300ms. Now near the boundary we allow up to
+  // CAPTCHA_POLLER_HOT_PARALLEL fetches in flight so the effective
+  // unlock-detection interval drops from ~one-RTT to ~10-50ms.
+  // Outside the hot zone the poller stays single-flight to save CPU.
+  const CAPTCHA_POLLER_HOT_PARALLEL = parseInt(process.env.CAPTCHA_POLLER_HOT_PARALLEL || '3', 10);
+  const CAPTCHA_POLLER_HOT_ZONE_MS  = parseInt(process.env.CAPTCHA_POLLER_HOT_ZONE_MS || '3000', 10);
   if (CAPTCHA_POLLER_INTERVAL <= 0) {
     log.info(`🔍 Independent captcha poller DISABLED (CAPTCHA_POLLER_MS=0) — tick loop only`);
   } else {
-    let capPollerBusy = false;
+    let capPollerInflight = 0;
   const capPollerHandle = setInterval(async () => {
-    if (capPollerBusy) return;
     // Only run when close to (or inside) a hot window — otherwise idle to save CPU.
     const untilN = msUntilNextWindow();
     if (untilN > CAPTCHA_POLLER_LEAD_MS && !isHotWindow()) return;
     if (wafActive()) return;
-    capPollerBusy = true;
+
+    // v3.45 — dynamic in-flight cap. Near the boundary (within
+    // ±CAPTCHA_POLLER_HOT_ZONE_MS or inside the hot window) allow N
+    // parallel probes to shave 100-300ms off unlock detection. Cold
+    // zone stays at 1-in-flight to conserve CPU/network.
+    const inHotZone = isHotWindow() || (untilN >= 0 && untilN <= CAPTCHA_POLLER_HOT_ZONE_MS);
+    const maxInflight = inHotZone ? CAPTCHA_POLLER_HOT_PARALLEL : 1;
+    if (capPollerInflight >= maxInflight) return;
+    capPollerInflight++;
     try {
       const primary = ctx.sessions[0];
       if (!primary || !primary.cookie) return;
@@ -2920,7 +2981,15 @@ async function main() {
       if (ctx._preCaptcha[primary.id]?.winKey === winKey && ctx._preCaptcha[primary.id]?.solved) return;
       const { img, reason } = await fetchCaptchaImage(primary);
       if (!img) return; // sap-empty (pre-unlock) — normal
+      // v3.45 — RACE GUARD: another parallel probe may have already
+      // solved this window's captcha while our fetch was in flight.
+      // If so, skip the solve to avoid wasted CPU / duplicate log spam
+      // and (most importantly) to avoid burning a second captcha value
+      // on SAP that could rotate the active one.
+      if (ctx._preCaptcha[primary.id]?.winKey === winKey && ctx._preCaptcha[primary.id]?.solved) return;
       const r = await solveViaLocal(img);
+      // Second guard — solver may take another 20-80ms.
+      if (ctx._preCaptcha[primary.id]?.winKey === winKey && ctx._preCaptcha[primary.id]?.solved) return;
       if (r.solved) {
         ctx._preCaptcha[primary.id] = {
           solved: r.solved,
@@ -3062,11 +3131,11 @@ async function main() {
     } catch (e) {
       // silent — poller must never crash the process
     } finally {
-      capPollerBusy = false;
+      capPollerInflight--;
     }
   }, CAPTCHA_POLLER_INTERVAL);
   capPollerHandle.unref?.();
-  log.info(`🔍 Independent captcha poller ACTIVE (interval=${CAPTCHA_POLLER_INTERVAL}ms, activates ${CAPTCHA_POLLER_LEAD_MS/1000}s before each :15/:45 window)`);
+  log.info(`🔍 Independent captcha poller ACTIVE (interval=${CAPTCHA_POLLER_INTERVAL}ms, hot-parallel=${CAPTCHA_POLLER_HOT_PARALLEL} within ±${CAPTCHA_POLLER_HOT_ZONE_MS}ms of boundary, activates ${CAPTCHA_POLLER_LEAD_MS/1000}s before each :15/:45 window)`);
   }
 
   // v3.35 — INDEPENDENT ORDERS POLLER (parallel to captcha poller).

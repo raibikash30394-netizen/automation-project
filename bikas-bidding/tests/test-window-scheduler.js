@@ -1964,6 +1964,77 @@ function testDynamicOrderShiftDetection() {
   console.log('✓ Dynamic order-shift protection (v3.44): 5 cases pass — late-arriving SapOrderIds force plan rebuild, pure position-shifts do NOT (Vbeln matching is position-independent), cap-poller discards stale plans');
 }
 
+// v3.45 — HOT-ZONE PARALLEL CAPTCHA PROBES.
+//
+// User's 2026-08-11 rank-2 log: save fires at :15:01.3 / :45:01.3 because
+// cap-poller was single-flight — each captcha fetch takes 100-300ms and
+// unlock detection stalls at ~1s. v3.45 allows 3 parallel probes in flight
+// near the boundary, dropping detection to ~30-50ms. Race guard ensures
+// only ONE solve per window even if multiple probes return non-empty
+// captcha images simultaneously.
+function testHotZoneParallelCaptcha() {
+  // Decision logic replicated from bid-engine.js cap-poller:
+  //   const inHotZone = isHotWindow() || (untilN >= 0 && untilN <= HOT_ZONE_MS)
+  //   const maxInflight = inHotZone ? HOT_PARALLEL : 1
+  const HOT_PARALLEL = 3;
+  const HOT_ZONE_MS = 3000;
+
+  const decide = (isHot, untilN) => {
+    const inHotZone = isHot || (untilN >= 0 && untilN <= HOT_ZONE_MS);
+    return inHotZone ? HOT_PARALLEL : 1;
+  };
+
+  // Cold zone: >3s from boundary, not in hot window → single-flight.
+  assert.strictEqual(decide(false, 10_000), 1, 'v3.45: cold zone (10s pre-boundary) → single-flight');
+  assert.strictEqual(decide(false, 5_000), 1, 'v3.45: cold zone (5s pre-boundary) → single-flight');
+  assert.strictEqual(decide(false, 3_001), 1, 'v3.45: just outside hot zone (3.001s) → single-flight');
+
+  // Hot zone by untilN proximity to boundary.
+  assert.strictEqual(decide(false, 3_000), 3, 'v3.45: exactly on hot-zone edge (3s) → parallel=3');
+  assert.strictEqual(decide(false, 500), 3, 'v3.45: 500ms pre-boundary → parallel=3');
+  assert.strictEqual(decide(false, 0), 3, 'v3.45: at boundary → parallel=3');
+
+  // Inside a hot window (isHotWindow=true).
+  assert.strictEqual(decide(true, -1000), 3, 'v3.45: 1s past boundary, in hot window → parallel=3');
+  assert.strictEqual(decide(true, -30_000), 3, 'v3.45: deep inside hot window → parallel=3');
+
+  // Race-guard semantics: once ctx._preCaptcha[winKey] is populated, all
+  // subsequent probes must short-circuit without solving. Simulate the
+  // guard as a Map keyed by winKey and confirm N=3 probes only trigger
+  // ONE solve.
+  const preCaptcha = { s1: null };
+  const winKey = 42;
+  let solveCount = 0;
+  const probe = async (probeIdx, imgArrivesAtMs) => {
+    // Simulate fetchCaptchaImage returning at imgArrivesAtMs.
+    await new Promise((r) => setTimeout(r, imgArrivesAtMs));
+    // Race-guard #1 (post-fetch, pre-solve).
+    if (preCaptcha.s1?.winKey === winKey && preCaptcha.s1?.solved) return 'race-skipped-post-fetch';
+    // Simulate solveViaLocal.
+    await new Promise((r) => setTimeout(r, 30));
+    // Race-guard #2 (post-solve).
+    if (preCaptcha.s1?.winKey === winKey && preCaptcha.s1?.solved) return 'race-skipped-post-solve';
+    solveCount++;
+    preCaptcha.s1 = { solved: `solved-by-probe-${probeIdx}`, winKey };
+    return 'solved';
+  };
+
+  return (async () => {
+    // 3 parallel probes, staggered 20ms apart (mimics real fetch timing).
+    const results = await Promise.all([
+      probe(1, 40),   // fastest — should solve first
+      probe(2, 60),   // second — should race-skip after solve
+      probe(3, 80),   // slowest — should race-skip
+    ]);
+    assert.strictEqual(solveCount, 1, 'v3.45 race-guard: exactly ONE solve fires even with 3 parallel probes');
+    assert.strictEqual(results[0], 'solved', 'v3.45: fastest probe wins the solve');
+    assert(results[1].startsWith('race-skipped'), `v3.45: probe #2 must race-skip, got ${results[1]}`);
+    assert(results[2].startsWith('race-skipped'), `v3.45: probe #3 must race-skip, got ${results[2]}`);
+    assert.strictEqual(preCaptcha.s1.solved, 'solved-by-probe-1', 'v3.45: winning solve is from the fastest probe');
+    console.log('✓ Hot-zone parallel captcha probes (v3.45): 11 cases pass — cold zone single-flight, hot zone parallel=3, race-guard ensures exactly one solve per window even with 3 concurrent probes');
+  })();
+}
+
 async function testNetworkRetryOnIdempotent() {
   const NETWORK_ERR_RE = /HeadersTimeoutError|Headers Timeout|UND_ERR_CONNECT_TIMEOUT|UND_ERR_SOCKET|ETIMEDOUT|ECONNRESET|socket hang up|other side closed/i;
 
@@ -2250,6 +2321,7 @@ function testEarlyDropAndBoundaryComplementary() {
     testCaptchaFailBeatsFlagTrust();
     testPreWindowPlanSurvivesBoundary();
     testDynamicOrderShiftDetection();
+    await testHotZoneParallelCaptcha();
     await testNetworkRetryOnIdempotent();
     console.log('\n🎉 ALL TESTS PASS');
     process.exit(0);

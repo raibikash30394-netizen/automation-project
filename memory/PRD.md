@@ -698,3 +698,34 @@ Two independent bugs from bhai's 2026-08-11 6th-run logs:
 **Files modified**
 - `/app/bikas-bidding/bid-engine.js` (buildBatches return + orders-poller rebuild-detection + cap-poller stale-plan guard + version header)
 - `/app/bikas-bidding/tests/test-window-scheduler.js` (v3.44 test group)
+
+## v3.45 — HOT-ZONE PARALLEL CAPTCHA PROBES (2026-02-12)
+User's 7th-run report: v3.44 fixed the miss bug (rank 2/3 now hit) but "save 45:00 me nahi hua ya 15:00 me ek sec let ho ne se … ager 00 me save hua tho kam grentee ho jaye ga" (saves are landing at :15:01 / :45:01 instead of :00, another vendor beats us by ~500ms on TIE).
+
+**Diagnosis** (from `bikas-bid-engine-out.log` + `captcha-timing-2026-08-11.csv`):
+- 13:45 window: captcha unlocked at T+1119ms → SAVED-TIED at T+1892ms.
+- 14:15 window: captcha unlocked at T+1316ms → SAVED-TIED at T+1604ms (3 orders, all rank 2).
+- Bot-side latency between "captcha ready" and "submit fired" = **0-1ms** (already optimal).
+- Total delay is 100% SAP-side captcha unlock detection latency.
+
+**Root cause**: cap-poller was single-flight (`capPollerBusy=true` blocked concurrent fetches). Each SAP captcha fetch takes 100-300ms. If SAP unlocked at T+100ms but a probe was already in flight until T+300ms, unlock was only detected at T+300ms. The competitor was likely running parallel captcha probes and beating us by ~500ms.
+
+**Fix**:
+- Cap-poller now supports up to `CAPTCHA_POLLER_HOT_PARALLEL` (default 3) concurrent fetches near the boundary (within `CAPTCHA_POLLER_HOT_ZONE_MS`, default 3000ms). Cold zone stays single-flight to save CPU/network.
+- **Race guard**: before + after solving each returned image, re-check `ctx._preCaptcha[winKey]`. If another parallel probe already populated it, skip the solve — prevents wasted OCR calls AND prevents burning a second captcha value on SAP (which could rotate the active one).
+- New test `testHotZoneParallelCaptcha` (11 cases) — validates cold vs hot zone decision logic and race-guard semantics with 3 concurrent simulated probes.
+
+**Expected improvement**: 100-500ms shaved off unlock detection → save fires at :15:00.5 / :45:00.5 instead of :15:01.3 / :45:01.3 → **rank-1 chance up significantly**.
+
+**Config knobs** (in `.env`):
+- `CAPTCHA_POLLER_HOT_PARALLEL=3` (set to 1 to revert to v3.44 single-flight)
+- `CAPTCHA_POLLER_HOT_ZONE_MS=3000`
+
+**Verification**
+- 37/37 tests pass.
+- Syntax + smoke boot clean.
+
+**Files modified**
+- `/app/bikas-bidding/bid-engine.js` (cap-poller parallel-probe support + race guards + version header)
+- `/app/bikas-bidding/.env` and `/app/bikas-bidding/.env.example` (new knobs)
+- `/app/bikas-bidding/tests/test-window-scheduler.js` (v3.45 test group)
