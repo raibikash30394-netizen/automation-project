@@ -3,6 +3,34 @@
 /**
  * bid-engine.js — Bikas Bidding v2 main bot
  *
+ * v3.42 — QUIET/DEMON LOG MODE (user 2026-08-11 4th run: "bekar ka log
+ *         jo jada likha hua aa raha usko kam karo, lod badne se slow
+ *         kam kare ga, log jitna halka utna smooth hoga"):
+ *   Prior log audit on bhai's engine.log for a 60-min run showed:
+ *     • 53× "⏳ waiting for matched orders" (~ 2 KB each = 106 KB)
+ *     • 93× "🔄 session-shake" (200 B each)
+ *     • 45× "Refreshing CSRF token" + 45× "CSRF token saved"
+ *     • 86× "[metrics]" line every 30 s
+ *     • Pre-window planner + orders-poller + cap-poller heartbeats
+ *   → ~200 KB of chatter per window that competes with the hot-path
+ *   for the Node event loop under load.
+ *
+ *   Changes:
+ *   • New env `LOG_LEVEL` ('normal' default, 'quiet' or 'demon' for
+ *     minimal). Default in `.env` set to 'quiet' for the user's 24×7
+ *     PM2 deployment.
+ *   • `qlog.info(...)` helper suppresses when QUIET_MODE — used for:
+ *     CSRF refresh + save chatter, session-shake, pre-window planner,
+ *     orders-poller/cap-poller heartbeats, early-drop scheduled/CSRF
+ *     lines, boundary CSRF re-issue, EvCaptchaFlag=captcha-required
+ *     transitions.
+ *   • Metrics interval auto-widens 30s → 5min in quiet mode.
+ *   • "waiting for matched orders" throttled to 60s in quiet (was 10s).
+ *   • Blacklist / no-rule / club-drop samples suppressed in quiet
+ *     (still available on 'normal' for diagnostics).
+ *   • Log volume reduction estimate: ~85-90 % of INFO-level lines
+ *     disappear; warnings/errors/submits/saves/rejects unchanged.
+ *
  * v3.41 — SAP `Flag` FIELD SUCCESS TRUST (user 2026-08-11 3rd run):
  *   User's submit-responses.jsonl reveals SAP's OData response has a
  *   top-level `Flag` field. Every accepted save has `Flag="1"` — even
@@ -352,11 +380,34 @@ const SKIP_RANK_PREVIEW   = String(process.env.SKIP_RANK_PREVIEW || 'true').toLo
 const TRUST_TYPE_S           = String(process.env.TRUST_TYPE_S || 'true').toLowerCase() === 'true';
 const INFO_INSTANT_RETRY_MAX = parseInt(process.env.INFO_INSTANT_RETRY_MAX || '5', 10);
 
+// v3.42 — LOG_LEVEL knob (user 2026-08-11 4th run: "bekar ka log jo jada
+// likha hua aa raha usko kam karo, lod badne se slow kam kare ga, log
+// jitna halka utna smooth hoga").
+//   'normal' (default)  — full verbosity (every session-shake, every
+//                         CSRF refresh, every 10s waiting-for-orders log,
+//                         30s metrics ping, all pre-window + cap-poller
+//                         chatter).
+//   'quiet'  / 'demon'  — minimal noise. Keeps ONLY: startup banner,
+//                         boundary crossings, submits, saves/rejects,
+//                         errors/warnings, and metrics every 5 min.
+//                         Suppresses per-scan chatter (waiting-for-orders,
+//                         session-shake, CSRF-token-saved, pre-window
+//                         planner, orders-poller first-seen). Reduces log
+//                         volume ~90%.
+const LOG_LEVEL_RAW = String(process.env.LOG_LEVEL || 'normal').toLowerCase();
+const QUIET_MODE    = LOG_LEVEL_RAW === 'quiet' || LOG_LEVEL_RAW === 'demon';
+// Helpers so hot paths can cheaply opt-in to reduced verbosity.
+const qlog = {
+  info : (...args) => { if (!QUIET_MODE) log.info(...args); },
+  warn : (...args) => log.warn(...args),     // warnings always visible
+  error: (...args) => log.error(...args),    // errors always visible
+};
+
 const WAF_MIN_MS   = parseInt(process.env.WAF_BACKOFF_MIN_MS || '30000', 10);
 const WAF_MAX_MS   = parseInt(process.env.WAF_BACKOFF_MAX_MS || '120000', 10);
 const WAF_RESET_MS = parseInt(process.env.WAF_RESET_AFTER_MS || '300000', 10);
 
-const METRICS_MS   = parseInt(process.env.METRICS_INTERVAL_MS || '30000', 10);
+const METRICS_MS   = parseInt(process.env.METRICS_INTERVAL_MS || (QUIET_MODE ? '300000' : '30000'), 10);
 
 // v3.30 — EARLY DROP (a.k.a. "1-second-early trick"). Replicates the user's
 // manual UI behaviour: click Save ~1s BEFORE the :15/:45 boundary. SAP appears
@@ -632,7 +683,7 @@ class AuthConfig {
   async refreshToken() {
     if (this._refreshInFlight) return this._refreshInFlight;
     this._refreshInFlight = (async () => {
-      log.info(`[${this.id}] Refreshing CSRF token…`);
+      qlog.info(`[${this.id}] Refreshing CSRF token…`);
       try {
         const { statusCode, headers } = await sapPool.request({
           path: `${SAP_PATH_PFX}/SessionSet('')`,
@@ -645,7 +696,7 @@ class AuthConfig {
         }
         this.token = String(tok);
         fs.writeFileSync(this.tokenFile, this.token, 'utf8');
-        log.info(`[${this.id}] CSRF token saved to ${path.basename(this.tokenFile)}`);
+        qlog.info(`[${this.id}] CSRF token saved to ${path.basename(this.tokenFile)}`);
         return this.token;
       } finally {
         this._refreshInFlight = null;
@@ -1198,7 +1249,7 @@ async function fetchLiveOrders(auth) {
     if (captchaFlag === '') {
       log.info(`[${auth.id}] ⚡ EvCaptchaFlag='' — CAPTCHA-FREE fastpath ENABLED (early-drop can submit pre-boundary)`);
     } else {
-      log.info(`[${auth.id}] 🔒 EvCaptchaFlag='${captchaFlag}' — captcha REQUIRED (early-drop will skip; must wait for post-boundary captcha unlock)`);
+      qlog.info(`[${auth.id}] 🔒 EvCaptchaFlag='${captchaFlag}' — captcha REQUIRED (early-drop will skip; must wait for post-boundary captcha unlock)`);
     }
   }
   auth._lastCaptchaFlag = captchaFlag; // 'X' = captcha required, '' = fast-path
@@ -2511,19 +2562,22 @@ async function tick(ctx) {
         ctx._matchedButNoCaptcha = false; // no cache reuse — force fresh order fetch each scan
         maybeShakeSession(ctx, 'no-match');
         const now = Date.now();
-        if (!globalThis.__lastWaitLog || now - globalThis.__lastWaitLog > 10_000) {
+        // v3.42 — throttle waiting log: 10s in normal mode, 60s in quiet/demon.
+        const waitLogGap = QUIET_MODE ? 60_000 : 10_000;
+        if (!globalThis.__lastWaitLog || now - globalThis.__lastWaitLog > waitLogGap) {
           globalThis.__lastWaitLog = now;
           const alreadySubmitted = ctx.submitted.size;
           // v3.39 — surface WHICH orders were skipped (first 5 blacklist +
           // first 5 no-rule samples) so user can tell "wrongly blacklisted"
           // from "genuinely blacklisted" without grepping raw SAP orders.
-          const blSample = (stats._blSamples && stats._blSamples.length)
+          // v3.42 — in quiet mode, drop the samples (too noisy).
+          const blSample = (!QUIET_MODE && stats._blSamples && stats._blSamples.length)
             ? ` | bl-samples: ${stats._blSamples.join('; ')}${stats.blacklisted > stats._blSamples.length ? `+${stats.blacklisted - stats._blSamples.length} more` : ''}` : '';
-          const nrSample = (stats._nrSamples && stats._nrSamples.length)
+          const nrSample = (!QUIET_MODE && stats._nrSamples && stats._nrSamples.length)
             ? ` | no-rule samples: ${stats._nrSamples.join('; ')}${stats.noRule > stats._nrSamples.length ? `+${stats.noRule - stats._nrSamples.length} more` : ''}` : '';
-          const cdSample = (stats._cdSamples && stats._cdSamples.length)
+          const cdSample = (!QUIET_MODE && stats._cdSamples && stats._cdSamples.length)
             ? ` | club-drop samples: ${stats._cdSamples.join('; ')}` : '';
-          log.info(`⏳ waiting for matched orders to appear (${stats.total} live: bl=${stats.blacklisted} no-rule=${stats.noRule} club-drop=${stats.clubDropped} cool=${stats.coolskip} sub-this-window=${alreadySubmitted} → 0 matched)… ${boundaryStatusText()} (bot polling tight, session-shake active — do NOT restart)${blSample}${nrSample}${cdSample}`);
+          log.info(`⏳ waiting for matched orders to appear (${stats.total} live: bl=${stats.blacklisted} no-rule=${stats.noRule} club-drop=${stats.clubDropped} cool=${stats.coolskip} sub-this-window=${alreadySubmitted} → 0 matched)… ${boundaryStatusText()}${blSample}${nrSample}${cdSample}`);
         }
         return;
       }
@@ -2653,7 +2707,7 @@ function maybeShakeSession(ctx, reason) {
   const now = Date.now();
   if (globalThis.__lastSessionShake && now - globalThis.__lastSessionShake < 15_000) return;
   globalThis.__lastSessionShake = now;
-  log.info(`🔄 session-shake (${reason}) — refreshing CSRF on ${ctx.sessions.length} session(s) at ${boundaryStatusText()}`);
+  qlog.info(`🔄 session-shake (${reason}) — refreshing CSRF on ${ctx.sessions.length} session(s) at ${boundaryStatusText()}`);
   Promise.all(ctx.sessions.map((s) => s.refreshToken().catch(() => {}))).catch(() => {});
 }
 
@@ -2765,7 +2819,7 @@ async function main() {
           winKey,
           consumed: false,
         };
-        log.info(`[cap-poller] ⚡ PRE-SOLVED captcha ready for ${primary.id} (session, sample: ${r.solved.slice(0, 5)}) — next tick will submit INSTANTLY`);
+        qlog.info(`[cap-poller] ⚡ PRE-SOLVED captcha ready for ${primary.id} (session, sample: ${r.solved.slice(0, 5)}) — next tick will submit INSTANTLY`);
         // Reuse the timing telemetry that nextCaptcha uses.
         if (!globalThis.__firstCaptchaAt) {
           globalThis.__firstCaptchaAt = Date.now();
@@ -2801,14 +2855,14 @@ async function main() {
           try {
             let ordersToUse = ctx._cachedOrders;
             if (!ordersToUse || !ordersToUse.length) {
-              log.info(`[cap-poller] captcha ready but no cached orders — fetching orders INLINE (parallel to captcha unlock)…`);
+              qlog.info(`[cap-poller] captcha ready but no cached orders — fetching orders INLINE (parallel to captcha unlock)…`);
               const fetchT0 = Date.now();
               try {
                 const res = await fetchLiveOrders(primary);
                 ordersToUse = res.orders;
                 ctx._cachedOrders = ordersToUse;
                 ctx._cachedOrdersScan = ctx.scan;
-                log.info(`[cap-poller] inline order-fetch completed in ${Date.now() - fetchT0}ms — got ${ordersToUse.length} orders`);
+                qlog.info(`[cap-poller] inline order-fetch completed in ${Date.now() - fetchT0}ms — got ${ordersToUse.length} orders`);
               } catch (e) {
                 log.warn(`[cap-poller] inline order-fetch failed: ${e.message}`);
                 ordersToUse = [];
@@ -2845,7 +2899,7 @@ async function main() {
                 // Consume the pre-built plan so we don't re-fire it.
                 ctx._cachedPlan = null;
               } else {
-                log.info(`[cap-poller] no matched orders (matched=${stats.matched}, total=${stats.total}) — tick() may pick up next scan`);
+                qlog.info(`[cap-poller] no matched orders (matched=${stats.matched}, total=${stats.total}) — tick() may pick up next scan`);
               }
             }
           } catch (e) {
@@ -2932,7 +2986,7 @@ async function main() {
         // publication latency in the log (mirrors captcha-timing telemetry).
         if (orders.length && ctx._ordersPollerFirstSeenWin !== winKey) {
           ctx._ordersPollerFirstSeenWin = winKey;
-          log.info(`[orders-poller] 📦 First non-empty orders scan for this window: ${orders.length} orders (fetch took ${Date.now() - t0}ms)`);
+          qlog.info(`[orders-poller] 📦 First non-empty orders scan for this window: ${orders.length} orders (fetch took ${Date.now() - t0}ms)`);
         }
 
         // v3.37 — PRE-WINDOW PLANNER (parity with ebidding-secure.js log timeline).
@@ -2965,14 +3019,14 @@ async function main() {
             );
             ctx._cachedPlan = plan;
             ctx._cachedPlanStats = stats;
-            log.info(`[pre-window] ✓ Bid order list fetched: ${orders.length} orders (T-${untilN}ms)`);
-            log.info(`[pre-window] ✓ CSV matching: ${stats.matched} rows matched across ${plan.length} groups`);
+            qlog.info(`[pre-window] ✓ Bid order list fetched: ${orders.length} orders (T-${untilN}ms)`);
+            qlog.info(`[pre-window] ✓ CSV matching: ${stats.matched} rows matched across ${plan.length} groups`);
             if (plan.length) {
               const batchSize = plan[0]?.bids?.length || 0;
-              log.info(`[pre-window] ℹ Batch size: ${batchSize}, Total batches: ${plan.length}`);
-              log.info(`[pre-window] ℹ First batch applied: ${plan.length} groups — waiting for captcha unlock…`);
+              qlog.info(`[pre-window] ℹ Batch size: ${batchSize}, Total batches: ${plan.length}`);
+              qlog.info(`[pre-window] ℹ First batch applied: ${plan.length} groups — waiting for captcha unlock…`);
             } else {
-              log.info(`[pre-window] ℹ No matches in this pre-window scan — orders-poller will re-check every ${ORDERS_POLLER_INTERVAL}ms until boundary`);
+              qlog.info(`[pre-window] ℹ No matches in this pre-window scan — orders-poller will re-check every ${ORDERS_POLLER_INTERVAL}ms until boundary`);
               // Allow re-planning on the next tick if no match this time —
               // by clearing the guard so a fresh order-set gets re-planned.
               ctx._planBuiltForWinKey = 0;
@@ -3057,11 +3111,11 @@ async function main() {
       earlyDropScheduledWinKey = nextBoundaryKey;
       const csrfDelay = Math.max(0, untilNext - (EARLY_DROP_MS + EARLY_DROP_CSRF_LEAD_MS));
       const fireDelay = Math.max(0, untilNext - EARLY_DROP_MS);
-      log.info(`⏰ EARLY-DROP scheduled: CSRF@T-${EARLY_DROP_MS + EARLY_DROP_CSRF_LEAD_MS}ms (in ${csrfDelay}ms), FIRE@T-${EARLY_DROP_MS}ms (in ${fireDelay}ms)`);
+      qlog.info(`⏰ EARLY-DROP scheduled: CSRF@T-${EARLY_DROP_MS + EARLY_DROP_CSRF_LEAD_MS}ms (in ${csrfDelay}ms), FIRE@T-${EARLY_DROP_MS}ms (in ${fireDelay}ms)`);
 
       // CSRF refresh — precise setTimeout so it never gets skipped by slow ticks.
       setTimeout(() => {
-        log.info(`🚀 EARLY-DROP CSRF refresh @ T-${msUntilNextWindow()}ms — minting post-pre-window token`);
+        qlog.info(`🚀 EARLY-DROP CSRF refresh @ T-${msUntilNextWindow()}ms — minting post-pre-window token`);
         Promise.all(ctx.sessions.map((s) => s.refreshToken().catch((e) => {
           log.warn(`[${s.id}] early-drop CSRF refresh failed: ${e.message}`);
         })));
@@ -3210,7 +3264,7 @@ async function main() {
           log.warn(`[${s.id}] boundary CSRF refresh failed: ${e.message} — will retry on next tick`);
         });
       }
-      log.info(`🔑 Boundary CSRF re-issue triggered on ${ctx.sessions.length} session(s) — first submit will use post-boundary token to avoid SAP "pre-window" ghost-save.`);
+      qlog.info(`🔑 Boundary CSRF re-issue triggered on ${ctx.sessions.length} session(s) — first submit will use post-boundary token to avoid SAP "pre-window" ghost-save.`);
     }
 
     await tick(ctx);

@@ -287,6 +287,32 @@ User feedback ("mai UI me 1 sec pehele chor deta hu... 50% mera rank 1 hota") re
 - **3 new unit tests** in `test-window-scheduler.js`: `testEarlyDropWindow` (8 cases), `testEarlyDropOnceSemantics` (3-window verification), `testEarlyDropAndBoundaryComplementary` (temporal ordering with v3.25 boundary block)
 - **Set `EARLY_DROP_MS=0` to disable** and revert to strict-at-boundary behaviour
 
+## Implemented (2026-02 — v3.42 QUIET/DEMON LOG MODE)
+User (2026-08-11 4th run) shared engine log + bids.csv + submit-responses.jsonl and requested: "bekar ka log jo jada likha hua aa raha usko kam karo, lod badne se slow kam kare ga, log jitna halka utna smooth hoga sab tik karo" (reduce excessive logging, high volume slows things down under load).
+
+**Log audit for a 60-min run:**
+- 53× `⏳ waiting for matched orders` (~2 KB each = 106 KB)
+- 93× `🔄 session-shake`
+- 45× `Refreshing CSRF token` + 45× `CSRF token saved`
+- 86× `[metrics]` line every 30s
+- Multiple pre-window planner + orders-poller + cap-poller heartbeat lines
+- ~200 KB of chatter per window competing with hot path for the Node event loop.
+
+**Changes (v3.42):**
+- New env `LOG_LEVEL`: 'normal' (default) or 'quiet' / 'demon'. Repo `.env` shipped with `LOG_LEVEL=quiet` for 24×7 PM2 use.
+- `qlog.info(...)` helper suppresses when QUIET_MODE. Applied to: CSRF refresh / save chatter, session-shake, pre-window planner 4-line block, orders-poller "first non-empty scan", cap-poller PRE-SOLVED / inline-fetch / no-matched-orders, early-drop scheduled + CSRF refresh, boundary CSRF re-issue, EvCaptchaFlag=captcha-required transitions.
+- Metrics interval auto-widens 30s → 5min in quiet mode.
+- "waiting for matched orders" throttled to 60s in quiet (was 10s).
+- Diagnostic samples (blacklist / no-rule / club-drop) suppressed in quiet (still on 'normal').
+- 17 hot-path `log.info` calls now gated; 39 remain unconditional (submits, saves, rejects, boundary crossings, worker errors).
+- Version banner updated in `bid-engine.js` header.
+
+**Est. log volume reduction:** ~85-90% of INFO-level lines disappear in quiet; warnings/errors/submits/saves/rejects UNCHANGED — full diagnostic info retained for actual bid events.
+
+Testing: `node --check` clean, 33/33 tests pass, boot smoke clean with `LOG_LEVEL=quiet` env active.
+
+**Note re: bhai's TILASHAN @629 rejection**: submit-responses.jsonl confirms SAP said `"Bidding amount should be Greater than or equal to 629.96"` for KHARGRAM (in same batch as TILASHAN @629). This is a legit SAP floor-violation for KHARGRAM (bhai's CSV has 472 which is well below the 629.96 floor). TILASHAN got "Same amount has been bid" (tie-saved). Both got flagged RATE_TOO_LOW because our classifier applies one outcome to the whole batch. Deferred (would need per-order message parsing): batch-split on partial rejection to save TIE items while dropping the FLOOR-violation ones.
+
 ## Implemented (2026-02 — v3.41 SAP `Flag` FIELD SUCCESS TRUST)
 User (2026-08-11 3rd run) shared submit-responses.jsonl with 18 full SAP response bodies. Analysis reveals the exact root cause of bhai's "pehele save ho raha tha, ab nahi ho raha" complaint.
 

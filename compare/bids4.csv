@@ -1,0 +1,4 @@
+timestamp,session,sap_order_id,city,spi,csv_rate,submit_ms,status,message
+2026-08-11T09:15:17.006Z,s1,1154945425,LITTIPARA,1162,683,259,SAVED_TIED,Same amount has been bid by other vendor for order  id : 5575765975 and posnr: 000101#
+2026-08-11T09:45:01.567Z,s1,1154937803,TILASHAN,1164,629,243,RATE_TOO_LOW,floor=629.96
+2026-08-11T09:45:01.568Z,s1,1154945670,KHARGRAM,1162,472,243,RATE_TOO_LOW,floor=629.96
