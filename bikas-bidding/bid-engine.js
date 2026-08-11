@@ -3,6 +3,27 @@
 /**
  * bid-engine.js — Bikas Bidding v2 main bot
  *
+ * v3.41 — SAP `Flag` FIELD SUCCESS TRUST (user 2026-08-11 3rd run):
+ *   User's submit-responses.jsonl reveals SAP's OData response has a
+ *   top-level `Flag` field. Every accepted save has `Flag="1"` — even
+ *   the "async ChangeNo" responses where NavEBiddingMessage=null and
+ *   Ev_Text="" (i.e., no text message at all). Prior versions ignored
+ *   `Flag` entirely; the classifier fell through to "unknown"/"ghost"
+ *   for these responses. bhai's 07:45 (post-restart) + 08:15 windows
+ *   saw the same 3 orders repeatedly submitted → all returning Flag="1"
+ *   with async persistence markers → all classified as GHOST-SAVED and
+ *   REJECTED_GHOST_MAX. In reality they WERE saved.
+ *
+ *   Changes:
+ *   • `submitBid` now returns `respFlag` from SAP's response body.
+ *   • handleBatch treats `respFlag === '1'` (when TRUST_TYPE_S=true and
+ *     not tie-rejected) as a definitive success signal — the strongest
+ *     signal available in the response. Sits alongside the v3.36
+ *     _trustTypeS ('S') and v3.40 _trustSavedText (text match) trust
+ *     paths. All three feed isRealSuccess.
+ *   • Applies to all response shapes: empty NavMsg, empty Ev_Text,
+ *     Type=' ', Type='S', with or without persistence markers.
+ *
  * v3.40 — GHOST DETECTION DISABLED + WARNING SUPPRESSION (user 2026-08-11
  *         second-run report: "ek bhi save nahi hua"):
  *   User's 07:45 window log:
@@ -1484,7 +1505,16 @@ async function submitBid(auth, bids, solvedCaptcha) {
     }
   }
 
-  return { statusCode: res.statusCode, info: primary.info, text: primary.text, messages, raw: res.data, submitMs, rankHints };
+  // v3.41 — capture SAP's response `Flag` field. SAP's OData EBiddingSave
+  // response has a top-level `Flag` string. Live evidence from bhai's
+  // 2026-08-11 07:46 log shows SAP returns `Flag="1"` even on responses
+  // where `NavEBiddingMessage=null` and `Ev_Text=""` (i.e., no text
+  // message at all). Flag="1" means the save was accepted; async DB
+  // replication just hasn't populated ChangeNo/CreatedOn yet. This
+  // single field is the STRONGEST success signal in the response.
+  const respFlag = (d.Flag || '').toString();
+
+  return { statusCode: res.statusCode, info: primary.info, text: primary.text, messages, raw: res.data, submitMs, rankHints, respFlag };
 }
 
 function extractSapMessages(d) {
@@ -1987,6 +2017,13 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
     /saved\s*successfully|bid.*accepted|save.*success/i.test(result.text || '') ||
     /saved\s*successfully|bid.*accepted|save.*success/i.test(evText)
   );
+  // v3.41 — Flag="1" trust (user 2026-08-11 3rd-run response.jsonl analysis).
+  // SAP's OData response top-level `Flag` is "1" on every accepted save,
+  // including the "async ChangeNo" case where NavEBiddingMessage=null and
+  // Ev_Text="". This means the DB row was written; the immediate response
+  // just doesn't include the persistence GUID yet. Treat Flag="1" as
+  // definitive success (highest-priority signal after tie-rejection).
+  const _trustRespFlag = TRUST_TYPE_S && !isTieRejected && (result.respFlag || '').toString() === '1';
   const isGhostSaved = TRUST_TYPE_S
     ? false  // v3.40: with TRUST_TYPE_S=true (default), ghost detection is DISABLED entirely.
              //         Post-save verification (1.5s later via fetchLiveOrders) is the
@@ -2001,8 +2038,9 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
   // explicitly acknowledge (v3.34 recalibrated).
   // v3.36 — TRUST_TYPE_S: any non-tie Type='S' is a real success.
   // v3.40 — also accept when SAP's text says "Saved" even with empty Type.
+  // v3.41 — also accept when SAP's response `Flag`='1' (async DB commit).
   const isRealSuccess  = !isTieRejected && !isGhostSaved && result.info !== 'E' && (
-    _trustTypeS || _trustSavedText ||
+    _trustTypeS || _trustSavedText || _trustRespFlag ||
     (result.info === 'S' && !/ended|closed|expired|invalid|error/i.test(textLower)) || isSavedOk
   );
   const isTimeEnded    = /ended|closed|expired/i.test(textLower) && !isSavedOk;

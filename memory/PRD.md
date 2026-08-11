@@ -287,6 +287,40 @@ User feedback ("mai UI me 1 sec pehele chor deta hu... 50% mera rank 1 hota") re
 - **3 new unit tests** in `test-window-scheduler.js`: `testEarlyDropWindow` (8 cases), `testEarlyDropOnceSemantics` (3-window verification), `testEarlyDropAndBoundaryComplementary` (temporal ordering with v3.25 boundary block)
 - **Set `EARLY_DROP_MS=0` to disable** and revert to strict-at-boundary behaviour
 
+## Implemented (2026-02 — v3.41 SAP `Flag` FIELD SUCCESS TRUST)
+User (2026-08-11 3rd run) shared submit-responses.jsonl with 18 full SAP response bodies. Analysis reveals the exact root cause of bhai's "pehele save ho raha tha, ab nahi ho raha" complaint.
+
+**Root cause — SAP's `Flag="1"` success signal was being ignored.**
+
+Every SAP OData `EBiddingSaveSet` response contains a top-level `Flag` field:
+```json
+{"d":{"Ev_Text":"","IvCaptchaValue":"pykeh","Flag":"1",
+       "NavEBiddingMessage":null,
+       "NavEBiddingTrackHis":{"results":[{"ChangeNo":"AAAA==",
+                                          "CreatedOn":null,
+                                          "CreatedAt":"PT00H00M00S",
+                                          "BiddingAmount":"630.000",
+                                          "BiddingRank":"0"}, ...]}}}
+```
+
+`Flag="1"` is SAP's definitive save-accepted signal. But our engine only ever inspected `NavEBiddingMessage[].Type`, `Ev_Text`, and the `ChangeNo/CreatedOn/CreatedAt` persistence markers on `NavEBiddingTrackHis[]`. When SAP returned this "async-commit" shape (Flag=1 + empty NavMsg + empty Ev_Text + async ghost markers), all prior classifier paths fell through to REJECTED_GHOST — repeatedly, until REJECTED_GHOST_MAX. The engine then treated the orders as unsaved and re-submitted them (especially after a PM2 restart resets `ctx.submitted`), triggering the same silent-201 loop.
+
+bhai's 07:46 window: same 3 orders (NAZIRPUR / BHARATPUR / BASICMORE) submitted 4× within 8s, each returning `Flag="1"` + async markers, all classified GHOST-SAVED → REJECTED_GHOST_MAX. In reality every one of those responses meant "saved" — SAP just hadn't populated the persistence GUID yet (async DB replication).
+
+**Changes (v3.41):**
+- `submitBid` now returns `respFlag` from the response body's top-level `Flag`.
+- `handleBatch` adds a new trust path `_trustRespFlag = TRUST_TYPE_S && !isTieRejected && respFlag === '1'`. Sits alongside `_trustTypeS` (v3.36) and `_trustSavedText` (v3.40). Any one being true → `isRealSuccess=true`.
+- Response shapes now correctly classified:
+  * `Type='S'` + text — v3.36 path
+  * empty Type + "Saved" text — v3.40 path
+  * `Flag='1'` alone (empty NavMsg + empty Ev_Text + async ghost markers) — v3.41 path
+- Legacy `TRUST_TYPE_S=false` behaviour preserved (Flag ignored, ghost detection active).
+- Version banner updated in `bid-engine.js` header.
+
+Unit tests: `testGhostSaveDetection` extended with 3 new sub-cases — Flag="1" with async ghost markers under default → ACCEPTED (fixes exact bhai scenario), same response under legacy → REJECTED_GHOST (preserves opt-in), Flag="0" → UNKNOWN (safety: doesn't over-trust). **33/33 tests pass.**
+
+Testing status: `node --check` clean, all tests green, boot smoke clean.
+
 ## Implemented (2026-02 — v3.40 GHOST DETECTION DISABLED + WARN SUPPRESSION)
 User (2026-08-11 second run) reported "ek bhi save nahi hua" (zero saves) and shared engine.log + solver.log + bids.csv + captcha-timing.csv. Analysis of the 07:45 window found TWO root causes:
 

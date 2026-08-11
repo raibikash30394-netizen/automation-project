@@ -1,0 +1,36 @@
+timestamp,session,sap_order_id,city,spi,csv_rate,submit_ms,status,message
+2026-08-11T06:19:27.419Z,s1,1154929400,CHATRA,1163,406,200,RATE_HIGH,reduce_by=1
+2026-08-11T06:19:27.419Z,s1,1154929391,CHATRA,1163,406,200,RATE_HIGH,reduce_by=1
+2026-08-11T06:45:01.429Z,s1,1154929666,TALIBPUR,1162,690,340,SAVED_TIED,Same amount has been bid by other vendor for order  id : 5575742449 and posnr: 000102# Same amount has been bid by other vendor for order  id : 5575751563 and posnr: 000102#
+2026-08-11T06:45:01.429Z,s1,1154919752,BALURGHAT,1164,869,340,SAVED_TIED,Same amount has been bid by other vendor for order  id : 5575742449 and posnr: 000102# Same amount has been bid by other vendor for order  id : 5575751563 and posnr: 000102#
+2026-08-11T06:45:01.429Z,s1,1154929409,TALIBPUR,1162,690,340,SAVED_TIED,Same amount has been bid by other vendor for order  id : 5575742449 and posnr: 000102# Same amount has been bid by other vendor for order  id : 5575751563 and posnr: 000102#
+2026-08-11T06:45:02.357Z,s1,1154929437,KANDI,1162,530,772,SAVED_TIED,Same amount has been bid by other vendor for order  id : 5575752327 and posnr: 000101# Same amount has been bid by other vendor for order  id : 5575753195 and posnr: 000101#
+2026-08-11T06:45:02.358Z,s1,1154928776,PATIRAM,1164,833,772,SAVED_TIED,Same amount has been bid by other vendor for order  id : 5575752327 and posnr: 000101# Same amount has been bid by other vendor for order  id : 5575753195 and posnr: 000101#
+2026-08-11T06:45:02.358Z,s1,1154928797,KUSHIDA,1163,792,772,SAVED_TIED,Same amount has been bid by other vendor for order  id : 5575752327 and posnr: 000101# Same amount has been bid by other vendor for order  id : 5575753195 and posnr: 000101#
+2026-08-11T07:45:03.848Z,s1,1154937801,NAZIRPUR(MLD),1164,630,262,SAVED_TIED,Same amount has been bid by other vendor for order  id : 5575756913 and posnr: 000102# Same amount has been bid by other vendor for order  id : 5575759730 and posnr: 000101#
+2026-08-11T07:45:03.848Z,s1,1154932649,BHARATPUR,1162,627,262,SAVED_TIED,Same amount has been bid by other vendor for order  id : 5575756913 and posnr: 000102# Same amount has been bid by other vendor for order  id : 5575759730 and posnr: 000101#
+2026-08-11T07:45:03.848Z,s1,1154937732,TALIBPUR,1162,690,262,SAVED_TIED,Same amount has been bid by other vendor for order  id : 5575756913 and posnr: 000102# Same amount has been bid by other vendor for order  id : 5575759730 and posnr: 000101#
+2026-08-11T07:46:54.564Z,s1,1154937801,NAZIRPUR(MLD),1164,630,246,REJECTED_GHOST,Ghost save (attempt 1/3)
+2026-08-11T07:46:54.565Z,s1,1154932649,BHARATPUR,1162,627,246,REJECTED_GHOST,Ghost save (attempt 1/3)
+2026-08-11T07:46:54.565Z,s1,1154938632,BASICMORE,1163,506,246,REJECTED_GHOST,Ghost save (attempt 1/3)
+2026-08-11T07:46:54.855Z,s1,1154937732,TALIBPUR,1162,690,135,REJECTED_GHOST,Ghost save (attempt 1/3)
+2026-08-11T07:46:55.142Z,s1,1154937732,TALIBPUR,1162,690,134,REJECTED_GHOST,Ghost save (attempt 2/3)
+2026-08-11T07:46:58.040Z,s1,1154937801,NAZIRPUR(MLD),1164,630,167,REJECTED_GHOST,Ghost save (attempt 2/3)
+2026-08-11T07:46:58.040Z,s1,1154932649,BHARATPUR,1162,627,167,REJECTED_GHOST,Ghost save (attempt 2/3)
+2026-08-11T07:46:58.040Z,s1,1154938632,BASICMORE,1163,506,167,REJECTED_GHOST,Ghost save (attempt 2/3)
+2026-08-11T07:46:58.413Z,s1,1154937732,TALIBPUR,1162,690,145,REJECTED_GHOST_MAX,SAP kept ghost-saving after 3 attempts — giving up for this window
+2026-08-11T07:47:01.982Z,s1,1154937801,NAZIRPUR(MLD),1164,630,217,REJECTED_GHOST_MAX,SAP kept ghost-saving after 3 attempts — giving up for this window
+2026-08-11T07:47:01.982Z,s1,1154932649,BHARATPUR,1162,627,217,REJECTED_GHOST_MAX,SAP kept ghost-saving after 3 attempts — giving up for this window
+2026-08-11T07:47:01.982Z,s1,1154938632,BASICMORE,1163,506,217,REJECTED_GHOST_MAX,SAP kept ghost-saving after 3 attempts — giving up for this window
+2026-08-11T08:16:54.691Z,s1,1154937727,JIBANTI,1164,420,201,REJECTED_GHOST,Ghost save (attempt 1/3)
+2026-08-11T08:16:54.691Z,s1,1154941410,KANDI,1162,530,201,REJECTED_GHOST,Ghost save (attempt 1/3)
+2026-08-11T08:16:57.848Z,s1,1154937727,JIBANTI,1164,420,158,REJECTED_GHOST,Ghost save (attempt 2/3)
+2026-08-11T08:16:57.848Z,s1,1154941410,KANDI,1162,530,158,REJECTED_GHOST,Ghost save (attempt 2/3)
+2026-08-11T08:17:00.541Z,s1,1154937727,JIBANTI,1164,420,165,REJECTED_GHOST_MAX,SAP kept ghost-saving after 3 attempts — giving up for this window
+2026-08-11T08:17:00.541Z,s1,1154941410,KANDI,1162,530,165,REJECTED_GHOST_MAX,SAP kept ghost-saving after 3 attempts — giving up for this window
+2026-08-11T08:17:24.750Z,s1,1154937727,JIBANTI,1164,420,176,REJECTED_GHOST,Ghost save (attempt 1/3)
+2026-08-11T08:17:24.750Z,s1,1154941410,KANDI,1162,530,176,REJECTED_GHOST,Ghost save (attempt 1/3)
+2026-08-11T08:17:25.925Z,s1,1154937727,JIBANTI,1164,420,169,REJECTED_GHOST,Ghost save (attempt 2/3)
+2026-08-11T08:17:25.925Z,s1,1154941410,KANDI,1162,530,169,REJECTED_GHOST,Ghost save (attempt 2/3)
+2026-08-11T08:17:27.847Z,s1,1154937727,JIBANTI,1164,420,151,REJECTED_GHOST_MAX,SAP kept ghost-saving after 3 attempts — giving up for this window
+2026-08-11T08:17:27.847Z,s1,1154941410,KANDI,1162,530,151,REJECTED_GHOST_MAX,SAP kept ghost-saving after 3 attempts — giving up for this window

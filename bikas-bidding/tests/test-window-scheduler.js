@@ -1235,14 +1235,14 @@ function testGhostSaveDetection() {
     const evText = (result.evText || '').toString();
     const evTextLower = evText.toLowerCase();
     const isTieRejected = /same\s+(avg\s+)?amount\s+has\s+been\s+bid\s+by\s+other\s+vendor/i.test(evTextLower);
-    // v3.34 — ghost detection: only mark as ghost if hints are ghost AND SAP
-    // did NOT explicitly acknowledge success.
-    // v3.36 — TRUST_TYPE_S upgrade: any Type='S' is trusted unconditionally.
-    // v3.40 — ghost detection is DISABLED entirely when TRUST_TYPE_S=true
-    //   (default). The reference bot (ebidding-secure.js) never inspects
-    //   Type/ChangeNo markers; post-save fetchLiveOrders is the only
-    //   authoritative persistence check. Set opts.trustTypeS=false to
-    //   restore v3.34 conditional ghost detection.
+    // v3.34 → v3.41 evolution:
+    // • v3.34: only mark ghost when hints=ghost AND SAP did NOT ack success
+    // • v3.36: TRUST_TYPE_S — any Type='S' trusted unconditionally
+    // • v3.40: ghost detection fully DISABLED under TRUST_TYPE_S=true;
+    //          _trustSavedText added (text-based ack even with empty Type)
+    // • v3.41: _trustRespFlag added (SAP top-level Flag='1' is the
+    //          strongest success signal, works for responses with
+    //          empty NavMsg + empty Ev_Text + async persistence markers)
     const _ghostMarkerHints = (result.rankHints || []).filter((h) => h.isGhostRecord);
     const _allHintsAreGhost = _ghostMarkerHints.length > 0 && _ghostMarkerHints.length === (result.rankHints || []).length;
     const _sapExplicitSuccess = (
@@ -1256,12 +1256,13 @@ function testGhostSaveDetection() {
       /saved\s*successfully|bid.*accepted|save.*success/i.test(result.text || '') ||
       /saved\s*successfully|bid.*accepted|save.*success/i.test(evText)
     );
+    const _trustRespFlag = TRUST_TYPE_S && !isTieRejected && (result.respFlag || '').toString() === '1';
     const isGhostSaved = TRUST_TYPE_S
       ? false
       : (_allHintsAreGhost && !_sapExplicitSuccess);
     const isSavedOk = /saved successfully|bid.*accepted|success/i.test(textLower);
     const isRealSuccess = !isTieRejected && !isGhostSaved && result.info !== 'E' && (
-      _trustTypeS || _trustSavedText ||
+      _trustTypeS || _trustSavedText || _trustRespFlag ||
       (result.info === 'S' && !/ended|closed|expired|invalid|error/i.test(textLower)) || isSavedOk
     );
     if (isTieRejected) return 'REJECTED_TIE';
@@ -1426,7 +1427,47 @@ function testGhostSaveDetection() {
     'v3.40: empty Type + "Saved" text → ACCEPTED (fixes bhai 2026-08-11 07:45 3-order rejection)'
   );
 
-  console.log('✓ Ghost-save detection (v3.34+v3.36+v3.40): all cases pass — text-based "Saved" trust closes the empty-Type gap that caused bhai\'s 07:45 zero-save outcome');
+  // Case 9 (v3.41 — bhai 2026-08-11 3rd run exact response):
+  //   SAP returned: statusCode=201, Flag="1", Ev_Text="",
+  //   NavEBiddingMessage=null (empty), and NavEBiddingTrackHis with
+  //   ChangeNo="AAAA==", CreatedOn=null, CreatedAt="PT0S". All prior
+  //   builds classified this as REJECTED_GHOST / UNKNOWN. v3.41 uses
+  //   the top-level `Flag` field as the primary success signal.
+  const asyncGhostHints = [hint({ ghost: true }), hint({ ghost: true }), hint({ ghost: true })];
+  assert.strictEqual(
+    classify({
+      statusCode: 201,
+      info: '',      // empty NavMsg (no message)
+      text: '',      // no message text at all
+      evText: '',    // no Ev_Text
+      respFlag: '1', // SAP's top-level success flag
+      rankHints: asyncGhostHints,
+    }, { trustTypeS: true }),
+    'ACCEPTED',
+    'v3.41: SAP `Flag="1"` + empty NavMsg + async ghost markers → ACCEPTED (fixes bhai 2026-08-11 07:46 REJECTED_GHOST_MAX)'
+  );
+  // Under legacy TRUST_TYPE_S=false, the same response is REJECTED_GHOST
+  // (v3.34 semantics) — legacy behaviour preserved.
+  assert.strictEqual(
+    classify({
+      statusCode: 201, info: '', text: '', evText: '', respFlag: '1',
+      rankHints: asyncGhostHints,
+    }, { trustTypeS: false }),
+    'REJECTED_GHOST',
+    'v3.41 legacy (TRUST_TYPE_S=false): async ghost markers still rejected (proves fix is opt-in-by-default only)'
+  );
+  // Flag="0" (explicit failure marker) should NOT be trusted even with
+  // TRUST_TYPE_S=true.
+  assert.strictEqual(
+    classify({
+      statusCode: 201, info: '', text: '', evText: '', respFlag: '0',
+      rankHints: asyncGhostHints,
+    }, { trustTypeS: true }),
+    'UNKNOWN',
+    'v3.41 safety: respFlag="0" (not "1") does NOT trigger _trustRespFlag; falls through to UNKNOWN'
+  );
+
+  console.log('✓ Ghost-save detection (v3.34+v3.36+v3.40+v3.41): all cases pass — SAP top-level Flag="1" + async persistence markers now correctly classified as ACCEPTED, closing bhai\'s 07:46/08:16 REJECTED_GHOST_MAX loop');
 }
 
 // v3.36 — INFO_INSTANT_RETRY parity with ebidding-secure.js#submitBids.
