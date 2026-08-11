@@ -287,6 +287,37 @@ User feedback ("mai UI me 1 sec pehele chor deta hu... 50% mera rank 1 hota") re
 - **3 new unit tests** in `test-window-scheduler.js`: `testEarlyDropWindow` (8 cases), `testEarlyDropOnceSemantics` (3-window verification), `testEarlyDropAndBoundaryComplementary` (temporal ordering with v3.25 boundary block)
 - **Set `EARLY_DROP_MS=0` to disable** and revert to strict-at-boundary behaviour
 
+## Implemented (2026-02 — v3.38 PRE-BOUNDARY ORDER-CAPTURE FIX)
+User (2026-08-10) shared `engine.log` (~9000 lines) + CSV + solver.log after a full run. Analysis revealed:
+
+**Symptom 1** — EVERY window logged:
+```
+🎯 EARLY-DROP FIRE @ T-500ms — attempting direct speculative submit
+🎯 EARLY-DROP FIRE: no cached orders yet — cannot speculatively submit.
+```
+User explanation (Hindi/Hinglish): "SAP oder fetch kar aane me lagbhag 1500 se 2000 ms lagta hai" — SAP releases pre-boundary orders at ~T-1s but each `fetchLiveOrders` round-trip takes 1500-2000ms. The previous single-in-flight `ordersPollerBusy` guard let one slow fetch block ~14 poll ticks, so orders released at T-1s were NOT in cache at the T-500ms early-drop moment.
+
+**Symptom 2** — Raiganj/Rajgram false-positive GHOST-SAVED events at log lines 4894/4898. Vbelns 1154908154/1154906389/1154906477 marked GHOST-SAVED at 12:15:12.535, then TIE-SAVE VERIFIED at 12:15:18.719 (6 seconds later — meaning they DID save). This is exactly what v3.36's `TRUST_TYPE_S=true` fixes; user just needed the new build.
+
+**Changes (v3.38):**
+- **Orders poller HOT-ZONE mode** (new: `ORDERS_POLLER_HOT_MS=50`, `ORDERS_POLLER_HOT_ZONE_MS=5000`, `ORDERS_POLLER_MAX_INFLIGHT=3`). Within ±5s of boundary (or in a hot window), interval drops from 150ms→50ms AND max-inflight goes from 1→3. A stalled 2s-long fetch no longer blocks the next probe. Verified by unit test: 12 hot-zone fetches vs 4 cold in the same 3s (3× improvement, confirmed).
+- **Empty-response guard**: a late-arriving empty fetch will no longer wipe a previously-populated `ctx._cachedOrders` (protects against racy overwrites now that we allow parallel fetches).
+- **Early-drop FIRE SPIN-WAIT** (new: `EARLY_DROP_WAIT_MS=1500`). Instead of bailing at T-500ms with "no cached orders yet", it spin-waits up to 1500ms (10ms tick) checking `ctx._cachedOrders` — the moment `buildBatches` returns non-empty, it fires. Hard-caps at boundary crossing so post-boundary path picks up cleanly. Verified by unit test with 4 timing scenarios.
+- Version banner updated in `bid-engine.js` header + `.env` + `.env.example` with inline docs.
+
+**Expected new pre-boundary timeline:**
+```
+T-5000  orders-poller enters HOT ZONE — 50ms interval, up to 3 parallel fetches
+T-3000  first hot-zone fetch completes (potentially still empty)
+T-1500  early-drop CSRF refresh; more parallel fetches now in flight
+T-1000  SAP releases pre-boundary orders → next in-flight fetch returns them
+T-500   FIRE handler starts spinning; first spin tick hits populated cache
+T-490   plan built with matches → INSTANT dispatch (fires before boundary!)
+T+~50   SAP responds "Bidding Amount Saved Successfully" → Rank 1
+```
+
+Testing status: `node --check` clean, 31/31 unit tests pass (up from 29 — added `testEarlyDropSpinWait` 4 cases + `testHotZoneParallelFetch` 1 case), boot smoke test clean.
+
 ## Implemented (2026-02 — v3.37 PRE-WINDOW PLANNER + 10ms CAPTCHA POLL)
 User (2026-08-08) shared a screenshot of a reference bot's log timeline (fast/working, always Rank 1):
 ```

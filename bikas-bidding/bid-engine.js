@@ -3,6 +3,34 @@
 /**
  * bid-engine.js — Bikas Bidding v2 main bot
  *
+ * v3.38 — PRE-BOUNDARY ORDER-CAPTURE FIX (user 2026-08-10 log analysis):
+ *   User's engine.log showed EVERY window logging:
+ *     "🎯 EARLY-DROP FIRE @ T-500ms — attempting direct speculative submit"
+ *     "🎯 EARLY-DROP FIRE: no cached orders yet — cannot speculatively submit."
+ *   User explained SAP releases pre-boundary orders at ~T-1s and each
+ *   fetchLiveOrders round-trip takes 1500-2000ms; the previous single-in-flight
+ *   busy-guard let one slow fetch block ~14 poll ticks so the T-500ms
+ *   probe consistently missed the release moment.
+ *
+ *   Changes:
+ *   • Orders poller HOT-ZONE mode: within ±5s of boundary (or in a hot
+ *     window), interval drops from 150ms→50ms AND max-inflight goes from
+ *     1→3. A stalled 2s-long fetch no longer blocks the next probe; SAP's
+ *     pre-boundary release moment gets multiple parallel probes.
+ *   • Empty-response guard: a late-arriving empty fetch will no longer
+ *     wipe a previously-populated `ctx._cachedOrders` (protects against
+ *     racy overwrites now that we allow parallel fetches).
+ *   • Early-drop FIRE now SPIN-WAITS for a matched cached-orders list
+ *     (EARLY_DROP_WAIT_MS=1500 default, 10ms tick). Instead of bailing at
+ *     T-500ms, it keeps checking every 10ms — the moment the parallel
+ *     orders-poller populates the cache with a non-empty matched list,
+ *     it fires. Hard-caps at boundary crossing so post-boundary path
+ *     picks up cleanly.
+ *   • Also picks up v3.36 TRUST_TYPE_S fix — Raiganj/Rajgram GHOST-SAVED
+ *     false-positives observed in the user's 2026-08-10 log (Vbelns
+ *     1154908154/1154906389/1154906477 were retried as ghost then verified
+ *     as persisted 6s later) are eliminated.
+ *
  * v3.37 — PRE-WINDOW PLANNER + 10 ms CAPTCHA POLL (user 2026-08-08 log analysis):
  *   User shared a screenshot of a reference bot's timeline:
  *     10:44:59  ✓ Bid order list fetched: 40 orders
@@ -2608,16 +2636,38 @@ async function main() {
   // reuses `_cachedOrders` when fresh (<5 scans old).
   const ORDERS_POLLER_INTERVAL = parseInt(process.env.ORDERS_POLLER_MS || '150', 10);
   const ORDERS_POLLER_LEAD_MS  = parseInt(process.env.ORDERS_POLLER_LEAD_MS || '90000', 10);
+  // v3.38 — HOT-ZONE aggressive polling parameters (user 2026-08-10 log
+  // analysis). SAP fetches take 1500-2000ms; the busy-guard let ONE slow
+  // fetch block ~14 poll ticks so orders released at T-1s weren't visible
+  // by the T-500ms early-drop moment ("no cached orders yet" warnings
+  // every window). Fix: within ±ORDERS_POLLER_HOT_ZONE_MS of the boundary,
+  // allow up to N parallel fetches at a faster interval so a slow fetch
+  // no longer stalls the poller.
+  const ORDERS_POLLER_HOT_INTERVAL   = parseInt(process.env.ORDERS_POLLER_HOT_MS      || '50',   10);
+  const ORDERS_POLLER_HOT_ZONE_MS    = parseInt(process.env.ORDERS_POLLER_HOT_ZONE_MS || '5000', 10);
+  const ORDERS_POLLER_MAX_INFLIGHT   = parseInt(process.env.ORDERS_POLLER_MAX_INFLIGHT || '3',    10);
   if (ORDERS_POLLER_INTERVAL <= 0) {
     log.info(`🔎 Independent orders poller DISABLED (ORDERS_POLLER_MS=0)`);
   } else {
-    let ordersPollerBusy = false;
+    let ordersInflight = 0;                // v3.38 — replaces boolean busy-flag
+    let lastOrdersFetchAt = 0;             // v3.38 — throttle when cold
     const ordersPollerHandle = setInterval(async () => {
-      if (ordersPollerBusy) return;
       const untilN = msUntilNextWindow();
-      if (untilN > ORDERS_POLLER_LEAD_MS && !isHotWindow()) return;
+      const inHotZone = untilN <= ORDERS_POLLER_HOT_ZONE_MS || isHotWindow();
+      // Cold zone: keep the original busy-guard (1 inflight at a time,
+      // stagger to `ORDERS_POLLER_INTERVAL`). Hot zone: up to N parallel
+      // fetches at `ORDERS_POLLER_HOT_INTERVAL` — the point is that SAP
+      // releases orders in a very narrow T-1s→T+500ms window and each
+      // fetch takes 1500-2000ms, so a single blocking fetch would miss it.
+      if (untilN > ORDERS_POLLER_LEAD_MS && !inHotZone) return;
       if (wafActive()) return;
-      ordersPollerBusy = true;
+      const now = Date.now();
+      const minGap = inHotZone ? ORDERS_POLLER_HOT_INTERVAL : ORDERS_POLLER_INTERVAL;
+      if (now - lastOrdersFetchAt < minGap) return;
+      const maxInflight = inHotZone ? ORDERS_POLLER_MAX_INFLIGHT : 1;
+      if (ordersInflight >= maxInflight) return;
+      lastOrdersFetchAt = now;
+      ordersInflight++;
       try {
         const primary = ctx.sessions[0];
         if (!primary || !primary.cookie) return;
@@ -2626,8 +2676,14 @@ async function main() {
         const t0 = Date.now();
         const res = await fetchLiveOrders(primary);
         const orders = res.orders || [];
-        ctx._cachedOrders = orders;
-        ctx._cachedOrdersScan = ctx.scan;
+        // Only overwrite the cache if this fetch actually returned data OR
+        // if it's the first fetch for this window (prevents a late-arriving
+        // empty response from wiping a previously-populated cache).
+        if (orders.length > 0 || !ctx._cachedOrders || !ctx._cachedOrders.length) {
+          ctx._cachedOrders = orders;
+          ctx._cachedOrdersScan = ctx.scan;
+          ctx._cachedOrdersAt = Date.now();
+        }
         const winKey = Math.floor((Date.now() + untilN) / 60_000);
         // Log the first non-empty scan per window so we can see order-list
         // publication latency in the log (mirrors captcha-timing telemetry).
@@ -2686,11 +2742,11 @@ async function main() {
       } catch (e) {
         // silent — poller must never crash the process
       } finally {
-        ordersPollerBusy = false;
+        ordersInflight--;
       }
-    }, ORDERS_POLLER_INTERVAL);
+    }, Math.min(ORDERS_POLLER_INTERVAL, ORDERS_POLLER_HOT_INTERVAL));
     ordersPollerHandle.unref?.();
-    log.info(`🔎 Independent orders poller ACTIVE (interval=${ORDERS_POLLER_INTERVAL}ms, activates ${ORDERS_POLLER_LEAD_MS/1000}s before each :15/:45 window)`);
+    log.info(`🔎 Independent orders poller ACTIVE (cold=${ORDERS_POLLER_INTERVAL}ms, hot=${ORDERS_POLLER_HOT_INTERVAL}ms within ±${ORDERS_POLLER_HOT_ZONE_MS}ms of boundary, max ${ORDERS_POLLER_MAX_INFLIGHT} parallel fetches; activates ${ORDERS_POLLER_LEAD_MS/1000}s before each :15/:45 window)`);
   }
 
   // Main polling loop.
@@ -2783,24 +2839,55 @@ async function main() {
         // straight to submitBid using the cached matched-bids from the last
         // successful scan. Only viable when EvCaptchaFlag='' (fastpath).
         try {
-          if (!ctx._cachedOrders || !ctx._cachedOrders.length) {
-            log.warn(`🎯 EARLY-DROP FIRE: no cached orders yet — cannot speculatively submit. Will rely on post-boundary tick() path.`);
-            return;
-          }
+          // v3.38 — SPIN-WAIT for orders to arrive (user 2026-08-10 log analysis).
+          //
+          // Previous behaviour: if `_cachedOrders` was empty at the exact
+          // T-500ms tick, we bailed out and fell back to post-boundary tick().
+          // But SAP releases orders ~1s pre-boundary and each fetch takes
+          // 1500-2000ms — so at T-500ms the orders-poller's most recent
+          // completed fetch was almost always the T-2500ms probe (empty).
+          // Result: EVERY window logged "no cached orders yet" and missed
+          // the pre-boundary submit opportunity.
+          //
+          // Fix: instead of bailing, spin-wait up to EARLY_DROP_WAIT_MS
+          // (default 1500ms) checking every 10ms — the moment the parallel
+          // hot-zone orders-poller populates the cache with a non-empty list
+          // and buildBatches finds a match, we fire IMMEDIATELY. Includes a
+          // hard timeout so we never fire past the boundary here.
+          const EARLY_DROP_WAIT_MS = parseInt(process.env.EARLY_DROP_WAIT_MS || '1500', 10);
+          const spinStartAt = Date.now();
+          const spinDeadline = spinStartAt + EARLY_DROP_WAIT_MS;
           const primary = ctx.sessions[0];
-          if (primary._lastCaptchaFlag === 'X') {
+          const captchaRequired = primary && primary._lastCaptchaFlag === 'X';
+          if (captchaRequired) {
             log.warn(`🎯 EARLY-DROP FIRE: SAP requires captcha (EvCaptchaFlag='X') — cannot fire pre-boundary without captcha unlock. Skipping speculative submit; falling back to normal post-boundary path.`);
             return;
           }
-          const { plan, stats } = buildBatches(
-            ctx._cachedOrders, ctx.rules, ctx.blacklist, ctx.submitted, ctx.inFlight, ctx.cooldown,
-            ctx.sessions.length, ctx.priorityVbelns
-          );
-          if (!plan.length) {
-            log.warn(`🎯 EARLY-DROP FIRE: no matched bids in cache (matched=${stats.matched}). Falling back.`);
+          let plan = null, stats = null;
+          let spinAttempts = 0;
+          while (Date.now() < spinDeadline) {
+            spinAttempts++;
+            if (ctx._cachedOrders && ctx._cachedOrders.length) {
+              const built = buildBatches(
+                ctx._cachedOrders, ctx.rules, ctx.blacklist, ctx.submitted, ctx.inFlight, ctx.cooldown,
+                ctx.sessions.length, ctx.priorityVbelns
+              );
+              if (built.plan.length) {
+                plan = built.plan;
+                stats = built.stats;
+                break;
+              }
+            }
+            // Guard: if the boundary has passed while spinning, exit — the
+            // regular boundary/instant-submit-from-poller path will pick up.
+            if (msUntilNextWindow() < 0) break;
+            await new Promise((r) => setTimeout(r, 10));
+          }
+          if (!plan) {
+            log.warn(`🎯 EARLY-DROP FIRE: spin-wait ${Date.now() - spinStartAt}ms (${spinAttempts} attempts), no matched cached orders — falling back to boundary path. cachedOrders=${ctx._cachedOrders?.length || 0}, T=${msUntilNextWindow()}ms.`);
             return;
           }
-          log.info(`🎯 EARLY-DROP FIRE: dispatching ${plan.length} batch(es), ${stats.matched} matched from cache (fastpath EvCaptchaFlag='')`);
+          log.info(`🎯 EARLY-DROP FIRE: dispatching ${plan.length} batch(es), ${stats.matched} matched from cache (fastpath EvCaptchaFlag='', spin=${Date.now() - spinStartAt}ms, ${spinAttempts} attempts, T-${msUntilNextWindow()}ms)`);
           const workerCtx = { ...ctx, plan };
           const workers = makeWorkerPool(workerCtx);
           await Promise.all(workers).catch(() => {});

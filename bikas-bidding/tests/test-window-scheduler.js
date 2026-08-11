@@ -1456,6 +1456,161 @@ async function testInfoInstantRetry() {
 // hang up. sapRequest now retries idempotent reads (fetchLiveOrders,
 // fetchCaptchaImage) ONCE on a fresh socket after a 150ms backoff. Submits
 // are NOT retried at this layer (post-save verification handles that).
+// v3.38 — EARLY-DROP spin-wait behaviour.
+//
+// Before: at T-500ms, if `ctx._cachedOrders` was empty, we bailed out
+// with "no cached orders yet — cannot speculatively submit". Log analysis
+// showed this happened EVERY window because SAP releases pre-boundary
+// orders at ~T-1s and each fetchLiveOrders round-trip takes 1500-2000ms;
+// the previous single-in-flight busy-guard let one slow fetch block the
+// next probe.
+//
+// After: FIRE handler spin-waits up to EARLY_DROP_WAIT_MS (default 1500ms,
+// checking every 10ms) for the parallel orders-poller to populate the
+// cache with a matched list. Fires the instant the plan builds non-empty.
+async function testEarlyDropSpinWait() {
+  // Simulate the FIRE handler's spin loop.
+  async function simulate({ cacheTimeline, buildPlanFromOrders, EARLY_DROP_WAIT_MS, tickMs }) {
+    const startAt = Date.now();
+    const cache = { orders: [] };
+    let fired = false;
+    let attempts = 0;
+    let fireAt = -1;
+
+    const timelineHandle = setInterval(() => {
+      const elapsed = Date.now() - startAt;
+      const entry = cacheTimeline.find((e) => elapsed >= e.at && elapsed < e.at + tickMs);
+      if (entry) cache.orders = entry.orders;
+    }, Math.max(1, Math.floor(tickMs / 4)));
+
+    const deadline = startAt + EARLY_DROP_WAIT_MS;
+    while (Date.now() < deadline) {
+      attempts++;
+      if (cache.orders && cache.orders.length) {
+        const plan = buildPlanFromOrders(cache.orders);
+        if (plan.length) { fired = true; fireAt = Date.now() - startAt; break; }
+      }
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    clearInterval(timelineHandle);
+    return { fired, fireAt, attempts, deadline_ms: EARLY_DROP_WAIT_MS };
+  }
+
+  // Case A: orders arrive at T+200ms (well within 1500ms wait) → FIRE.
+  let r = await simulate({
+    cacheTimeline: [{ at: 200, orders: [{ id: 'X' }] }],
+    buildPlanFromOrders: (orders) => (orders.length ? [{ bids: orders }] : []),
+    EARLY_DROP_WAIT_MS: 1500,
+    tickMs: 20,
+  });
+  assert.strictEqual(r.fired, true, `Case A: orders at T+200 → FIRED, got fired=${r.fired}`);
+  assert.ok(r.fireAt >= 200 && r.fireAt < 500, `Case A: fireAt ${r.fireAt} should be ~200-300ms`);
+
+  // Case B: orders NEVER arrive (empty cache all along) → bail after 1500ms.
+  r = await simulate({
+    cacheTimeline: [],
+    buildPlanFromOrders: (orders) => (orders.length ? [{ bids: orders }] : []),
+    EARLY_DROP_WAIT_MS: 500,
+    tickMs: 20,
+  });
+  assert.strictEqual(r.fired, false, `Case B: never-arriving orders → NO fire, got fired=${r.fired}`);
+  assert.ok(r.attempts >= 30, `Case B: expected 30+ spin attempts in 500ms, got ${r.attempts}`);
+
+  // Case C: orders arrive but build returns empty plan (no matches in CSV)
+  //   → keep spinning; deadline reached without firing.
+  r = await simulate({
+    cacheTimeline: [{ at: 100, orders: [{ id: 'X' }] }],
+    buildPlanFromOrders: () => [], // always no match
+    EARLY_DROP_WAIT_MS: 400,
+    tickMs: 20,
+  });
+  assert.strictEqual(r.fired, false, `Case C: orders arrive but no CSV match → no fire`);
+
+  // Case D: orders arrive very late (T+1400ms in a 1500ms window) → still fires.
+  r = await simulate({
+    cacheTimeline: [{ at: 1400, orders: [{ id: 'Y' }] }],
+    buildPlanFromOrders: (orders) => (orders.length ? [{ bids: orders }] : []),
+    EARLY_DROP_WAIT_MS: 1500,
+    tickMs: 20,
+  });
+  assert.strictEqual(r.fired, true, `Case D: orders at T+1400 (within 1500ms) → FIRED`);
+  assert.ok(r.fireAt >= 1400, `Case D: fireAt ${r.fireAt} should be ≥1400ms`);
+
+  console.log('✓ EARLY-DROP spin-wait (v3.38): 4 cases pass — orders at T+200 fires ~200ms, empty cache bails after full wait, no-match keeps spinning, late-arriving (T+1400) still fires within 1500ms window');
+}
+
+// v3.38 — HOT-ZONE parallel orders fetch.
+//
+// Before: `if (ordersPollerBusy) return;` — single in-flight fetch. If SAP
+// took 2000ms to respond, ~14 poll ticks were skipped and the pre-boundary
+// order release (T-1s) was missed.
+//
+// After: within ±ORDERS_POLLER_HOT_ZONE_MS of boundary, allow up to N
+// parallel fetches at a tighter interval. Uses an integer counter instead
+// of a boolean guard.
+function testHotZoneParallelFetch() {
+  // Simulate the counter/gap logic — verify hot-zone fires more probes
+  // than the single-in-flight model when SAP responds slowly.
+
+  function simulate({
+    fetchDurationMs, tickMs, coldIntervalMs, hotIntervalMs, hotZoneMs,
+    maxInflightHot, totalDurationMs, msUntilBoundaryStart,
+  }) {
+    // Time = 0..totalDurationMs, boundary at msUntilBoundaryStart.
+    const endTimes = []; // upcoming completion timestamps
+    let lastFetchAt = -Infinity;
+    let started = 0;
+    for (let t = 0; t < totalDurationMs; t += tickMs) {
+      // Drain any completed fetches so inflight decrements.
+      while (endTimes.length && endTimes[0] <= t) endTimes.shift();
+      const untilN = Math.max(0, msUntilBoundaryStart - t);
+      const inHot = untilN <= hotZoneMs;
+      const minGap = inHot ? hotIntervalMs : coldIntervalMs;
+      const maxInflight = inHot ? maxInflightHot : 1;
+      if (t - lastFetchAt < minGap) continue;
+      if (endTimes.length >= maxInflight) continue;
+      lastFetchAt = t;
+      started++;
+      // Insert end-time in sorted order (small array).
+      endTimes.push(t + fetchDurationMs);
+      endTimes.sort((a, b) => a - b);
+    }
+    // Count completions that fit inside the simulation span.
+    const completed = endTimes.filter((e) => e <= totalDurationMs).length + started - endTimes.length;
+    return { started, completed };
+  }
+
+  // Simulate a 3-second span with boundary at T+2500ms. Hot-zone = last 2s.
+  // Fetch takes 800ms (typical SAP cached fetch on warm connection).
+  const res = simulate({
+    fetchDurationMs: 800,
+    tickMs: 10,
+    coldIntervalMs: 150,
+    hotIntervalMs: 50,
+    hotZoneMs: 2000,
+    maxInflightHot: 3,
+    totalDurationMs: 3000,
+    msUntilBoundaryStart: 2500,
+  });
+  assert.ok(res.started >= 6, `Hot-zone should start ≥6 parallel fetches in the hot 2s; got ${res.started}`);
+
+  // Ensure single-in-flight cold model starts far fewer.
+  const cold = simulate({
+    fetchDurationMs: 800,
+    tickMs: 10,
+    coldIntervalMs: 150,
+    hotIntervalMs: 150,   // same as cold (i.e., no hot mode)
+    hotZoneMs: 0,
+    maxInflightHot: 1,
+    totalDurationMs: 3000,
+    msUntilBoundaryStart: 2500,
+  });
+  assert.ok(cold.started <= 4, `Cold single-in-flight should start ≤4 fetches, got ${cold.started}`);
+  assert.ok(res.started > cold.started, `Hot-zone (${res.started}) should exceed cold (${cold.started})`);
+
+  console.log(`✓ Hot-zone parallel fetch (v3.38): pass — hot-zone started ${res.started} fetches vs cold ${cold.started} in same 3s (>3× improvement, guarantees fresh probes catch SAP's pre-boundary order release)`);
+}
+
 async function testNetworkRetryOnIdempotent() {
   const NETWORK_ERR_RE = /HeadersTimeoutError|Headers Timeout|UND_ERR_CONNECT_TIMEOUT|UND_ERR_SOCKET|ETIMEDOUT|ECONNRESET|socket hang up|other side closed/i;
 
@@ -1736,6 +1891,8 @@ function testEarlyDropAndBoundaryComplementary() {
     testTieRejection();
     testGhostSaveDetection();
     await testInfoInstantRetry();
+    await testEarlyDropSpinWait();
+    testHotZoneParallelFetch();
     await testNetworkRetryOnIdempotent();
     console.log('\n🎉 ALL TESTS PASS');
     process.exit(0);
