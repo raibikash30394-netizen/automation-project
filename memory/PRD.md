@@ -287,6 +287,38 @@ User feedback ("mai UI me 1 sec pehele chor deta hu... 50% mera rank 1 hota") re
 - **3 new unit tests** in `test-window-scheduler.js`: `testEarlyDropWindow` (8 cases), `testEarlyDropOnceSemantics` (3-window verification), `testEarlyDropAndBoundaryComplementary` (temporal ordering with v3.25 boundary block)
 - **Set `EARLY_DROP_MS=0` to disable** and revert to strict-at-boundary behaviour
 
+## Implemented (2026-02 — v3.43 LATE-SAVE + CAPTCHA-FAIL FIXES)
+User (2026-08-11 5th run) reported: "save kar raha hai lekin itna let pata nahi q… amarapara save he nahi hua kya galti ho raha hai." Analysis of the 11:15 window log revealed TWO independent bugs:
+
+**Bug 1 — Pre-window plan wiped at boundary → 9s save delay.**
+Timeline:
+```
+T-1753ms  pre-window planner cached 27 orders + built 3-match plan
+T-0       BOUNDARY reached — old code wiped _cachedOrders + _cachedPlan
+T+430ms   captcha unlocked (via cap-poller)
+T+430ms   cap-poller saw _cachedOrders=null → INLINE order-fetch
+T+5000ms  inline fetch returned (SAP LB slow) → build plan
+T+5000ms  submit fired
+T+8878ms  SAP responded "SAVED-TIED" (3878ms latency, tie at rank 3+)
+```
+Root cause: (a) boundary clear at line 3240 nulled `ctx._cachedOrders`, and (b) `havePreBuilt` in cap-poller INSTANT-SUBMIT required exact `_planBuiltForWinKey === winKey` — but winKey changes AT boundary by definition, invalidating fresh plans right when we needed them most.
+
+**Bug 2 — AMRAPARA "Captcha Validation Failed" + Flag="1" misclassified as ACCEPTED.**
+SAP returned `Ev_Text="Captcha Validation Failed. Worng Captcha Value."` + top-level `Flag="1"`. v3.41's flag-trust ACCEPTED this response — the batch was added to submitted map, never retried, and shown as "SAVED" in bids.csv even though SAP rejected the captcha. Two AMRAPARA orders were never actually saved.
+
+**Changes (v3.43):**
+- `isWrongCaptcha` regex now runs BEFORE Flag/text trust checks and matches BOTH `textLower` AND `evTextLower` (SAP puts the wrong-captcha error in Ev_Text, not top-level Message).
+- `isRealSuccess` explicitly includes `!isWrongCaptcha` — Flag="1" or "Saved" text cannot override a wrong-captcha error.
+- Boundary clear NO LONGER wipes `ctx._cachedOrders` / `ctx._cachedPlan`. Pre-window orders reflect the same window's bid set (SAP just flips them from "future" to "active" at boundary; vbelns/amounts stay identical). Keeping them lets cap-poller submit INSTANTLY.
+- `havePreBuilt` guard relaxed to age-based: `planAge <= 10_000ms`. New `_cachedPlanBuiltAt` timestamp recorded when pre-window planner runs.
+- **Renamed** LOG_LEVEL → LOG_MODE (env var) to avoid pino conflict (pino's built-in LOG_LEVEL only accepts info/warn/error/etc; "quiet"/"demon" crashed the process).
+
+Unit tests: `testCaptchaFailBeatsFlagTrust` (4 subcases including bhai's exact 11:15 AMRAPARA response — WRONG_CAPTCHA verdict; textLower fallback; legit save unchanged; Flag="0" safety). `testPreWindowPlanSurvivesBoundary` (6 subcases: fresh 500ms plan REUSE; bhai's 1753ms plan REUSE; 5s REUSE; 9999ms REUSE; 10500ms REBUILD; no-plan REBUILD). **35/35 tests pass** (was 33).
+
+**Bug-testing agent verdict: FIXED.** Also spotted a config bug: duplicate `LOG_LEVEL` lines in .env — cleaned up with proper LOG_MODE / pino LOG_LEVEL separation.
+
+Testing status: `node --check` clean, all 35 tests pass, boot smoke clean with `LOG_MODE=quiet` + `LOG_LEVEL=info` env active.
+
 ## Implemented (2026-02 — v3.42 QUIET/DEMON LOG MODE)
 User (2026-08-11 4th run) shared engine log + bids.csv + submit-responses.jsonl and requested: "bekar ka log jo jada likha hua aa raha usko kam karo, lod badne se slow kam kare ga, log jitna halka utna smooth hoga sab tik karo" (reduce excessive logging, high volume slows things down under load).
 

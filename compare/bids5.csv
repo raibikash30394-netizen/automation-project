@@ -1,0 +1,8 @@
+timestamp,session,sap_order_id,city,spi,csv_rate,submit_ms,status,message
+2026-08-11T10:15:58.752Z,s1,1154947953,RAJGRAM,1163,424,156,ACCEPTED,rank=0 L1=? submitted=424.000 | OK
+2026-08-11T10:17:12.199Z,s1,1154947953,RAJGRAM,1163,424,270,SAVED_TIED,Same amount has been bid by other vendor for order  id : 5575767149 and posnr: 000101#
+2026-08-11T11:15:09.301Z,s1,1154947939,TALIBPUR,1163,644,3878,SAVED_TIED,Same amount has been bid by other vendor for order  id : 5575766873 and posnr: 000101# Same amount has been bid by other vendor for order  id : 5575770635 and posnr: 000101# Same amount has been bid by other vendor for order  id : 5575770878 and posnr: 000101#
+2026-08-11T11:15:09.301Z,s1,1154952905,GAZOLE,1164,651,3878,SAVED_TIED,Same amount has been bid by other vendor for order  id : 5575766873 and posnr: 000101# Same amount has been bid by other vendor for order  id : 5575770635 and posnr: 000101# Same amount has been bid by other vendor for order  id : 5575770878 and posnr: 000101#
+2026-08-11T11:15:09.301Z,s1,1154953517,BALURGHAT,1164,869,3878,SAVED_TIED,Same amount has been bid by other vendor for order  id : 5575766873 and posnr: 000101# Same amount has been bid by other vendor for order  id : 5575770635 and posnr: 000101# Same amount has been bid by other vendor for order  id : 5575770878 and posnr: 000101#
+2026-08-11T11:15:18.034Z,s1,1154953662,AMRAPARA,1162,567,706,ACCEPTED,rank=0 L1=? submitted=567.000 | Captcha Validation Failed. Worng Captcha Value.
+2026-08-11T11:15:18.035Z,s1,1154953664,AMRAPARA,1162,567,706,ACCEPTED,rank=0 L1=? submitted=567.000 | Captcha Validation Failed. Worng Captcha Value.

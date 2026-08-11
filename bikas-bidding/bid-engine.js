@@ -3,6 +3,38 @@
 /**
  * bid-engine.js — Bikas Bidding v2 main bot
  *
+ * v3.43 — LATE-SAVE + CAPTCHA-FAIL-AS-ACCEPTED FIXES (user 2026-08-11 5th run:
+ *         "save kar raha hai lekin itna let pata nahi q... amarapara save he
+ *         nahi hua"):
+ *   bhai's 11:15 window timeline:
+ *     T-1753ms  pre-window planner cached 27 orders + built 3-match plan
+ *     T-0       BOUNDARY reached — old code wiped _cachedOrders/_cachedPlan
+ *     T+430ms   captcha unlocked (via cap-poller)
+ *     T+430ms   cap-poller saw _cachedOrders=null → INLINE order-fetch
+ *     T+5000ms  inline fetch returned (SAP LB slow) → build plan
+ *     T+5000ms  submit fired
+ *     T+8878ms  SAP responded "SAVED-TIED" (3878ms latency, tie at rank 3+)
+ *   Then AMRAPARA batch fired at T+17s with fresh captcha → SAP responded
+ *   Ev_Text="Captcha Validation Failed. Worng Captcha Value." + Flag="1"
+ *   → v3.41 flag-trust classified as ACCEPTED (wrong!) → orders added to
+ *   submitted, never retried → user saw no AMRAPARA save.
+ *
+ *   Changes:
+ *   • CAPTCHA-FAIL detection now runs BEFORE Flag/text success trust.
+ *     isWrongCaptcha matches both textLower AND evTextLower (SAP puts the
+ *     wrong-captcha message in Ev_Text). isRealSuccess explicitly
+ *     !isWrongCaptcha — Flag="1" or "Saved" text cannot override a
+ *     wrong-captcha error. Fixes AMRAPARA false-accept.
+ *   • Boundary clear no longer wipes ctx._cachedOrders / ctx._cachedPlan.
+ *     Pre-window orders reflect the same window's bid set — SAP just flips
+ *     them from "future" to "active" at boundary; vbelns/amounts/customers
+ *     stay identical. Keeping them lets cap-poller submit INSTANTLY on
+ *     captcha unlock.
+ *   • havePreBuilt guard relaxed from strict winKey match to age-based
+ *     (planAge ≤ 10s). winKey changes AT boundary by definition — the
+ *     strict guard invalidated fresh plans right when we needed them
+ *     most. New _cachedPlanBuiltAt timestamp records build time.
+ *
  * v3.42 — QUIET/DEMON LOG MODE (user 2026-08-11 4th run: "bekar ka log
  *         jo jada likha hua aa raha usko kam karo, lod badne se slow
  *         kam kare ga, log jitna halka utna smooth hoga"):
@@ -380,9 +412,12 @@ const SKIP_RANK_PREVIEW   = String(process.env.SKIP_RANK_PREVIEW || 'true').toLo
 const TRUST_TYPE_S           = String(process.env.TRUST_TYPE_S || 'true').toLowerCase() === 'true';
 const INFO_INSTANT_RETRY_MAX = parseInt(process.env.INFO_INSTANT_RETRY_MAX || '5', 10);
 
-// v3.42 — LOG_LEVEL knob (user 2026-08-11 4th run: "bekar ka log jo jada
+// v3.42 — LOG_MODE knob (user 2026-08-11 4th run: "bekar ka log jo jada
 // likha hua aa raha usko kam karo, lod badne se slow kam kare ga, log
-// jitna halka utna smooth hoga").
+// jitna halka utna smooth hoga").  IMPORTANT: named LOG_MODE (not
+// LOG_LEVEL) to avoid colliding with pino's built-in LOG_LEVEL env
+// (which only accepts trace/debug/info/warn/error/fatal — pino throws
+// "default level:quiet must be included in custom levels" if we reuse it).
 //   'normal' (default)  — full verbosity (every session-shake, every
 //                         CSRF refresh, every 10s waiting-for-orders log,
 //                         30s metrics ping, all pre-window + cap-poller
@@ -394,7 +429,7 @@ const INFO_INSTANT_RETRY_MAX = parseInt(process.env.INFO_INSTANT_RETRY_MAX || '5
 //                         session-shake, CSRF-token-saved, pre-window
 //                         planner, orders-poller first-seen). Reduces log
 //                         volume ~90%.
-const LOG_LEVEL_RAW = String(process.env.LOG_LEVEL || 'normal').toLowerCase();
+const LOG_LEVEL_RAW = String(process.env.LOG_MODE || process.env.LOG_LEVEL_MODE || 'normal').toLowerCase();
 const QUIET_MODE    = LOG_LEVEL_RAW === 'quiet' || LOG_LEVEL_RAW === 'demon';
 // Helpers so hot paths can cheaply opt-in to reduced verbosity.
 const qlog = {
@@ -2083,6 +2118,14 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
     : (_allHintsAreGhost && !_sapExplicitSuccess);
 
   const isSavedOk      = /saved successfully|bid.*accepted|success/i.test(textLower);
+  // v3.43 CRITICAL — captcha-error detection MUST run BEFORE Flag/text trust
+  // so wrong-captcha responses (which SAP sometimes stamps with Flag="1")
+  // are correctly classified. bhai's 2026-08-11 11:15 AMRAPARA batch got
+  // Ev_Text="Captcha Validation Failed. Worng Captcha Value." + Flag="1"
+  // and was wrongly classified as ACCEPTED by v3.41. Both textLower AND
+  // evTextLower are checked (SAP may put the captcha error in either).
+  const isWrongCaptcha = /captcha.*(fail|wrong|invalid)|worng\s*captcha/i.test(textLower)
+                      || /captcha.*(fail|wrong|invalid)|worng\s*captcha/i.test(evTextLower);
   // isRealSuccess must NOT trigger when SAP flags Type='E' with a tie-reject
   // Ev_Text — even if Message cosmetically says "Saved Successfully" — OR when
   // the response only contains ghost persistence markers AND SAP did not
@@ -2090,12 +2133,14 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
   // v3.36 — TRUST_TYPE_S: any non-tie Type='S' is a real success.
   // v3.40 — also accept when SAP's text says "Saved" even with empty Type.
   // v3.41 — also accept when SAP's response `Flag`='1' (async DB commit).
-  const isRealSuccess  = !isTieRejected && !isGhostSaved && result.info !== 'E' && (
+  // v3.43 — ALSO reject when isWrongCaptcha even if Flag="1" or text-trust
+  //   would have accepted. Prevents the AMRAPARA "captcha-failed but
+  //   Flag=1 present" case from being marked ACCEPTED.
+  const isRealSuccess  = !isTieRejected && !isGhostSaved && !isWrongCaptcha && result.info !== 'E' && (
     _trustTypeS || _trustSavedText || _trustRespFlag ||
     (result.info === 'S' && !/ended|closed|expired|invalid|error/i.test(textLower)) || isSavedOk
   );
   const isTimeEnded    = /ended|closed|expired/i.test(textLower) && !isSavedOk;
-  const isWrongCaptcha = /captcha.*(fail|wrong|invalid)|worng\s*captcha/i.test(textLower);
   const reduceBy       = parseReduceAmount(evText || result.text);
   const minFloor       = parseMinFloor(evText || result.text);
 
@@ -2873,10 +2918,20 @@ async function main() {
               // at T-1500ms (parity with ebidding-secure.js). If we have a
               // cached plan for this same window, skip the buildBatches
               // step (~5-20ms saved). Otherwise build inline as fallback.
+              // v3.43 — winKey-match guard RELAXED to age-based (≤10s). At
+              // boundary crossing winKey changes by definition; the old
+              // guard invalidated a fresh (T-1753ms) pre-window plan
+              // 430ms after boundary, forcing a 5s inline SAP fetch and
+              // producing a 9s save delay. Age-based reuse is safe
+              // because pre-window orders reflect the same window's
+              // published bid set (SAP just flips them from "future" to
+              // "active" at boundary; the vbelns/amounts/customers stay
+              // identical). Submitted-map filter in buildBatches (if we
+              // rebuild anyway) keeps duplicate submits out.
               let plan, stats;
+              const planAge = ctx._cachedPlanBuiltAt ? (Date.now() - ctx._cachedPlanBuiltAt) : Infinity;
               const havePreBuilt = (
-                ctx._cachedPlan && ctx._cachedPlan.length &&
-                ctx._planBuiltForWinKey === winKey
+                ctx._cachedPlan && ctx._cachedPlan.length && planAge <= 10_000
               );
               if (havePreBuilt) {
                 plan = ctx._cachedPlan;
@@ -3019,6 +3074,7 @@ async function main() {
             );
             ctx._cachedPlan = plan;
             ctx._cachedPlanStats = stats;
+            ctx._cachedPlanBuiltAt = Date.now(); // v3.43 — age-based reuse guard
             qlog.info(`[pre-window] ✓ Bid order list fetched: ${orders.length} orders (T-${untilN}ms)`);
             qlog.info(`[pre-window] ✓ CSV matching: ${stats.matched} rows matched across ${plan.length} groups`);
             if (plan.length) {
@@ -3227,7 +3283,21 @@ async function main() {
       const clearedUc  = ctx.undercutAttempts.size;
       ctx.undercutAttempts.clear();
       ctx.ghostRetries.clear();  // v3.25: reset per-window ghost-retry counters
-      ctx._cachedOrders = null; // force fresh order fetch for new window
+      // v3.43 CRITICAL FIX — DO NOT wipe ctx._cachedOrders / ctx._cachedPlan
+      // at boundary crossing. bhai's 2026-08-11 11:15 log showed the exact
+      // race this caused:
+      //   T-1753ms  pre-window planner cached 27 orders + built 3-match plan
+      //   T-0      boundary clear wiped _cachedOrders + _cachedPlan
+      //   T+430ms  captcha unlocked; cap-poller saw _cachedOrders=null
+      //   T+430ms  cap-poller kicked off INLINE order-fetch (~5000ms SAP)
+      //   T+5000ms inline fetch returned; submit finally fired
+      //   T+8878ms SAP saved (3878ms submit latency)
+      // Total: 9-second delay for a save that should've been ~500ms.
+      // With this fix, cap-poller reuses the pre-window plan directly
+      // (winKey guard also relaxed below).
+      ctx._cachedOrders_lastBoundary = ctx._cachedOrders; // keep reference for stats
+      // Note: orders-poller and cap-poller will refresh _cachedOrders naturally
+      // within 50-150ms via the hot-zone parallel fetches (v3.38).
       // v3.32 — Record boundary timestamp for captcha-timing telemetry (used
       // by nextCaptcha() to compute per-window unlock latency).
       globalThis.__lastBoundaryMs = Date.now();

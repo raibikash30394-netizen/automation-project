@@ -1752,6 +1752,112 @@ function testExactMatchPolicies() {
   console.log('✓ EXACT-MATCH policies (v3.39): 8 cases pass — blacklist ignores "TRADERS vs CONSTRUCTION" false-positive under exact mode, still catches genuine delete-list entries; CSV rule mode blocks "KANDI vs KANDIGRAM" partial hits by default');
 }
 
+// v3.43 — Captcha-fail-as-accepted regression test.
+//
+// bhai's 2026-08-11 11:15 AMRAPARA batch: SAP returned
+//   Ev_Text = "Captcha Validation Failed. Worng Captcha Value."
+//   Flag    = "1"
+// v3.41's flag-trust classified this as ACCEPTED. v3.43 checks
+// isWrongCaptcha FIRST (in both textLower and evTextLower) — so any
+// captcha error correctly returns UNKNOWN (which triggers retry).
+function testCaptchaFailBeatsFlagTrust() {
+  function classify(result, opts = {}) {
+    const TRUST_TYPE_S = opts.trustTypeS !== false;
+    const textLower = (result.text || '').toString().toLowerCase();
+    const evText = (result.evText || '').toString();
+    const evTextLower = evText.toLowerCase();
+    const isTieRejected = /same\s+(avg\s+)?amount\s+has\s+been\s+bid\s+by\s+other\s+vendor/i.test(evTextLower);
+    const _trustTypeS = TRUST_TYPE_S && result.info === 'S' && !isTieRejected;
+    const _trustSavedText = TRUST_TYPE_S && !isTieRejected && (
+      /saved\s*successfully|bid.*accepted|save.*success/i.test(result.text || '') ||
+      /saved\s*successfully|bid.*accepted|save.*success/i.test(evText)
+    );
+    const _trustRespFlag = TRUST_TYPE_S && !isTieRejected && (result.respFlag || '').toString() === '1';
+    const isSavedOk = /saved successfully|bid.*accepted|success/i.test(textLower);
+    // v3.43 — check wrong-captcha in BOTH textLower AND evTextLower.
+    const isWrongCaptcha = /captcha.*(fail|wrong|invalid)|worng\s*captcha/i.test(textLower)
+                        || /captcha.*(fail|wrong|invalid)|worng\s*captcha/i.test(evTextLower);
+    const isRealSuccess = !isTieRejected && !isWrongCaptcha && result.info !== 'E' && (
+      _trustTypeS || _trustSavedText || _trustRespFlag ||
+      (result.info === 'S' && !/ended|closed|expired|invalid|error/i.test(textLower)) || isSavedOk
+    );
+    if (isTieRejected) return 'REJECTED_TIE';
+    if (isWrongCaptcha) return 'WRONG_CAPTCHA';
+    if (isRealSuccess) return 'ACCEPTED';
+    return 'UNKNOWN';
+  }
+
+  // Case A: bhai's exact 11:15 AMRAPARA response — Ev_Text says captcha
+  //   failed, Flag="1", no other message. Expected: WRONG_CAPTCHA (retry).
+  assert.strictEqual(
+    classify({
+      statusCode: 201, info: '', text: '',
+      evText: 'Captcha Validation Failed. Worng Captcha Value.',
+      respFlag: '1',
+      rankHints: [],
+    }, { trustTypeS: true }),
+    'WRONG_CAPTCHA',
+    'v3.43: SAP Ev_Text "Captcha Validation Failed" + Flag="1" → WRONG_CAPTCHA (was falsely ACCEPTED in v3.41)'
+  );
+
+  // Case B: same message but in top-level text (defensive). Expected: WRONG_CAPTCHA.
+  assert.strictEqual(
+    classify({
+      statusCode: 201, info: 'E', text: 'Worng Captcha Value.',
+      evText: '', respFlag: '1', rankHints: [],
+    }, { trustTypeS: true }),
+    'WRONG_CAPTCHA',
+    'v3.43: Wrong-captcha message in textLower still triggers WRONG_CAPTCHA'
+  );
+
+  // Case C: legit success (Flag=1, no captcha error) still ACCEPTED.
+  assert.strictEqual(
+    classify({
+      statusCode: 201, info: '', text: '', evText: '', respFlag: '1', rankHints: [],
+    }, { trustTypeS: true }),
+    'ACCEPTED',
+    'v3.43: Flag="1" with no captcha error still ACCEPTED (legit save path preserved)'
+  );
+
+  // Case D: captcha error text but Flag="0" — still WRONG_CAPTCHA, not
+  //   silently accepted. Sanity: legacy Flag-0 path unaffected.
+  assert.strictEqual(
+    classify({
+      statusCode: 201, info: '', text: '',
+      evText: 'Captcha Validation Failed.', respFlag: '0', rankHints: [],
+    }, { trustTypeS: true }),
+    'WRONG_CAPTCHA',
+    'v3.43: Wrong-captcha error takes precedence over Flag="0" too'
+  );
+
+  console.log('✓ Captcha-fail beats flag-trust (v3.43): 4 cases pass — Ev_Text "Captcha Validation Failed" no longer classified as ACCEPTED when Flag="1"');
+}
+
+// v3.43 — Pre-window plan survives boundary crossing.
+//
+// bhai's 11:15 window: pre-window plan built at T-1753ms was invalidated
+// at T-0 (boundary clear + winKey change), forcing cap-poller into a 5s
+// inline order-fetch → 9s total save delay. v3.43 uses age-based reuse
+// (plan valid for ≤10s) so cap-poller keeps using the pre-window plan.
+function testPreWindowPlanSurvivesBoundary() {
+  const now = Date.now();
+  const cases = [
+    { built: now - 500,  desc: 'fresh plan (500ms old)', expected: true },
+    { built: now - 1753, desc: "bhai's 11:15 exact age (1753ms — was invalidated by v3.42)", expected: true },
+    { built: now - 5000, desc: '5s old plan', expected: true },
+    { built: now - 9999, desc: '~10s old plan (just under limit)', expected: true },
+    { built: now - 10500, desc: '10.5s old plan (past limit)', expected: false },
+    { built: null, desc: 'no plan built yet', expected: false },
+  ];
+  for (const c of cases) {
+    const planAge = c.built ? (now - c.built) : Infinity;
+    const havePreBuilt = c.built && planAge <= 10_000;
+    assert.strictEqual(!!havePreBuilt, c.expected,
+      `v3.43 age-based plan reuse: ${c.desc} → ${c.expected ? 'REUSE' : 'REBUILD'}, got ${havePreBuilt ? 'REUSE' : 'REBUILD'}`);
+  }
+  console.log('✓ Pre-window plan survives boundary (v3.43): 6 cases pass — plans up to 10s old are reused, older plans force rebuild; boundary crossing no longer invalidates fresh pre-window plans');
+}
+
 async function testNetworkRetryOnIdempotent() {
   const NETWORK_ERR_RE = /HeadersTimeoutError|Headers Timeout|UND_ERR_CONNECT_TIMEOUT|UND_ERR_SOCKET|ETIMEDOUT|ECONNRESET|socket hang up|other side closed/i;
 
@@ -2035,6 +2141,8 @@ function testEarlyDropAndBoundaryComplementary() {
     await testEarlyDropSpinWait();
     testHotZoneParallelFetch();
     testExactMatchPolicies();
+    testCaptchaFailBeatsFlagTrust();
+    testPreWindowPlanSurvivesBoundary();
     await testNetworkRetryOnIdempotent();
     console.log('\n🎉 ALL TESTS PASS');
     process.exit(0);
