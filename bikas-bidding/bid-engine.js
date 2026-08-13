@@ -3,6 +3,55 @@
 /**
  * bid-engine.js — Bikas Bidding v2 main bot
  *
+ * v3.46 — v3.45 ROLLBACK + SPI PRIORITY + AUDIT LOG + CONTINUOUS PIPELINE
+ *         (user 2026-08-13 8th run: "rank 2 or 3 picha nahi chor raha" +
+ *         "SPI 1164 ko bhaut jada priroty dena" + "ek alag se all time
+ *         oder fetch kare … save karne wala batch bana bana k … save
+ *         karta rahe ga" + "ek or log bana do … or do din se jada
+ *         purana log apane aap delet ho jaye"):
+ *
+ *   Bhai's 07:15 IST log shows v3.45 REGRESSION: 3 parallel captcha
+ *   probes caused SAP to rotate the active captcha in flight → first
+ *   submit hit WRONG CAPTCHA at T+292ms → retry 1 hit WRONG CAPTCHA
+ *   again → 3rd attempt finally SAVED-TIED at T+2740ms. That 2.7-second
+ *   retry loop is what let the competitor claim rank 1.
+ *
+ *   Changes:
+ *   1. HOT-PARALLEL DEFAULT ROLLED BACK from 3 to 1 (single-flight).
+ *      Users who want to experiment can set CAPTCHA_POLLER_HOT_PARALLEL=2/3
+ *      manually but default is now safe.
+ *
+ *   2. SPI-PRIORITY TIER — matched orders with SPI in HIGH_PRIORITY_SPI
+ *      (default "1164") get the TOP submission slot, ABOVE Vbeln
+ *      priority.csv. Three tiers now: SPI → VBELN → NORMAL. Clubs
+ *      atomic-promote to SPI tier if ANY member has a high-priority SPI.
+ *
+ *   3. ORDER AUDIT LOG — new `logs/order-audit-YYYY-MM-DD.csv` with per-
+ *      order lifecycle: SEEN (when bot first saw the order in SAP feed,
+ *      with t_boundary_ms), SUBMITTED (batch details, priority tier),
+ *      RESPONSE (SAP classification + Ev_Text). Covers user's ask
+ *      "kab kon sa oder ghusa or kya hit kiya".
+ *
+ *   4. LOG RETENTION — `LOG_RETENTION_DAYS` (default 2). On startup +
+ *      every 6h, any file in `logs/` older than the cutoff is deleted.
+ *      Auto-cleans bids-*.csv, captcha-timing-*.csv, order-audit-*.csv,
+ *      submit-responses-*.jsonl, engine.log.YYYY-MM-DD.N, etc.
+ *
+ *   5. CONTINUOUS FETCH+SUBMIT PIPELINE — cap-poller no longer stops
+ *      after firing exactly once per window. New orders arriving AFTER
+ *      the first INSTANT-SUBMIT now trigger successive INSTANT-SUBMITs
+ *      (throttled to 1 per POLLER_MIN_DISPATCH_GAP_MS, default 400ms).
+ *      Cap-poller keeps re-solving captchas after each `pc.consumed`
+ *      so the next batch has a fresh captcha ready. Guarded by
+ *      `_pollerActiveSubmits` counter — will NOT fetch a new captcha
+ *      while a previous submit is still in flight (that's what caused
+ *      the v3.45 wrong-captcha race).
+ *
+ *      Result: producer-consumer pipeline. orders-poller = fetcher,
+ *      cap-poller = submitter. As long as SAP keeps publishing new
+ *      matched orders during the :15-:19 / :45-:49 hot window, they
+ *      get submitted with minimum latency.
+ *
  * v3.45 — HOT-ZONE PARALLEL CAPTCHA PROBES (user 2026-08-11 7th run:
  *         "rank 2 or 3 hua hai lekin save 45:00 me nahi hua ya 15:00 me
  *         ek sec let ho ne se sayed ye ho raha hai … ager 00 me save
@@ -990,6 +1039,120 @@ const captchaTimingLog = (() => {
   };
 })();
 
+/**
+ * v3.46 — ORDER AUDIT LOG (user 2026-08-13 directive: "ek or log bana do
+ * kab kon sa oder ghusa or kya hit kiya system kon sa kya mila ye sab").
+ *
+ * Full per-order lifecycle audit: when the bot FIRST SAW the order in SAP
+ * (T relative to :15/:45 boundary), whether the order matched CSV rules,
+ * why it was skipped (blacklist / no-rule / cooldown / already submitted),
+ * priority tier (SPI-priority / Vbeln-priority / normal), what batch it
+ * was queued into, when the submit fired, SAP's raw response text, and
+ * the final classification (ACCEPTED / SAVED_TIED / WRONG_CAPTCHA /
+ * REJECTED / etc).
+ *
+ * One CSV per day: `logs/order-audit-YYYY-MM-DD.csv`. Columns:
+ *   • ts                    — ISO timestamp of THIS event
+ *   • event                 — SEEN | MATCHED | SKIPPED | QUEUED | SUBMITTED | RESPONSE
+ *   • sap_order_id          — the SAP order id (unique key)
+ *   • vbeln                 — COF order id (blank if not exposed)
+ *   • dest                  — destination city (as SAP returned it)
+ *   • spi                   — special process indicator
+ *   • club_id               — club group id (blank for singles)
+ *   • customer              — KUNAG name (short — first 40 chars)
+ *   • csv_rate              — matched CSV amount (blank if not matched)
+ *   • priority_tier         — SPI | VBELN | NORMAL | -
+ *   • t_boundary_ms         — ms from most-recent :15/:45 boundary
+ *                             (negative = pre-boundary, positive = post)
+ *   • batch_id              — internal batch identifier
+ *   • status                — event-specific (e.g. ACCEPTED, TIED, WRONG_CAPTCHA)
+ *   • detail                — free-form (SAP Ev_Text, skip reason, etc.)
+ */
+const orderAuditLog = (() => {
+  const dir = path.join(ROOT, 'logs');
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  let currentDate = '';
+  let stream = null;
+  const HEADER = 'ts,event,sap_order_id,vbeln,dest,spi,club_id,customer,csv_rate,priority_tier,t_boundary_ms,batch_id,status,detail\n';
+  function open() {
+    const today = new Date().toISOString().slice(0, 10);
+    if (today === currentDate && stream) return stream;
+    if (stream) { try { stream.end(); } catch (_) { /* ignore */ } }
+    currentDate = today;
+    const file = path.join(dir, `order-audit-${today}.csv`);
+    const exists = fs.existsSync(file);
+    stream = fs.createWriteStream(file, { flags: 'a' });
+    if (!exists) stream.write(HEADER);
+    return stream;
+  }
+  function esc(v) {
+    const s = String(v == null ? '' : v);
+    if (s.includes(',') || s.includes('"') || s.includes('\n')) {
+      return '"' + s.replace(/"/g, '""') + '"';
+    }
+    return s;
+  }
+  return {
+    write(row) {
+      try {
+        const s = open();
+        s.write([
+          row.ts || new Date().toISOString(),
+          row.event || '',
+          row.sap_order_id || '',
+          row.vbeln || '',
+          row.dest || '',
+          row.spi || '',
+          row.club_id || '',
+          (row.customer || '').toString().slice(0, 40),
+          row.csv_rate ?? '',
+          row.priority_tier || '-',
+          row.t_boundary_ms ?? '',
+          row.batch_id || '',
+          row.status || '',
+          row.detail || '',
+        ].map(esc).join(',') + '\n');
+      } catch (_) { /* never let logging break bidding */ }
+    },
+  };
+})();
+
+/**
+ * v3.46 — LOG RETENTION (user 2026-08-13 directive: "do din se jada
+ * purana log apane aap delet ho jaye ye bhi kar dena").
+ *
+ * On engine startup, delete any file inside `logs/` whose mtime is older
+ * than LOG_RETENTION_DAYS (default 2). Also runs every 6 hours in the
+ * background so long-lived processes stay tidy. Matches all rotating
+ * files (bids-*.csv, captcha-timing-*.csv, order-audit-*.csv, engine.log.*
+ * from pino daily-rotate, submit-responses.jsonl if manually rotated).
+ * The active/day-current files are kept via mtime check (recently
+ * touched files pass).
+ */
+const LOG_RETENTION_DAYS = parseInt(process.env.LOG_RETENTION_DAYS || '2', 10);
+function purgeOldLogs() {
+  try {
+    const dir = path.join(ROOT, 'logs');
+    if (!fs.existsSync(dir)) return;
+    const cutoffMs = Date.now() - LOG_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+    let purged = 0;
+    for (const name of fs.readdirSync(dir)) {
+      const full = path.join(dir, name);
+      try {
+        const st = fs.statSync(full);
+        if (!st.isFile()) continue;
+        if (st.mtimeMs < cutoffMs) {
+          fs.unlinkSync(full);
+          purged++;
+        }
+      } catch (_) { /* ignore per-file errors */ }
+    }
+    if (purged > 0) log.info(`🧹 log retention: purged ${purged} file(s) older than ${LOG_RETENTION_DAYS} day(s) from logs/`);
+  } catch (e) {
+    log.warn(`log retention purge failed: ${e.message}`);
+  }
+}
+
 // ---- Small SAP request helper (with 403 CSRF-refresh once) ----------------
 //
 // If the SAP cookie itself has expired/been invalidated (different browser
@@ -1742,8 +1905,17 @@ function parseMinFloor(text) {
 function buildBatches(orders, rules, blacklist, seenSubmitted, inFlight, cooldown, sessionCount = 1, priorityVbelns = null) {
   const now = Date.now();
   const byClub = new Map();
-  const stats = { total: orders.length, matched: 0, blacklisted: 0, noRule: 0, clubDropped: 0, coolskip: 0, priority: 0 };
+  const stats = { total: orders.length, matched: 0, blacklisted: 0, noRule: 0, clubDropped: 0, coolskip: 0, priority: 0, spiPriority: 0 };
   const priSet = priorityVbelns instanceof Set ? priorityVbelns : new Set();
+
+  // v3.46 — HIGH-PRIORITY SPI TIER (user 2026-08-13 directive: "Special
+  // Process Indi 1164 ko bhaut jada priroty dena he hai"). Any matched
+  // order whose SPI is in HIGH_PRIORITY_SPIS gets the TOP tier —
+  // submitted BEFORE Vbeln priority.csv orders and before everything
+  // else. Configured via HIGH_PRIORITY_SPI env (comma-separated).
+  // Default: "1164".
+  const HIGH_PRI_SPI_RAW = (process.env.HIGH_PRIORITY_SPI ?? '1164').toString();
+  const highPriSpiSet = new Set(HIGH_PRI_SPI_RAW.split(',').map((s) => s.trim()).filter(Boolean));
 
   // Pre-sort rule cities: longest first → "KRISHNANAGAR - STO" wins over "KRISHNANAGAR"
   const ruleCitiesByLen = Array.from(rules.keys()).sort((a, b) => b.length - a.length);
@@ -1785,6 +1957,14 @@ function buildBatches(orders, rules, blacklist, seenSubmitted, inFlight, cooldow
     return Boolean(sid && priSet.has(sid));
   };
 
+  // v3.46 — Helper: does this MATCHED order carry a high-priority SPI?
+  // Uses the SPI as resolved by matchOrder (m.matchedSpi), which normalises
+  // SAP's various SPI field aliases (SPI/Spi/SpecialProcessInd/Zspi).
+  const isHighPriSpi = (matchedSpi) => {
+    if (!highPriSpiSet.size) return false;
+    return highPriSpiSet.has(String(matchedSpi || '').trim());
+  };
+
   for (const [club, members] of byClub.entries()) {
     if (!club) {
       for (const o of members) {
@@ -1816,14 +1996,17 @@ function buildBatches(orders, rules, blacklist, seenSubmitted, inFlight, cooldow
         }
         stats.matched++;
         const priority = isPriorityOrder(o);
-        if (priority) stats.priority++;
-        singles.push({ order: o, amount: m.amount, city: m.matchedCity, spi: m.matchedSpi, priority });
+        const spiPriority = isHighPriSpi(m.matchedSpi);
+        if (spiPriority) stats.spiPriority++;
+        else if (priority) stats.priority++;
+        singles.push({ order: o, amount: m.amount, city: m.matchedCity, spi: m.matchedSpi, priority, spiPriority });
       }
     } else {
       const items = [];
       let drop = false;
       let dropReason = '';
       let clubPriority = false;
+      let clubSpiPriority = false;
       for (const o of members) {
         if (isCustomerBlacklisted(o, blacklist)) {
           drop = true;
@@ -1837,6 +2020,7 @@ function buildBatches(orders, rules, blacklist, seenSubmitted, inFlight, cooldow
           break;
         }
         if (isPriorityOrder(o)) clubPriority = true;
+        if (isHighPriSpi(m.matchedSpi)) clubSpiPriority = true;
         items.push({ order: o, amount: m.amount, city: m.matchedCity, spi: m.matchedSpi });
       }
       if (drop) {
@@ -1846,10 +2030,11 @@ function buildBatches(orders, rules, blacklist, seenSubmitted, inFlight, cooldow
       }
       else if (items.length) {
         stats.matched += items.length;
-        if (clubPriority) stats.priority += items.length;
+        if (clubSpiPriority) stats.spiPriority += items.length;
+        else if (clubPriority) stats.priority += items.length;
         // clubs also split at BATCH_SIZE (SAP hard-limit 3 per submit)
         for (let i = 0; i < items.length; i += BATCH_SIZE) {
-          clubGroups.push({ clubId: club, bids: items.slice(i, i + BATCH_SIZE), priority: clubPriority });
+          clubGroups.push({ clubId: club, bids: items.slice(i, i + BATCH_SIZE), priority: clubPriority, spiPriority: clubSpiPriority });
         }
       }
     }
@@ -1870,12 +2055,16 @@ function buildBatches(orders, rules, blacklist, seenSubmitted, inFlight, cooldow
   const effectiveBatchSize = BATCH_SIZE;
 
   // Stable partition: preserve original discovery order within each bucket.
-  // (Priority Vbelns must go FIRST so they're hitting SAP within the first
-  //  ~300 ms of the window; but we don't reshuffle among priority items.)
-  const singlesPriority    = singles.filter((s) => s.priority);
-  const singlesNonPriority = singles.filter((s) => !s.priority);
-  const clubsPriority      = clubGroups.filter((c) => c.priority);
-  const clubsNonPriority   = clubGroups.filter((c) => !c.priority);
+  // v3.46 — THREE tiers (highest → lowest):
+  //   1) SPI-priority (HIGH_PRIORITY_SPI, default "1164")
+  //   2) Vbeln-priority (priority.csv / PRIORITY_VBELNS env)
+  //   3) Non-priority (rest)
+  const singlesSpiPri      = singles.filter((s) => s.spiPriority);
+  const singlesVbelnPri    = singles.filter((s) => !s.spiPriority && s.priority);
+  const singlesNonPriority = singles.filter((s) => !s.spiPriority && !s.priority);
+  const clubsSpiPri        = clubGroups.filter((c) => c.spiPriority);
+  const clubsVbelnPri      = clubGroups.filter((c) => !c.spiPriority && c.priority);
+  const clubsNonPriority   = clubGroups.filter((c) => !c.spiPriority && !c.priority);
 
   const packSingles = (arr) => {
     const out = [];
@@ -1884,17 +2073,21 @@ function buildBatches(orders, rules, blacklist, seenSubmitted, inFlight, cooldow
     }
     return out;
   };
-  const singleBatchesP = packSingles(singlesPriority);
-  const singleBatchesN = packSingles(singlesNonPriority);
+  const singleBatchesS  = packSingles(singlesSpiPri);
+  const singleBatchesP  = packSingles(singlesVbelnPri);
+  const singleBatchesN  = packSingles(singlesNonPriority);
 
-  // Order: priority-singles → priority-clubs → non-priority-singles → non-priority-clubs
-  // Rationale: within priority tier, singles still pack-3 per SAP call (fewest
-  // calls = fastest); then priority clubs; then everything else.
+  // Order: SPI-singles → SPI-clubs → Vbeln-singles → Vbeln-clubs → rest.
+  // Rationale: SPI-priority orders (e.g. 1164) MUST hit SAP first — user
+  // wants max chance of Rank 1 on those. Singles pack 3-per-call for
+  // minimum SAP round-trips within each tier.
   const plan = [];
-  for (const b of singleBatchesP) plan.push({ kind: 'single', bids: b, priority: true });
-  for (const c of clubsPriority)  plan.push({ kind: 'club',   bids: c.bids, clubId: c.clubId, priority: true });
-  for (const b of singleBatchesN) plan.push({ kind: 'single', bids: b, priority: false });
-  for (const c of clubsNonPriority) plan.push({ kind: 'club', bids: c.bids, clubId: c.clubId, priority: false });
+  for (const b of singleBatchesS) plan.push({ kind: 'single', bids: b, priority: true, spiPriority: true });
+  for (const c of clubsSpiPri)    plan.push({ kind: 'club',   bids: c.bids, clubId: c.clubId, priority: true, spiPriority: true });
+  for (const b of singleBatchesP) plan.push({ kind: 'single', bids: b, priority: true, spiPriority: false });
+  for (const c of clubsVbelnPri)  plan.push({ kind: 'club',   bids: c.bids, clubId: c.clubId, priority: true, spiPriority: false });
+  for (const b of singleBatchesN) plan.push({ kind: 'single', bids: b, priority: false, spiPriority: false });
+  for (const c of clubsNonPriority) plan.push({ kind: 'club', bids: c.bids, clubId: c.clubId, priority: false, spiPriority: false });
 
   // v3.44 — DYNAMIC ORDER-SHIFT PROTECTION (user 2026-08-11: "new order
   // ghusega toh kabhi kabhi wo uper ya niche kahi chala jata hai jise
@@ -2115,6 +2308,31 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
   const list = item.bids.map((b) => `${b.order.SapOrderId}[${b.city}/${b.spi}]@${b.amount}`).join(', ');
   log.info(`[${workerId}] → ${item.kind.toUpperCase()}${item.clubId ? ' id=' + item.clubId : ''} (${item.bids.length}): ${list}`);
 
+  // v3.46 — audit log: SUBMITTED event, once per handleBatch call. batchId
+  // is short-lived (per-attempt) so retries create distinct rows.
+  const batchId = `${workerId}-${item.kind}${item.clubId ? '#' + item.clubId : ''}-${Date.now().toString(36)}`;
+  try {
+    const boundaryMs = globalThis.__lastBoundaryMs || 0;
+    const tier = item.spiPriority ? 'SPI' : (item.priority ? 'VBELN' : 'NORMAL');
+    for (const b of item.bids) {
+      orderAuditLog.write({
+        event: 'SUBMITTED',
+        sap_order_id: b.order.SapOrderId,
+        vbeln: b.order.Vbeln || b.order.CofOrderId || '',
+        dest: b.city,
+        spi: b.spi,
+        club_id: item.clubId || '',
+        customer: b.order.KunagName1 || b.order.KunweName1 || '',
+        csv_rate: b.amount,
+        priority_tier: tier,
+        t_boundary_ms: boundaryMs > 0 ? Date.now() - boundaryMs : '',
+        batch_id: batchId,
+        status: retryDepth > 0 ? `RETRY_${retryDepth}` : 'FIRST',
+        detail: `kind=${item.kind} bids=${item.bids.length} captcha_len=${(solved||'').length}`,
+      });
+    }
+  } catch (_) { /* never let audit break bidding */ }
+
   const bids = item.bids.map((b) => ({
     sapOrderId: b.order.SapOrderId,
     amount    : b.amount,
@@ -2242,10 +2460,33 @@ async function handleBatch(ctx, session, item, solved, workerId, retryDepth = 0)
   const reduceBy       = parseReduceAmount(evText || result.text);
   const minFloor       = parseMinFloor(evText || result.text);
 
-  const bidLogRow = (b, status, message) => bidLog.write({
-    session: workerId, sap_order_id: b.order.SapOrderId, city: b.city, spi: b.spi,
-    csv_rate: b.amount, submit_ms: result.submitMs, status, message,
-  });
+  const bidLogRow = (b, status, message) => {
+    bidLog.write({
+      session: workerId, sap_order_id: b.order.SapOrderId, city: b.city, spi: b.spi,
+      csv_rate: b.amount, submit_ms: result.submitMs, status, message,
+    });
+    // v3.46 — mirror the classification into the order-audit CSV so the
+    // full lifecycle (SEEN → SUBMITTED → RESPONSE) is queryable per order.
+    try {
+      const boundaryMs = globalThis.__lastBoundaryMs || 0;
+      const tier = item.spiPriority ? 'SPI' : (item.priority ? 'VBELN' : 'NORMAL');
+      orderAuditLog.write({
+        event: 'RESPONSE',
+        sap_order_id: b.order.SapOrderId,
+        vbeln: b.order.Vbeln || b.order.CofOrderId || '',
+        dest: b.city,
+        spi: b.spi,
+        club_id: item.clubId || '',
+        customer: b.order.KunagName1 || b.order.KunweName1 || '',
+        csv_rate: b.amount,
+        priority_tier: tier,
+        t_boundary_ms: boundaryMs > 0 ? Date.now() - boundaryMs : '',
+        batch_id: batchId,
+        status,
+        detail: message,
+      });
+    } catch (_) { /* never let audit break bidding */ }
+  };
 
   if (isRealSuccess) {
     metrics.submitsOk++;
@@ -2865,6 +3106,12 @@ function maybeShakeSession(ctx, reason) {
 async function main() {
   log.info('🚀 Bikas Bidding v2 engine starting…');
 
+  // v3.46 — retention purge on startup + every 6h. Removes logs older
+  // than LOG_RETENTION_DAYS (default 2). Fires before any log writes
+  // so the engine starts clean.
+  purgeOldLogs();
+  setInterval(purgeOldLogs, 6 * 60 * 60 * 1000).unref?.();
+
   // Discover session cookie files (cookie.txt, cookie2.txt, cookie3.txt, …)
   const sessionSpecs = discoverSessions();
   const sessions = sessionSpecs.map((sp) => new AuthConfig(sp.id, sp.cookieFile, sp.tokenFile));
@@ -2950,7 +3197,13 @@ async function main() {
   // CAPTCHA_POLLER_HOT_PARALLEL fetches in flight so the effective
   // unlock-detection interval drops from ~one-RTT to ~10-50ms.
   // Outside the hot zone the poller stays single-flight to save CPU.
-  const CAPTCHA_POLLER_HOT_PARALLEL = parseInt(process.env.CAPTCHA_POLLER_HOT_PARALLEL || '3', 10);
+  // v3.46 — HOT-PARALLEL DEFAULT ROLLED BACK to 1 (single-flight). v3.45's
+  // 3 parallel probes caused SAP to rotate captcha in flight: our first
+  // solved captcha was stale by submit time → 2-3 wrong-captcha retries
+  // eating 2.7s per window (bhai's 2026-08-13 07:15 log: rank2/3 due
+  // to retry loop, not late detection). User can experiment with
+  // CAPTCHA_POLLER_HOT_PARALLEL=2 or 3 in .env, but default STAYS 1.
+  const CAPTCHA_POLLER_HOT_PARALLEL = parseInt(process.env.CAPTCHA_POLLER_HOT_PARALLEL || '1', 10);
   const CAPTCHA_POLLER_HOT_ZONE_MS  = parseInt(process.env.CAPTCHA_POLLER_HOT_ZONE_MS || '3000', 10);
   if (CAPTCHA_POLLER_INTERVAL <= 0) {
     log.info(`🔍 Independent captcha poller DISABLED (CAPTCHA_POLLER_MS=0) — tick loop only`);
@@ -2976,9 +3229,28 @@ async function main() {
       // If SAP told us fastpath is active for this window, skip captcha work.
       if (primary._lastCaptchaFlag === '') return;
       const winKey = Math.floor((Date.now() + untilN) / 60_000);
-      // One fresh solve per window is enough — after that, tick() uses the
-      // cached value; the poller stops re-solving until next boundary.
-      if (ctx._preCaptcha[primary.id]?.winKey === winKey && ctx._preCaptcha[primary.id]?.solved) return;
+      // v3.46 — CONTINUOUS PIPELINE: keep re-solving the captcha AFTER
+      // each consumed submit so the next batch of newly-matched orders
+      // can INSTANT-SUBMIT without waiting for the tick loop to fetch
+      // + solve a fresh captcha (~200-500 ms shaved per successive
+      // submit within the same :15/:45 window). The `pc.consumed` flag
+      // is set to true by resolveCaptcha() when the cached captcha is
+      // handed out for a real submit; when we see it consumed here,
+      // we re-solve immediately so a fresh captcha is ready for the
+      // next batch. Skip only if a fresh (unconsumed) captcha is
+      // already cached.
+      //
+      // CRITICAL: SAP rotates its active captcha the moment we fetch a
+      // NEW captcha image. If we do that while a submit using the
+      // previous captcha is still in flight, SAP returns "Wrong
+      // Captcha" and we burn 2-3 retries (the v3.45 regression bhai
+      // reported at 07:15 on 2026-08-13). To avoid that, cap-poller
+      // WAITS for `ctx._pollerActiveSubmits === 0` before fetching a
+      // fresh captcha. Counter is incremented right before dispatching
+      // INSTANT-SUBMIT and decremented when the workers finish.
+      const pc = ctx._preCaptcha[primary.id];
+      if (pc && pc.winKey === winKey && pc.solved && !pc.consumed) return;
+      if ((ctx._pollerActiveSubmits || 0) > 0) return;
       const { img, reason } = await fetchCaptchaImage(primary);
       if (!img) return; // sap-empty (pre-unlock) — normal
       // v3.45 — RACE GUARD: another parallel probe may have already
@@ -2986,10 +3258,16 @@ async function main() {
       // If so, skip the solve to avoid wasted CPU / duplicate log spam
       // and (most importantly) to avoid burning a second captcha value
       // on SAP that could rotate the active one.
-      if (ctx._preCaptcha[primary.id]?.winKey === winKey && ctx._preCaptcha[primary.id]?.solved) return;
+      {
+        const cur = ctx._preCaptcha[primary.id];
+        if (cur && cur.winKey === winKey && cur.solved && !cur.consumed) return;
+      }
       const r = await solveViaLocal(img);
       // Second guard — solver may take another 20-80ms.
-      if (ctx._preCaptcha[primary.id]?.winKey === winKey && ctx._preCaptcha[primary.id]?.solved) return;
+      {
+        const cur = ctx._preCaptcha[primary.id];
+        if (cur && cur.winKey === winKey && cur.solved && !cur.consumed) return;
+      }
       if (r.solved) {
         ctx._preCaptcha[primary.id] = {
           solved: r.solved,
@@ -3028,9 +3306,36 @@ async function main() {
         // if orders are not cached yet, fetch them INLINE right here to
         // eliminate the 1771ms tick-loop delay observed in the 18:15 window
         // between captcha-ready (T+661ms) and instant-dispatch (T+2432ms).
-        if (!ctx._pollerSubmittedForWinKey?.[winKey]) {
-          ctx._pollerSubmittedForWinKey = ctx._pollerSubmittedForWinKey || {};
-          ctx._pollerSubmittedForWinKey[winKey] = true;
+        // v3.46 — CONTINUOUS PIPELINE (user 2026-08-13 directive: "aisa
+        // kiya jana possible hai kya ki ek alag se all time oder fetch
+        // kare … or save karne wala batch bana bana k current batch me
+        // add karte karte save karta rahe ga … ise sayed kam thora jaldi
+        // ho or kuch aacha result aaye"):
+        //
+        // Old behaviour (v3.34-v3.45): cap-poller fired INSTANT-SUBMIT
+        // exactly ONCE per :15/:45 window (guarded by
+        // `_pollerSubmittedForWinKey[winKey]`). Any orders SAP published
+        // AFTER that first fire had to wait for the tick loop's 5ms
+        // cadence + fresh captcha solve — often 200-500 ms extra
+        // latency, and other vendors beat us to the tie.
+        //
+        // New behaviour: cap-poller keeps firing INSTANT-SUBMIT for
+        // SUBSEQUENT batches of newly-matched orders during the same
+        // hot window, throttled to 1 dispatch per POLLER_MIN_DISPATCH_GAP_MS
+        // (default 400ms) to avoid burning captchas faster than SAP
+        // rotates them. `ctx.submitted` still dedupes so we never
+        // resubmit an already-saved order. When there are zero matched
+        // orders (buildBatches returns empty plan), the poller skips
+        // silently and re-checks on the next tick.
+        //
+        // The orders-poller is now the FETCHER, cap-poller is the
+        // SUBMITTER — a true producer-consumer pipeline that keeps
+        // pumping new orders through until SAP stops publishing.
+        const POLLER_MIN_DISPATCH_GAP_MS = parseInt(process.env.CAPTCHA_POLLER_MIN_DISPATCH_GAP_MS || '400', 10);
+        const lastDispatchAt = ctx._pollerLastDispatchAt || 0;
+        const dispatchGapOk = Date.now() - lastDispatchAt >= POLLER_MIN_DISPATCH_GAP_MS;
+        if (dispatchGapOk) {
+          ctx._pollerLastDispatchAt = Date.now();
           try {
             let ordersToUse = ctx._cachedOrders;
             if (!ordersToUse || !ordersToUse.length) {
@@ -3106,9 +3411,19 @@ async function main() {
                 ctx._hotStall = true;
                 const workerCtx = { ...ctx, plan };
                 const workers = makeWorkerPool(workerCtx);
+                // v3.46 — CONTINUOUS PIPELINE: increment active-submit
+                // counter so the poller's captcha-refetch guard knows a
+                // submit is in flight (and will NOT rotate SAP's captcha
+                // by fetching a new image mid-submit). Decrement when
+                // workers finish so the next batch can INSTANT-SUBMIT.
+                ctx._pollerActiveSubmits = (ctx._pollerActiveSubmits || 0) + 1;
                 // Fire-and-forget — don't await, the poller must return quickly
                 // for the next tick.
-                Promise.all(workers).catch(() => {});
+                Promise.all(workers)
+                  .catch(() => {})
+                  .finally(() => {
+                    ctx._pollerActiveSubmits = Math.max(0, (ctx._pollerActiveSubmits || 1) - 1);
+                  });
                 // Consume the pre-built plan so we don't re-fire it.
                 ctx._cachedPlan = null;
                 // v3.44 — reset the winKey guard so that late-arriving
@@ -3208,6 +3523,40 @@ async function main() {
         if (orders.length && ctx._ordersPollerFirstSeenWin !== winKey) {
           ctx._ordersPollerFirstSeenWin = winKey;
           qlog.info(`[orders-poller] 📦 First non-empty orders scan for this window: ${orders.length} orders (fetch took ${Date.now() - t0}ms)`);
+        }
+
+        // v3.46 — ORDER AUDIT LOG (SEEN event). Track FIRST time we saw
+        // each SapOrderId this window. Reset per-window keeps the CSV
+        // scoped to this bidding session (bhai wants to know "kab kon
+        // sa oder ghusa"). t_boundary_ms is negative when the order
+        // dropped BEFORE :15/:45 (SAP pre-published) — those are the
+        // ones we can pre-warm the plan against.
+        if (orders.length) {
+          if (ctx._orderFirstSeenWin !== winKey) {
+            ctx._orderFirstSeen = new Map();
+            ctx._orderFirstSeenWin = winKey;
+          }
+          const boundaryMs = globalThis.__lastBoundaryMs
+            || (Date.now() + untilN); // best-guess: current time + ms-until-next
+          for (const o of orders) {
+            const sid = String(o.SapOrderId || '');
+            if (!sid || ctx._orderFirstSeen.has(sid)) continue;
+            const seenAt = Date.now();
+            ctx._orderFirstSeen.set(sid, seenAt);
+            orderAuditLog.write({
+              ts: new Date(seenAt).toISOString(),
+              event: 'SEEN',
+              sap_order_id: sid,
+              vbeln: o.Vbeln || o.CofOrderId || o.CofOrder || '',
+              dest: o.Destination || o.DestCityDesc || o.CityCodeDescription || '',
+              spi: o.SPI || o.Spi || o.SpecialProcessInd || o.Zspi || '',
+              club_id: o.ClubId || '',
+              customer: o.KunagName1 || o.KunweName1 || o.Customer || o.CustomerName || '',
+              t_boundary_ms: seenAt - boundaryMs,
+              status: 'FIRST_SEEN',
+              detail: `bot first saw this order in SAP feed`,
+            });
+          }
         }
 
         // v3.37 — PRE-WINDOW PLANNER (parity with ebidding-secure.js log timeline).

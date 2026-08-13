@@ -2035,6 +2035,219 @@ function testHotZoneParallelCaptcha() {
   })();
 }
 
+// v3.46 — SPI-PRIORITY TIER: matched orders whose SPI is in
+// HIGH_PRIORITY_SPI (default "1164") get the TOP priority slot,
+// submitted BEFORE Vbeln-priority orders. Bhai's 2026-08-13 directive:
+// "Special Process Indi 1164 ko bhaut jada priroty dena he hai".
+function testSpiPriorityTier() {
+  const BATCH_SIZE = 3;
+
+  function buildPlanWithSpi(singlesIn, clubsIn, priorityVbelns, highPriSpiSet) {
+    const isVbelnPri = (v) => priorityVbelns.has(String(v || ''));
+    const isSpiPri   = (spi) => highPriSpiSet.has(String(spi || ''));
+
+    const singles = singlesIn.map((o) => ({
+      order: o,
+      priority: isVbelnPri(o.Vbeln),
+      spiPriority: isSpiPri(o.SPI),
+    }));
+    const clubs = clubsIn.map((c) => ({
+      clubId: c.clubId,
+      bids: c.bids.map((b) => ({ order: b })),
+      priority: c.bids.some((b) => isVbelnPri(b.Vbeln)),
+      spiPriority: c.bids.some((b) => isSpiPri(b.SPI)),
+    }));
+
+    const singlesS = singles.filter((s) => s.spiPriority);
+    const singlesP = singles.filter((s) => !s.spiPriority && s.priority);
+    const singlesN = singles.filter((s) => !s.spiPriority && !s.priority);
+    const clubsS   = clubs.filter((c) => c.spiPriority);
+    const clubsP   = clubs.filter((c) => !c.spiPriority && c.priority);
+    const clubsN   = clubs.filter((c) => !c.spiPriority && !c.priority);
+
+    const pack = (arr) => {
+      const out = [];
+      for (let i = 0; i < arr.length; i += BATCH_SIZE) out.push(arr.slice(i, i + BATCH_SIZE));
+      return out;
+    };
+    const plan = [];
+    for (const b of pack(singlesS)) plan.push({ kind: 'single', bids: b, tier: 'SPI' });
+    for (const c of clubsS)          plan.push({ kind: 'club',   bids: c.bids, clubId: c.clubId, tier: 'SPI' });
+    for (const b of pack(singlesP)) plan.push({ kind: 'single', bids: b, tier: 'VBELN' });
+    for (const c of clubsP)          plan.push({ kind: 'club',   bids: c.bids, clubId: c.clubId, tier: 'VBELN' });
+    for (const b of pack(singlesN)) plan.push({ kind: 'single', bids: b, tier: 'NORMAL' });
+    for (const c of clubsN)          plan.push({ kind: 'club',   bids: c.bids, clubId: c.clubId, tier: 'NORMAL' });
+    return plan;
+  }
+
+  const priVbelns = new Set(['V-PRIORITY-1']);
+  const highSpi   = new Set(['1164']);
+
+  // Case A: mixed batch — SPI 1164 orders MUST come first even without Vbeln match.
+  const p1 = buildPlanWithSpi(
+    [
+      { SapOrderId: 'S1', Vbeln: 'V-NORMAL',       SPI: '1163' },
+      { SapOrderId: 'S2', Vbeln: 'V-PRIORITY-1',   SPI: '1163' },
+      { SapOrderId: 'S3', Vbeln: 'V-SPI-ONLY',     SPI: '1164' },
+      { SapOrderId: 'S4', Vbeln: 'V-BOTH',         SPI: '1164' },
+    ],
+    [],
+    priVbelns,
+    highSpi
+  );
+  assert.strictEqual(p1[0].tier, 'SPI', 'v3.46: SPI-priority batch must be FIRST');
+  assert.deepStrictEqual(
+    p1[0].bids.map((b) => b.order.SapOrderId).sort(),
+    ['S3', 'S4'],
+    'v3.46: SPI batch contains ALL SPI=1164 orders (including those also in Vbeln priority)'
+  );
+  assert.strictEqual(p1[1].tier, 'VBELN', 'v3.46: Vbeln-priority batch is SECOND');
+  assert.deepStrictEqual(p1[1].bids.map((b) => b.order.SapOrderId), ['S2'], 'v3.46: Vbeln-priority contains ONLY S2 (S4 promoted to SPI tier)');
+  assert.strictEqual(p1[2].tier, 'NORMAL', 'v3.46: normal batch is LAST');
+  assert.deepStrictEqual(p1[2].bids.map((b) => b.order.SapOrderId), ['S1'], 'v3.46: normal batch contains ONLY S1');
+
+  // Case B: only normal orders → single batch, NORMAL tier.
+  const p2 = buildPlanWithSpi(
+    [
+      { SapOrderId: 'N1', Vbeln: 'V-A', SPI: '1163' },
+      { SapOrderId: 'N2', Vbeln: 'V-B', SPI: '1165' },
+    ],
+    [],
+    priVbelns,
+    highSpi
+  );
+  assert.strictEqual(p2.length, 1);
+  assert.strictEqual(p2[0].tier, 'NORMAL');
+
+  // Case C: SPI-priority CLUB — full club promoted if ANY member has high-priority SPI.
+  const p3 = buildPlanWithSpi(
+    [],
+    [
+      { clubId: 'CLUB-A', bids: [
+        { SapOrderId: 'CA1', Vbeln: 'X', SPI: '1163' },
+        { SapOrderId: 'CA2', Vbeln: 'X', SPI: '1164' },
+        { SapOrderId: 'CA3', Vbeln: 'X', SPI: '1163' },
+      ]},
+      { clubId: 'CLUB-B', bids: [
+        { SapOrderId: 'CB1', Vbeln: 'X', SPI: '1165' },
+      ]},
+    ],
+    priVbelns,
+    highSpi
+  );
+  assert.strictEqual(p3[0].tier, 'SPI', 'v3.46: CLUB with ANY 1164 member → whole club goes to SPI tier');
+  assert.strictEqual(p3[0].clubId, 'CLUB-A');
+  assert.strictEqual(p3[0].bids.length, 3, 'v3.46: SPI-priority club preserves all 3 members atomically');
+  assert.strictEqual(p3[1].tier, 'NORMAL');
+
+  // Case D: multi-SPI env "1164,1234".
+  const multiSpi = new Set(['1164', '1234']);
+  const p4 = buildPlanWithSpi(
+    [
+      { SapOrderId: 'S1', Vbeln: 'X', SPI: '1234' },
+      { SapOrderId: 'S2', Vbeln: 'X', SPI: '1164' },
+      { SapOrderId: 'S3', Vbeln: 'X', SPI: '9999' },
+    ],
+    [],
+    new Set(),
+    multiSpi
+  );
+  assert.strictEqual(p4[0].tier, 'SPI');
+  assert.deepStrictEqual(p4[0].bids.map((b) => b.order.SapOrderId).sort(), ['S1', 'S2'], 'v3.46: both 1164 AND 1234 promoted to SPI tier');
+
+  // Case E: empty highPriSpiSet → SPI tier disabled, v3.44 2-tier resumes.
+  const p5 = buildPlanWithSpi(
+    [
+      { SapOrderId: 'S1', Vbeln: 'V-PRIORITY-1', SPI: '1164' },
+      { SapOrderId: 'S2', Vbeln: 'V-OTHER',      SPI: '1163' },
+    ],
+    [],
+    priVbelns,
+    new Set()
+  );
+  assert.strictEqual(p5[0].tier, 'VBELN', 'v3.46: with SPI disabled, Vbeln-priority resumes top slot');
+
+  console.log('✓ SPI-priority tier (v3.46): 5 cases pass — SPI=1164 orders submit FIRST even against Vbeln-priority, clubs atomic-promote on any high-SPI member, multi-SPI supported, empty SPI set falls back to v3.44 2-tier ordering');
+}
+
+// v3.46 — CONTINUOUS PIPELINE: cap-poller's INSTANT-SUBMIT no longer
+// stops after firing once per window. It keeps firing for new batches
+// of matched orders throughout the hot window, throttled to 1 dispatch
+// per POLLER_MIN_DISPATCH_GAP_MS. Cap-poller ALSO won't re-fetch a
+// fresh captcha while a previous submit is in flight (guarded by
+// `_pollerActiveSubmits` counter), preventing the v3.45 wrong-captcha
+// rotation race.
+function testContinuousPipeline() {
+  const POLLER_MIN_DISPATCH_GAP_MS = 400;
+
+  // Simulate cap-poller state machine over a hot window.
+  const ctx = {
+    _pollerLastDispatchAt: 0,
+    _pollerActiveSubmits: 0,
+    _preCaptcha: { s1: null },
+  };
+  const winKey = 42;
+
+  const shouldDispatch = (now) => {
+    const gap = now - ctx._pollerLastDispatchAt;
+    return gap >= POLLER_MIN_DISPATCH_GAP_MS;
+  };
+
+  const shouldFetchCaptcha = () => {
+    const pc = ctx._preCaptcha.s1;
+    if (pc && pc.winKey === winKey && pc.solved && !pc.consumed) return false;
+    if ((ctx._pollerActiveSubmits || 0) > 0) return false;
+    return true;
+  };
+
+  // T=0: first dispatch always allowed (no prior dispatch).
+  assert.strictEqual(shouldDispatch(500), true, 'v3.46: initial dispatch allowed (500ms into hot window, no prior dispatch)');
+  ctx._pollerLastDispatchAt = 500;
+
+  // T=600: too soon for another dispatch (throttled).
+  assert.strictEqual(shouldDispatch(600), false, 'v3.46: 100ms after dispatch → throttled');
+
+  // T=899: still throttled.
+  assert.strictEqual(shouldDispatch(899), false, 'v3.46: 399ms after dispatch → still throttled');
+
+  // T=900: gap met, next dispatch OK.
+  assert.strictEqual(shouldDispatch(900), true, 'v3.46: exactly 400ms → dispatch allowed');
+
+  // T=1500: many dispatches later, also OK.
+  ctx._pollerLastDispatchAt = 900;
+  assert.strictEqual(shouldDispatch(1500), true, 'v3.46: 600ms since last dispatch → allowed');
+
+  // Captcha fetch guard — fresh unconsumed captcha available → skip fetch.
+  ctx._preCaptcha.s1 = { solved: 'ABCDE', winKey, consumed: false };
+  ctx._pollerActiveSubmits = 0;
+  assert.strictEqual(shouldFetchCaptcha(), false, 'v3.46: fresh unconsumed captcha → no fetch needed');
+
+  // Consumed captcha, no submits in flight → fetch new one.
+  ctx._preCaptcha.s1.consumed = true;
+  assert.strictEqual(shouldFetchCaptcha(), true, 'v3.46: consumed captcha + no in-flight → fetch new');
+
+  // Consumed captcha, but submit IN FLIGHT → do NOT fetch (would rotate SAP).
+  ctx._pollerActiveSubmits = 1;
+  assert.strictEqual(shouldFetchCaptcha(), false, 'v3.46: submit in flight → do NOT fetch new captcha (prevents SAP rotation)');
+
+  // Submit finishes → counter drops → fetch resumes.
+  ctx._pollerActiveSubmits = 0;
+  assert.strictEqual(shouldFetchCaptcha(), true, 'v3.46: submit finished → fetch allowed again');
+
+  // No cached captcha at all, no submit in flight → fetch.
+  ctx._preCaptcha.s1 = null;
+  ctx._pollerActiveSubmits = 0;
+  assert.strictEqual(shouldFetchCaptcha(), true, 'v3.46: no cached captcha → fetch');
+
+  // Counter safety: decrement below 0 never happens.
+  const decrement = () => { ctx._pollerActiveSubmits = Math.max(0, (ctx._pollerActiveSubmits || 1) - 1); };
+  ctx._pollerActiveSubmits = 0;
+  decrement();
+  assert.strictEqual(ctx._pollerActiveSubmits, 0, 'v3.46: active-submits counter never goes negative');
+
+  console.log('✓ Continuous pipeline (v3.46): 10 cases pass — dispatch throttled by MIN_DISPATCH_GAP_MS, captcha-refetch guard prevents SAP rotation during in-flight submits, counter never negative');
+}
+
 async function testNetworkRetryOnIdempotent() {
   const NETWORK_ERR_RE = /HeadersTimeoutError|Headers Timeout|UND_ERR_CONNECT_TIMEOUT|UND_ERR_SOCKET|ETIMEDOUT|ECONNRESET|socket hang up|other side closed/i;
 
@@ -2322,6 +2535,8 @@ function testEarlyDropAndBoundaryComplementary() {
     testPreWindowPlanSurvivesBoundary();
     testDynamicOrderShiftDetection();
     await testHotZoneParallelCaptcha();
+    testSpiPriorityTier();
+    testContinuousPipeline();
     await testNetworkRetryOnIdempotent();
     console.log('\n🎉 ALL TESTS PASS');
     process.exit(0);

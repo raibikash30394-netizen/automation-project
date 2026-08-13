@@ -729,3 +729,32 @@ User's 7th-run report: v3.44 fixed the miss bug (rank 2/3 now hit) but "save 45:
 - `/app/bikas-bidding/bid-engine.js` (cap-poller parallel-probe support + race guards + version header)
 - `/app/bikas-bidding/.env` and `/app/bikas-bidding/.env.example` (new knobs)
 - `/app/bikas-bidding/tests/test-window-scheduler.js` (v3.45 test group)
+
+## v3.46 — v3.45 ROLLBACK + SPI PRIORITY + AUDIT LOG + CONTINUOUS PIPELINE (2026-02-13)
+User's 8th-run report showed v3.45 REGRESSION: 3 parallel captcha probes caused SAP captcha rotation in flight → first submit hit WRONG CAPTCHA at T+292ms → 2 more retries → SAVED-TIED at T+2740ms. That 2.7-second retry loop is what let competitors claim rank 1.
+
+**Fixes**:
+1. **v3.45 rollback**: `CAPTCHA_POLLER_HOT_PARALLEL` default 3 → 1 (single-flight). Users can experiment with 2/3 manually but safe default restored.
+2. **SPI-priority tier**: matched orders with SPI in `HIGH_PRIORITY_SPI` env (default "1164") get TOP submission slot, ABOVE Vbeln priority.csv. Three tiers now: SPI → VBELN → NORMAL. Clubs atomic-promote to SPI if ANY member has high-priority SPI. Multi-SPI supported (comma-separated).
+3. **Order audit log**: new `logs/order-audit-YYYY-MM-DD.csv` with per-order lifecycle — SEEN (when bot first saw the order + t_boundary_ms), SUBMITTED (batch details + priority tier), RESPONSE (SAP classification + Ev_Text). Covers "kab kon sa oder ghusa or kya hit kiya".
+4. **Log retention**: `LOG_RETENTION_DAYS` (default 2). Startup + every 6h purge in `logs/`. Verified: purged 20 stale files on first boot.
+5. **Continuous fetch+submit pipeline**: cap-poller no longer stops after firing once per window. Successive batches of newly-matched orders trigger INSTANT-SUBMIT dispatches throttled to 1 per `CAPTCHA_POLLER_MIN_DISPATCH_GAP_MS` (default 400ms). Cap-poller re-solves captcha after each `pc.consumed`, guarded by `_pollerActiveSubmits` counter (won't re-fetch new captcha while in-flight submit is using the old one — prevents v3.45 rotation race).
+
+**New tests** (40 total, all passing):
+- `testSpiPriorityTier` — 5 cases (SPI top slot, atomic club promotion, multi-SPI, empty-set fallback)
+- `testContinuousPipeline` — 10 cases (dispatch throttling, captcha-refetch guard, counter safety)
+
+**Verification**
+- 40/40 tests pass.
+- Smoke boot: `🧹 log retention: purged 20 file(s) older than 2 day(s) from logs/`.
+
+**Config knobs** (in `.env`):
+- `HIGH_PRIORITY_SPI=1164`
+- `LOG_RETENTION_DAYS=2`
+- `CAPTCHA_POLLER_HOT_PARALLEL=1` (rollback)
+- `CAPTCHA_POLLER_MIN_DISPATCH_GAP_MS=400`
+
+**Files modified**
+- `/app/bikas-bidding/bid-engine.js` (buildBatches 3-tier + audit log module + retention + cap-poller continuous pipeline)
+- `/app/bikas-bidding/.env` and `/app/bikas-bidding/.env.example`
+- `/app/bikas-bidding/tests/test-window-scheduler.js` (v3.46 tests)
