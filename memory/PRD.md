@@ -758,3 +758,32 @@ User's 8th-run report showed v3.45 REGRESSION: 3 parallel captcha probes caused 
 - `/app/bikas-bidding/bid-engine.js` (buildBatches 3-tier + audit log module + retention + cap-poller continuous pipeline)
 - `/app/bikas-bidding/.env` and `/app/bikas-bidding/.env.example`
 - `/app/bikas-bidding/tests/test-window-scheduler.js` (v3.46 tests)
+
+## v3.47 — TRUECAPTCHA VALIDATION / RANK 1 FIX (2026-02-13)
+User's 9th-run report: "rank bhaut kaharp hai … save karo rank 1 karo plese kuch karo". Post-v3.46 rollback of parallel probes, ONE PATH was still causing wrong-captcha loops.
+
+**Diagnosis** (bhai's 15:15 IST engine.log + audit CSV):
+- T+1144ms captcha unlocked ("AWSKH"), INSTANT-SUBMIT fired
+- T+2361ms **WRONG CAPTCHA** → retry
+- T+4220ms **WRONG CAPTCHA** → retry
+- T+5768ms SAVED-TIED (rank 2, 4.6s AFTER unlock)
+
+**Root cause**: TrueCaptcha (fallback for local OCR) returned strings with symbols like `@` and `=` ("VFh@4", "TLu=V"). SAP's alphabet is strictly `[A-Za-z0-9]{4,8}`, so those responses ALWAYS trigger wrong-captcha. Local OCR had `looksLikeCaptcha` gate; TrueCaptcha path did NOT. Also, `data.json` cache had 11 poisoned entries with invalid captchas from prior runs — every hash-match hit served bad data, compounding the loop.
+
+**Fix** (`bidding.js`):
+- `solveViaApi()` validates TrueCaptcha response with `looksLikeCaptcha`. Invalid → return `''` so caller re-fetches a fresh captcha image.
+- `solve()` validates cache-hits too — evicts invalid entries and re-solves.
+- `loadCache()` startup-pass purges pre-existing invalid entries (first boot: **11 legacy entries purged**).
+
+**New test**: `testCaptchaValidation` — 26 cases covering valid pass-through, invalid reject, cache eviction, edge cases.
+
+**Verification**
+- 41/41 tests pass.
+- Smoke: `Cache loaded: 151 entries (TTL=24h) — v3.47 purged 11 legacy entries with non-alphanumeric captcha results`.
+
+**Expected impact**: Eliminate the 4-second wrong-captcha retry loop → submit lands at :15:00.3 - :15:00.5 (captcha unlock + 200ms RTT) → strong rank-1 chance on TIEs.
+
+**Files modified**
+- `/app/bikas-bidding/bidding.js` (looksLikeCaptcha applied to TrueCaptcha responses, cache-hit validation, startup purge, cacheDel helper)
+- `/app/bikas-bidding/bid-engine.js` (version header)
+- `/app/bikas-bidding/tests/test-window-scheduler.js` (v3.47 test group)

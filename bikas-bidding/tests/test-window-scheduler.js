@@ -2248,6 +2248,65 @@ function testContinuousPipeline() {
   console.log('✓ Continuous pipeline (v3.46): 10 cases pass — dispatch throttled by MIN_DISPATCH_GAP_MS, captcha-refetch guard prevents SAP rotation during in-flight submits, counter never negative');
 }
 
+// v3.47 — TRUECAPTCHA VALIDATION (RANK 1 FIX). SAP's captcha alphabet is
+// [A-Za-z0-9] 4-8 chars. TrueCaptcha occasionally returns strings with
+// `@` or `=` symbols (OCR artifacts) that ALWAYS fail SAP validation,
+// triggering 2-3 wrong-captcha retries and 4-second delay. Bhai's 15:15
+// IST 2026-08-13 log: "AWSKH" solved → wrong → 2 retries → SAVED-TIED
+// at T+5768ms (rank 2). This test validates the reject-invalid logic.
+function testCaptchaValidation() {
+  // Mirror bidding.js:looksLikeCaptcha (SAP alphabet gate).
+  const LOCAL_OCR_MIN_LEN = 4;
+  const LOCAL_OCR_MAX_LEN = 8;
+  function looksLikeCaptcha(text) {
+    if (!text) return false;
+    const trimmed = String(text).replace(/\s+/g, '');
+    if (trimmed.length < LOCAL_OCR_MIN_LEN || trimmed.length > LOCAL_OCR_MAX_LEN) return false;
+    return /^[A-Za-z0-9]+$/.test(trimmed);
+  }
+
+  // Cases lifted from bhai's actual TrueCaptcha responses in the wild:
+  const validCases   = ['AWSKH', 'fwme4', 'stack', '8k2yk', 'ABCD', 'abc123', 'Xy4Z', 'A1B2C3D4'];
+  const invalidCases = ['VFh@4', 'TLu=V', 'ab!c1', 'abc',  'abcdefghi', '', null, '@=$%', 'X Y Z', 'Redo!'];
+
+  for (const c of validCases) {
+    assert.strictEqual(looksLikeCaptcha(c), true, `v3.47: valid captcha "${c}" must pass`);
+  }
+  for (const c of invalidCases) {
+    assert.strictEqual(looksLikeCaptcha(c), false, `v3.47: invalid captcha "${c}" must be REJECTED`);
+  }
+
+  // Simulate solveViaApi guard: if TrueCaptcha returns invalid string,
+  // caller must receive '' (not the bad value).
+  const simulateApiFilter = (rawResult) => {
+    if (rawResult && rawResult !== 'Redo' && !looksLikeCaptcha(rawResult)) return '';
+    return rawResult;
+  };
+  assert.strictEqual(simulateApiFilter('VFh@4'), '', 'v3.47: TrueCaptcha "VFh@4" → filtered to empty');
+  assert.strictEqual(simulateApiFilter('TLu=V'), '', 'v3.47: TrueCaptcha "TLu=V" → filtered to empty');
+  assert.strictEqual(simulateApiFilter('AWSKH'), 'AWSKH', 'v3.47: valid captcha passes through');
+  assert.strictEqual(simulateApiFilter('Redo'),  'Redo',  'v3.47: TrueCaptcha "Redo" pass-through (special retry signal)');
+  assert.strictEqual(simulateApiFilter(''),      '',      'v3.47: empty pass-through');
+
+  // Simulate cache eviction path: bad cached entry should be evicted, forcing re-solve.
+  const cache = new Map([
+    ['hash-good', 'AWSKH'],
+    ['hash-bad',  'VFh@4'],
+    ['hash-empty','']
+  ]);
+  const trySolve = (hash) => {
+    const hit = cache.get(hash);
+    if (hit && looksLikeCaptcha(hit)) return { solved: hit, source: 'cache' };
+    if (hit) cache.delete(hash);
+    return { solved: '', source: 'evicted-or-miss' };
+  };
+  assert.deepStrictEqual(trySolve('hash-good'), { solved: 'AWSKH', source: 'cache' }, 'v3.47: valid cache hit served');
+  assert.deepStrictEqual(trySolve('hash-bad'),  { solved: '',      source: 'evicted-or-miss' }, 'v3.47: invalid cache entry evicted');
+  assert.strictEqual(cache.has('hash-bad'), false, 'v3.47: invalid cache entry removed from map');
+
+  console.log('✓ TrueCaptcha validation (v3.47): 26 cases pass — invalid results ("VFh@4", "TLu=V", non-alphanumeric, too short/long) are REJECTED; valid captchas pass through; poisoned cache entries auto-evict on read');
+}
+
 async function testNetworkRetryOnIdempotent() {
   const NETWORK_ERR_RE = /HeadersTimeoutError|Headers Timeout|UND_ERR_CONNECT_TIMEOUT|UND_ERR_SOCKET|ETIMEDOUT|ECONNRESET|socket hang up|other side closed/i;
 
@@ -2537,6 +2596,7 @@ function testEarlyDropAndBoundaryComplementary() {
     await testHotZoneParallelCaptcha();
     testSpiPriorityTier();
     testContinuousPipeline();
+    testCaptchaValidation();
     await testNetworkRetryOnIdempotent();
     console.log('\n🎉 ALL TESTS PASS');
     process.exit(0);

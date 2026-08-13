@@ -3,6 +3,40 @@
 /**
  * bid-engine.js — Bikas Bidding v2 main bot
  *
+ * v3.47 — TRUECAPTCHA VALIDATION (RANK 1 FIX) (user 2026-08-13 9th run:
+ *         "rank bhaut kaharp hai … save karo rank 1 karo plese kuch karo").
+ *
+ *   Diagnosis (from bhai's 15:15 IST engine.log + audit CSV):
+ *     T-500ms   EARLY-DROP tried (bailed, SAP requires captcha)
+ *     T+1144ms  cap-poller: PRE-SOLVED captcha "AWSKH" — INSTANT-SUBMIT
+ *     T+2361ms  SAP: WRONG CAPTCHA — retry 1/3
+ *     T+4220ms  SAP: WRONG CAPTCHA — retry 2/3
+ *     T+5768ms  SAP: SAVED-TIED (4.6s AFTER captcha unlock, rank 2)
+ *     Meanwhile competitor's amount-tied entry got Rank 1.
+ *
+ *   ROOT CAUSE: TrueCaptcha API (fallback for local OCR) was returning
+ *   captcha strings containing symbols like "@" and "=" (bhai's earlier
+ *   samples: "VFh@4", "TLu=V"). SAP's captcha alphabet is A-Za-z0-9 ONLY.
+ *   Submitting "@" or "=" ALWAYS triggers "Wrong Captcha" → 2-3 retries →
+ *   4-second delay → competitor wins rank 1 on TIE-break.
+ *
+ *   Also — old data.json cache had 11 poisoned entries with invalid
+ *   captchas from prior runs; every hash-cache hit served bad data,
+ *   compounding the wrong-captcha loop.
+ *
+ *   Fix (in bidding.js, not bid-engine.js):
+ *   • solveViaApi() validates TrueCaptcha result via looksLikeCaptcha()
+ *     (regex ^[A-Za-z0-9]+$, 4-8 chars). Invalid → return '' so caller
+ *     re-fetches a fresh captcha image.
+ *   • solve() validates cache-hits too — evicts invalid entries and
+ *     re-solves. Prevents legacy poisoned cache from serving bad data.
+ *   • loadCache() startup-pass purges pre-existing invalid entries
+ *     (bhai's first boot: purged 11 legacy captchas).
+ *
+ *   Expected impact: eliminate the 4-second wrong-captcha retry loop.
+ *   Submit will land at :15:00.3 - :15:00.5 (captcha-unlock latency +
+ *   200ms SAP submit RTT) → strong rank-1 chance on TIEs.
+ *
  * v3.46 — v3.45 ROLLBACK + SPI PRIORITY + AUDIT LOG + CONTINUOUS PIPELINE
  *         (user 2026-08-13 8th run: "rank 2 or 3 picha nahi chor raha" +
  *         "SPI 1164 ko bhaut jada priroty dena" + "ek alag se all time

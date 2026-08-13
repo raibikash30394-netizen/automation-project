@@ -92,13 +92,25 @@ function loadCache() {
     // TTL prune (savedAt in ms; missing = keep forever for backward-compat)
     const ttlMs = CACHE_TTL_HOURS * 3_600_000;
     const now = Date.now();
+    let invalidPurged = 0;
     entries = raw.filter((e) => {
       if (!e || !e.hash || !e.result) return false;
+      // v3.47 — purge entries whose `result` fails the SAP captcha
+      // alphabet check (e.g. legacy TrueCaptcha responses containing
+      // `@` or `=`). Without this, a poisoned cache would return the
+      // bad value forever, wasting the wrong-captcha retry budget on
+      // every window that reuses the same image hash.
+      if (!looksLikeCaptcha(e.result)) { invalidPurged++; return false; }
       if (!e.savedAt) return true; // legacy entries have no timestamp — keep
       return now - e.savedAt < ttlMs || ttlMs <= 0;
     });
     for (const e of entries) hashMap.set(e.hash, e.result);
-    log.info(`Cache loaded: ${entries.length} entries (TTL=${CACHE_TTL_HOURS}h)`);
+    if (invalidPurged > 0) {
+      log.info(`Cache loaded: ${entries.length} entries (TTL=${CACHE_TTL_HOURS}h) — v3.47 purged ${invalidPurged} legacy entries with non-alphanumeric captcha results`);
+      dirty = true; // ensure the purged cache is persisted on next save
+    } else {
+      log.info(`Cache loaded: ${entries.length} entries (TTL=${CACHE_TTL_HOURS}h)`);
+    }
   } catch (e) {
     log.warn(`Cache load failed: ${e.message} — starting empty`);
     entries = [];
@@ -127,6 +139,17 @@ function cachePut(hash, result) {
   const entry = { hash, file: `image-${Date.now()}.png`, result, savedAt: Date.now() };
   entries.push(entry);
   hashMap.set(hash, result);
+  dirty = true;
+}
+
+// v3.47 — cache eviction (used when a cache entry is discovered to be
+// invalid, e.g. an old cached TrueCaptcha response with non-alphanumeric
+// chars that predates the input-validation fix).
+function cacheDel(hash) {
+  if (!hashMap.has(hash)) return;
+  hashMap.delete(hash);
+  const idx = entries.findIndex((e) => e.hash === hash);
+  if (idx >= 0) entries.splice(idx, 1);
   dirty = true;
 }
 
@@ -257,8 +280,20 @@ async function solveViaApi(base64Raw) {
       log.error({ statusCode, textPreview: text.slice(0, 200) }, 'TrueCaptcha non-JSON response');
       return '';
     }
-    const solved = json.result || '';
+    const solved = (json.result || '').toString();
     log.debug({ statusCode, ms: Date.now() - t0, solved }, 'TrueCaptcha response');
+    // v3.47 — VALIDATE TrueCaptcha response against SAP's captcha alphabet
+    // (A-Za-z0-9 only, 4-8 chars). Bhai's 2026-08-13 15:15 IST log showed
+    // TrueCaptcha returning "VFh@4", "TLu=V", etc. — `@` and `=` are NOT
+    // valid SAP captcha characters, so submitting them ALWAYS triggers
+    // SAP "Wrong Captcha" → 2-3 retry loop eats 2-4 seconds → competitor
+    // beats us to the TIE. Reject invalid responses here so the caller
+    // (bid-engine cap-poller) fetches a fresh image and re-solves.
+    if (solved && solved !== 'Redo' && !looksLikeCaptcha(solved)) {
+      stats.apiErrors++;
+      log.warn(`TrueCaptcha returned invalid chars ("${solved}") — rejected, will re-fetch captcha`);
+      return '';
+    }
     return solved;
   } catch (e) {
     stats.apiErrors++;
@@ -287,8 +322,17 @@ async function solve(base64Input) {
   // 1) Cache-first (sub-ms)
   const hit = cacheHit(hash);
   if (hit) {
-    stats.hits++;
-    return { solved: hit, source: 'cache', hash };
+    // v3.47 — validate cache hit against SAP's captcha alphabet. Old
+    // caches may hold invalid entries from pre-v3.47 solves (e.g. the
+    // "VFh@4" / "TLu=V" bad TrueCaptcha responses bhai's 15:15 IST log
+    // showed). Evict + re-solve so we never serve a known-bad answer.
+    if (looksLikeCaptcha(hit)) {
+      stats.hits++;
+      return { solved: hit, source: 'cache', hash };
+    }
+    // Evict — fall through to fresh solve.
+    cacheDel(hash);
+    log.warn(`cache had invalid captcha "${hit}" for hash ${hash.slice(0, 8)} — evicted, re-solving`);
   }
 
   stats.misses++;
